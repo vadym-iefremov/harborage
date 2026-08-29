@@ -16,7 +16,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && chmod +x dist/client/cli.js",
     "prepare": "npm run build",
     "daemon": "npm run build && node dist/daemon/index.js",
     "test": "tsx --test test/*.test.ts",
