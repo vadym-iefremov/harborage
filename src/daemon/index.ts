@@ -5,8 +5,18 @@ import { createServerFactory } from './server.js';
 import { SessionStore } from './sessions.js';
 import { startSweepLoop } from './sweep.js';
 
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 async function main(): Promise<void> {
   const config = loadConfig();
+
+  if (config.testStartupDelayMs > 0) {
+    console.error(`[harborage] HARBORAGE_TEST_STARTUP_DELAY_MS set, delaying startup by ${config.testStartupDelayMs}ms`);
+    await sleep(config.testStartupDelayMs);
+  }
+
   const startedAt = Date.now();
 
   const browserManager = new BrowserManager(config.debugPort);

@@ -42,6 +42,13 @@ export interface Config {
   daemonReadyTimeoutMs: number;
   /** Poll interval while waiting for the daemon to become healthy. */
   daemonHealthPollMs: number;
+  /**
+   * Test-only: artificially delays the daemon's startup by this many ms
+   * before it opens its HTTP listener, simulating a slow cold start (e.g. a
+   * first-time dependency fetch). Used to prove the client wrapper's MCP
+   * handshake never waits on daemon readiness. Zero in every real deployment.
+   */
+  testStartupDelayMs: number;
 }
 
 function num(name: string, fallback: number): number {
@@ -78,6 +85,7 @@ export function loadConfig(): Config {
     registryPath: str('HARBORAGE_REGISTRY_PATH', join(stateDir, 'registry.json')),
     daemonLogPath: str('HARBORAGE_DAEMON_LOG_PATH', join(stateDir, 'daemon.log')),
     daemonReadyTimeoutMs: num('HARBORAGE_DAEMON_READY_TIMEOUT_MS', 60 * 1000),
-    daemonHealthPollMs: num('HARBORAGE_DAEMON_HEALTH_POLL_MS', 200)
+    daemonHealthPollMs: num('HARBORAGE_DAEMON_HEALTH_POLL_MS', 200),
+    testStartupDelayMs: num('HARBORAGE_TEST_STARTUP_DELAY_MS', 0)
   };
 }
