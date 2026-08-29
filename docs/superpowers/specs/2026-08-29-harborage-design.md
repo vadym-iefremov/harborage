@@ -1,4 +1,10 @@
-# Parallel headless QA browser pool — design
+# harborage — design
+
+A shared, on-demand pool of isolated headless browser sessions for
+Claude Code subagents. QA is the motivating use case and the one this
+spec tests against, but nothing here is QA-specific, any subagent
+that needs its own isolated browser (scraping, research, form-filling)
+can use the same pool.
 
 Status: approved design, pre-implementation
 Date: 2026-08-29
@@ -99,8 +105,8 @@ Gaps Steel doesn't cover, which this project supplies:
 
 ```
 Claude Code session (any project)
-        │  .mcp.json → "steel-qa": { command: npx,
-        │              args: [-y, "github:<you>/steel-qa-pool#<pinned-ref>"] }
+        │  .mcp.json → "harborage": { command: npx,
+        │              args: [-y, "github:vadym-iefremov/harborage#<pinned-ref>"] }
         ▼
  our wrapper CLI (bin/cli.js)
         │  1. reply to the MCP `initialize` handshake immediately,
@@ -146,13 +152,13 @@ have to babysit:
    image only, no vendored source.
 2. **`bin/cli.js`** — the wrapper: handshake-first, then
    ensure-running, register, handoff. Registered in `.mcp.json` as
-   `{"command": "npx", "args": ["-y", "github:<you>/steel-qa-pool#<pinned-ref>"], "env": {"MCP_TIMEOUT": "120000"}}`
+   `{"command": "npx", "args": ["-y", "github:vadym-iefremov/harborage#<pinned-ref>"], "env": {"MCP_TIMEOUT": "120000"}}`
    (see §8 for why this works without an npm publish, and §7 for why
    `MCP_TIMEOUT` is set explicitly rather than relying on Claude Code's
    undocumented default).
 3. **Registry file** — a small JSON file, `[{pid, startedAt}, ...]`,
    living in a fixed machine-level location outside any single
-   project (e.g. `~/.steel-qa-pool/registry.json`), since this is a
+   project (e.g. `~/.harborage/registry.json`), since this is a
    shared resource across whatever projects use it, not tied to one
    project or to `~/.claude` specifically (this is meant to be a
    separate, shareable tool).
@@ -173,7 +179,7 @@ have to babysit:
 ## 6. Flows
 
 **Normal QA session.** A subagent's Claude Code session opens the
-`steel-qa` MCP connection → wrapper CLI ensures Steel is running,
+`harborage` MCP connection → wrapper CLI ensures Steel is running,
 registers its PID, hands off to `steel-mcp-server` → subagent calls
 `steel_session_create`, drives its isolated session, calls
 `steel_session_release` when done (or lets `inactivityTimeout` do it).
@@ -228,7 +234,7 @@ a failure.
 
 **Now:** verified directly (a local git repo with a real dependency,
 run multiple ways) that `npx` supports installing straight from a git
-spec, `npx github:<you>/steel-qa-pool#<ref>`, with no npm registry
+spec, `npx github:vadym-iefremov/harborage#<ref>`, with no npm registry
 publish involved at all. This is a real one-liner today, not something
 deferred to a later phase. The detail that matters: **pin an exact
 commit or tag, don't track a floating branch.** A floating ref (e.g.
@@ -241,7 +247,7 @@ deliberately updating the pinned ref in `.mcp.json`, not just pushing
 to `main` and expecting it to propagate.
 
 **Later (out of scope for this spec):** publish to npm anyway, so
-`.mcp.json` can use `"command": "npx", "args": ["-y", "steel-qa-pool@latest"]`
+`.mcp.json` can use `"command": "npx", "args": ["-y", "harborage@latest"]`
 the same way `@playwright/mcp` is used today. The GitHub-based install
 already works without it; npm mainly buys a shorter install spec and
 the conventional `@latest`/version-tag ergonomics people expect from an
@@ -253,7 +259,7 @@ MCP server.
   retention: needs checking directly against a running instance, not
   assumed from docs alone.
 - Registry file's exact path and permissions.
-- Repo name (working name in this doc: `steel-qa-pool`) and whether it
+- Repo name (working name in this doc: `harborage`) and whether it
   starts public or private on GitHub.
 - The QA skill that dispatches N subagents against this pool is a
   separate, later layer on top of this infrastructure and is not part
