@@ -44,6 +44,10 @@ export async function makeTestConfig(overrides: Partial<Config> = {}): Promise<C
     stateDir,
     registryPath: join(stateDir, 'registry.json'),
     daemonLogPath: join(stateDir, 'daemon.log'),
+    screenshotCacheDir: join(stateDir, 'screenshots'),
+    screenshotCacheTtlMs: 30 * 60 * 1000,
+    consoleBufferSize: 200,
+    networkBufferSize: 200,
     daemonReadyTimeoutMs: 30 * 1000,
     daemonHealthPollMs: 100,
     testStartupDelayMs: 0,
@@ -129,6 +133,10 @@ export function spawnDaemonProcess(config: Config, extraEnv: Record<string, stri
         HARBORAGE_STATE_DIR: config.stateDir,
         HARBORAGE_REGISTRY_PATH: config.registryPath,
         HARBORAGE_DAEMON_LOG_PATH: config.daemonLogPath,
+        HARBORAGE_SCREENSHOT_CACHE_DIR: config.screenshotCacheDir,
+        HARBORAGE_SCREENSHOT_CACHE_TTL_MS: String(config.screenshotCacheTtlMs),
+        HARBORAGE_CONSOLE_BUFFER_SIZE: String(config.consoleBufferSize),
+        HARBORAGE_NETWORK_BUFFER_SIZE: String(config.networkBufferSize),
         HARBORAGE_TEST_STARTUP_DELAY_MS: String(config.testStartupDelayMs),
         ...extraEnv
       }

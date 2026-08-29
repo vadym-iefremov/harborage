@@ -1,7 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/server';
 
 import { toolDescriptions, toolInputSchemas } from './tools/schemas.js';
-import { createToolHandlers } from './tools/handlers.js';
+import { createToolHandlers, type ToolHandlerConfig } from './tools/handlers.js';
 import type { SessionStore } from './sessions.js';
 
 /**
@@ -14,14 +14,14 @@ import type { SessionStore } from './sessions.js';
  *
  * Each tool is registered by an explicit call (rather than looped over
  * `toolNames`) so each one's Zod schema and handler stay paired as a single
- * concrete type — looping over the union of all eleven schemas defeats
+ * concrete type — looping over the union of all fifteen schemas defeats
  * `registerTool`'s own overload resolution.
  */
-export function createServerFactory(sessions: SessionStore, debugPort: number) {
-  const handlers = createToolHandlers(sessions, debugPort);
+export function createServerFactory(sessions: SessionStore, config: ToolHandlerConfig) {
+  const handlers = createToolHandlers(sessions, config);
 
   return function createServer(): McpServer {
-    const server = new McpServer({ name: 'harborage', version: '0.1.0' });
+    const server = new McpServer({ name: 'harborage', version: '0.2.0' });
 
     server.registerTool(
       'create_session',
@@ -69,6 +69,26 @@ export function createServerFactory(sessions: SessionStore, debugPort: number) {
       'release_session',
       { description: toolDescriptions.release_session, inputSchema: toolInputSchemas.release_session },
       handlers.release_session
+    );
+    server.registerTool(
+      'list_sessions',
+      { description: toolDescriptions.list_sessions, inputSchema: toolInputSchemas.list_sessions },
+      handlers.list_sessions
+    );
+    server.registerTool(
+      'read_console',
+      { description: toolDescriptions.read_console, inputSchema: toolInputSchemas.read_console },
+      handlers.read_console
+    );
+    server.registerTool(
+      'list_network_requests',
+      { description: toolDescriptions.list_network_requests, inputSchema: toolInputSchemas.list_network_requests },
+      handlers.list_network_requests
+    );
+    server.registerTool(
+      'send_cdp_command',
+      { description: toolDescriptions.send_cdp_command, inputSchema: toolInputSchemas.send_cdp_command },
+      handlers.send_cdp_command
     );
 
     return server;

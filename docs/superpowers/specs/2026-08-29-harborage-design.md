@@ -2,7 +2,7 @@
 
 Status: implemented (see the codebase for the source of truth; this doc
 records the decisions and why)
-Date: 2026-08-29
+Date: 2026-08-29 (v1.0), updated 2026-08-29 for v1.1 (§9)
 
 This supersedes the earlier Steel-based design
 (`2026-08-29-steel-qa-pool-design.md`, since removed from the working
@@ -65,7 +65,7 @@ Two processes, matching the spec:
 
 - **The client wrapper** is what `.mcp.json` actually spawns — one per
   Claude Code MCP connection. It's a thin stdio<->HTTP proxy: an
-  `McpServer` on the stdio side (talking to Claude Code) whose 11 tool
+  `McpServer` on the stdio side (talking to Claude Code) whose 15 tool
   handlers each forward the call, arguments and result unchanged, to an
   MCP `Client` connected to the daemon's `/mcp` endpoint. Tool
   name/description/Zod schema live in one shared module
@@ -87,7 +87,7 @@ hand. Using the SDK's real `Client` (which already implements Streamable
 HTTP correctly) to talk to the daemon, behind an equally real `McpServer`
 on the stdio side, costs one extra protocol hop but means both legs are
 spec-correct by construction. Given the tool surface is small and fixed
-(11 tools, known upfront), this was a better trade than building and
+(15 tools, known upfront), this was a better trade than building and
 maintaining a generic bidirectional protocol-level proxy.
 
 ## 3. Tool surface
@@ -101,10 +101,14 @@ maintaining a generic bidirectional protocol-level proxy.
 | `evaluate` | Run a JS expression in the page, get the JSON-serialized result back. |
 | `snapshot` | AI-optimized ARIA accessibility tree of the tab (`locator.ariaSnapshot({mode: 'ai'})`) — structure and text, not pixels. |
 | `list_tabs` | List a session's open tabs. |
-| `screenshot` | PNG, returned inline as base64 — never written to disk. |
+| `screenshot` | PNG. `mode: 'inline'` (default): base64, never written to disk. `mode: 'cached'`: written to a TTL-expiring local cache, returns a file reference instead — see §9.2. |
 | `export_state` | Returns the session's current `storageState` (cookies + localStorage), for seeding future sessions. |
-| `escalate_session` | Resolves the session's current CDP target and returns its `webSocketDebuggerUrl` for a human to attach to directly. |
+| `escalate_session` | Resolves the session's current CDP target and returns its `webSocketDebuggerUrl` for a *human* to attach to directly. |
 | `release_session` | Closes the session's `BrowserContext`. |
+| `list_sessions` | Every currently active session machine-wide (id, createdAt, lastActivity, current tab URL) — not scoped to the caller. See §9.1. |
+| `read_console` | Buffered `console` messages for a session's tab, since `create_session`. See §9.3. |
+| `list_network_requests` | Buffered network request/response activity for a session's tab, since `create_session`. See §9.3. |
+| `send_cdp_command` | Raw CDP method + params, issued directly by an *agent* (no human in the loop) — the agent-facing counterpart to `escalate_session`. See §9.4. |
 
 A session can have multiple tabs (`pageId`, defaulting to the
 most-recently-active one); a tab opened by the page itself
@@ -228,10 +232,15 @@ most of it.
   with `EADDRINUSE`; it logs that another instance is already serving and
   exits `0` rather than crashing. Wasteful (one extra short-lived
   process) but not a correctness issue.
+- **Cached screenshot expiry.** The same sweep tick also deletes any file
+  in the screenshot cache directory (§9.2) older than
+  `HARBORAGE_SCREENSHOT_CACHE_TTL_MS`, by file mtime. Same one-timer
+  rationale as the rest of this section — see §9.2 for why this rides the
+  existing sweep instead of a fourth mechanism.
 
 ## 7. Testing
 
-19 tests, `npm test` (builds, then runs against the real compiled
+33 tests, `npm test` (builds, then runs against the real compiled
 `dist/`), all against real Chromium and real daemon/wrapper subprocesses
 — no mocks of the browser or the protocol layer:
 
@@ -245,6 +254,10 @@ most of it.
 | `handshake-not-blocked.test.ts` | The real wrapper's MCP handshake completes in well under half of an artificially-slowed 3s daemon cold start; the first tool call visibly pays that cost; the daemon it spawned shuts itself down after the client disconnects. |
 | `screenshot-inline.test.ts` | Screenshot content is inline base64 PNG (magic-byte checked); a whole-repo file listing (excluding `node_modules`/`dist`/`.git`) is byte-identical before and after. |
 | `seeding.test.ts` | `export_state` on a session with a real cookie + localStorage value, fed into `create_session`, produces a session that already has both — before any navigation in the seeded session sets anything itself. |
+| `list-sessions.test.ts` | Two sessions are both discoverable through `list_sessions` without ever being told their ids; a session's current URL reflects real navigation; listing does not itself touch `lastActivity`; a released session drops out of the list. |
+| `screenshot-cache.test.ts` | `mode: 'cached'` writes a real PNG to the cache dir (magic-byte checked via file size/existence) and returns a reference with no inline image block; default mode is unchanged (inline, nothing written); `cleanScreenshotCache` deletes a backdated file past TTL and leaves a fresh one; a missing cache dir is a no-op, not an error. |
+| `console-network-buffer.test.ts` | `read_console` surfaces buffered `console.log`/`console.error` messages from before the tool was ever called; `list_network_requests` captures a real request+response pair for a live navigation; `clear: true` drains the buffer; the buffer is genuinely bounded (oldest entries dropped once over the configured limit). |
+| `cdp-command.test.ts` | `send_cdp_command` against a live page returns real structured `Page.getLayoutMetrics` / `Runtime.evaluate` results; an unknown CDP method rejects with a real protocol error, not a silent no-op. |
 
 All three consecutive full runs during development passed with zero
 flakiness, and left zero orphaned Chromium or daemon processes behind
@@ -279,3 +292,99 @@ flakiness, and left zero orphaned Chromium or daemon processes behind
   `@playwright/mcp`'s equivalent — a subagent driving its own session can
   run arbitrary JS in that session's page. Not a new risk this project
   introduces, just worth naming.
+
+## 9. v1.1: session discovery, screenshot caching, browser telemetry, raw CDP
+
+Four additions, all built on the same two processes and the same single
+sweep timer — no new moving parts at the architecture level.
+
+### 9.1 `list_sessions`
+
+Before this, a session was only reachable if the caller already had its
+`sessionId` — there was no way for a lead agent to discover what its
+subagents currently have open. `list_sessions` is a new, unscoped read:
+`SessionStore.listSessions()` walks the in-memory table and returns every
+session's id, `createdAt`, `lastActivity`, active tab's `pageId`/`url`, and
+tab count. Deliberately **not scoped to any caller** — the whole point is
+discovery without a prior handoff — and deliberately does **not** touch any
+listed session's `lastActivity` (matching `reapIdle`'s existing precedent:
+inspecting a session's state is not activity on that session).
+
+### 9.2 Screenshot caching with TTL cleanup
+
+`screenshot` gained a `mode: 'inline' | 'cached'` parameter (default
+`'inline'`, i.e. the original behavior — base64, written nowhere).
+`mode: 'cached'` writes the PNG to `HARBORAGE_SCREENSHOT_CACHE_DIR`
+(default `~/.harborage/screenshots/`) under a random `cacheId.png`, and
+returns `{ cacheId, path, sizeBytes, expiresAt }` instead of image bytes.
+
+Two design calls worth naming:
+
+- **`cached` mode does not also return the inline image data.** The
+  entire point of caching is to let a subagent avoid paying the token
+  cost of a large or frequently-repeated screenshot; returning both would
+  defeat that. A caller that wants both just calls `screenshot` twice (or
+  reads the cached file itself) — cheap, and keeps the common case (one
+  or the other) from paying for the uncommon one.
+- **Cleanup rides the existing sweep timer, not a fourth mechanism.**
+  `cleanScreenshotCache()` (`src/daemon/screenshotCache.ts`) deletes any
+  file under the cache directory whose mtime is older than
+  `HARBORAGE_SCREENSHOT_CACHE_TTL_MS` (default 30 minutes), and is called
+  from `runSweepOnce()` alongside idle-session reaping and registry
+  pruning — matching §4.2's "one in-process timer" philosophy exactly,
+  rather than adding a second scheduled job just for this. A missing
+  cache directory (nothing has ever been cached) is a no-op, not an
+  error, so this is safe to call from the very first sweep of a fresh
+  daemon.
+
+### 9.3 Console and network buffering
+
+Playwright exposes `page.on('console', ...)`, `page.on('request', ...)`,
+and `page.on('response', ...)` per page, but nothing before v1.1 was
+listening — the events fired into the void. `SessionStore` now attaches
+these listeners to every page at the moment it's created (the initial
+page in `createSession`, and again for every tab the page itself opens via
+`context.on('page', ...)`), pushing into two **bounded** per-session
+buffers (`consoleBuffer`, `networkBuffer`), each capped at
+`HARBORAGE_CONSOLE_BUFFER_SIZE` / `HARBORAGE_NETWORK_BUFFER_SIZE` entries
+(default 200 each) — oldest entries silently dropped once over the limit,
+so a long-lived session's memory footprint for this doesn't grow
+unbounded. `read_console` and `list_network_requests` read (and, with
+`clear: true`, drain) these buffers, optionally filtered to one `pageId`.
+
+Buffering starts at session creation, not at the moment a tool first asks
+for it — so a subagent that navigates, does a few things, and *then*
+calls `read_console` still sees everything that happened in between, not
+just messages emitted after the call.
+
+### 9.4 `send_cdp_command` — raw CDP access for an agent, not just a human
+
+`escalate_session` (§3) already exposes real CDP, but only as a
+`webSocketDebuggerUrl` for a *human* to attach to by hand. `send_cdp_command`
+is the agent-facing equivalent: given `sessionId` (+ optional `pageId`),
+a CDP `method` string, and optional `params`, it opens a
+`context.newCDPSession(page)` (the same mechanism `escalate_session`
+already uses to resolve a target), calls `.send(method, params)` directly,
+and returns the structured result — no human, no WebSocket URL, no
+DevTools frontend involved. `method` is necessarily a runtime string
+rather than one of Playwright's literal CDP-method types, since the
+whole point is letting the caller issue *any* CDP command; the resulting
+type cast is deliberate, not a workaround. One implementation pitfall
+worth naming: `cdpSession.send` must be called directly on `cdpSession`
+(not extracted into a standalone function reference first) — Playwright's
+`CDPSession.send` relies on its own `this` binding internally, and
+detaching the method loses it silently (surfaced during testing as
+`Cannot read properties of undefined (reading '_channel')`, not a
+type error).
+
+### 9.5 Testing and config additions
+
+Four new env vars (`HARBORAGE_SCREENSHOT_CACHE_DIR`,
+`HARBORAGE_SCREENSHOT_CACHE_TTL_MS`, `HARBORAGE_CONSOLE_BUFFER_SIZE`,
+`HARBORAGE_NETWORK_BUFFER_SIZE`), all following the existing `HARBORAGE_*`
+convention with documented defaults. Fourteen new tests across four files
+(§7) bring the suite to 33, still entirely against real Chromium with no
+mocks; all pre-existing tests continue to pass unchanged (the only
+pre-existing test file touched was `screenshot-inline.test.ts`, updated
+for `createToolHandlers`'s new config-object signature — its assertions
+are unchanged).

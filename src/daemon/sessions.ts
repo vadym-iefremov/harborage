@@ -17,6 +17,42 @@ export class PageNotFoundError extends Error {
   }
 }
 
+/** One buffered `console` message from a session's tab. */
+export interface ConsoleEntry {
+  pageId: string;
+  type: string;
+  text: string;
+  timestamp: number;
+}
+
+/** One buffered network request or response from a session's tab. */
+export interface NetworkEntry {
+  pageId: string;
+  direction: 'request' | 'response';
+  url: string;
+  method?: string;
+  resourceType?: string;
+  status?: number;
+  statusText?: string;
+  timestamp: number;
+}
+
+/** Max buffered entries kept per session (console + network, each independently bounded). */
+export interface BufferLimits {
+  console: number;
+  network: number;
+}
+
+const defaultBufferLimits: BufferLimits = { console: 200, network: 200 };
+
+/** Pushes onto a bounded array, dropping the oldest entries once over `max`. */
+function pushBounded<T>(buffer: T[], entry: T, max: number): void {
+  buffer.push(entry);
+  if (buffer.length > max) {
+    buffer.splice(0, buffer.length - max);
+  }
+}
+
 interface SessionRecord {
   id: string;
   context: BrowserContext;
@@ -25,6 +61,8 @@ interface SessionRecord {
   activePageId: string;
   createdAt: number;
   lastActivity: number;
+  consoleBuffer: ConsoleEntry[];
+  networkBuffer: NetworkEntry[];
 }
 
 /** What a tool handler gets back after resolving a sessionId (+ optional pageId). */
@@ -32,6 +70,16 @@ export interface ResolvedTarget {
   session: SessionRecord;
   page: Page;
   pageId: string;
+}
+
+/** One row of `list_sessions` output — deliberately not scoped to any particular caller. */
+export interface SessionSummary {
+  sessionId: string;
+  createdAt: number;
+  lastActivity: number;
+  pageId: string;
+  url: string | undefined;
+  tabCount: number;
 }
 
 /**
@@ -43,8 +91,56 @@ export interface ResolvedTarget {
  */
 export class SessionStore {
   private readonly sessions = new Map<string, SessionRecord>();
+  private readonly bufferLimits: BufferLimits;
 
-  constructor(private readonly browserManager: BrowserManager) {}
+  constructor(private readonly browserManager: BrowserManager, bufferLimits: Partial<BufferLimits> = {}) {
+    this.bufferLimits = { ...defaultBufferLimits, ...bufferLimits };
+  }
+
+  /**
+   * Wires up console/network buffering for one page. Called for the initial
+   * page at session creation and again for every tab the page itself opens
+   * (`window.open`, `target="_blank"`), so a subagent that never calls
+   * `list_tabs` first still gets buffered activity for tabs it didn't
+   * explicitly create.
+   */
+  private attachBuffers(record: SessionRecord, page: Page, pageId: string): void {
+    page.on('console', msg => {
+      pushBounded(
+        record.consoleBuffer,
+        { pageId, type: msg.type(), text: msg.text(), timestamp: Date.now() },
+        this.bufferLimits.console
+      );
+    });
+    page.on('request', req => {
+      pushBounded(
+        record.networkBuffer,
+        {
+          pageId,
+          direction: 'request',
+          url: req.url(),
+          method: req.method(),
+          resourceType: req.resourceType(),
+          timestamp: Date.now()
+        },
+        this.bufferLimits.network
+      );
+    });
+    page.on('response', res => {
+      pushBounded(
+        record.networkBuffer,
+        {
+          pageId,
+          direction: 'response',
+          url: res.url(),
+          status: res.status(),
+          statusText: res.statusText(),
+          timestamp: Date.now()
+        },
+        this.bufferLimits.network
+      );
+    });
+  }
 
   async createSession(storageState?: unknown): Promise<{ sessionId: string; pageId: string }> {
     const browser = await this.browserManager.getBrowser();
@@ -63,7 +159,9 @@ export class SessionStore {
       nextPageSeq: 1,
       activePageId: pageId,
       createdAt: now,
-      lastActivity: now
+      lastActivity: now,
+      consoleBuffer: [],
+      networkBuffer: []
     };
 
     // A tab opened by the page itself (window.open, a target="_blank" link,
@@ -74,6 +172,7 @@ export class SessionStore {
       const id = String(record.nextPageSeq++);
       record.pages.set(id, newPage);
       record.activePageId = id;
+      this.attachBuffers(record, newPage, id);
       newPage.on('close', () => {
         record.pages.delete(id);
       });
@@ -82,6 +181,7 @@ export class SessionStore {
     page.on('close', () => {
       record.pages.delete(pageId);
     });
+    this.attachBuffers(record, page, pageId);
 
     this.sessions.set(sessionId, record);
     return { sessionId, pageId };
@@ -113,6 +213,47 @@ export class SessionStore {
         title: await page.title().catch(() => '')
       }))
     );
+  }
+
+  /**
+   * Every currently active session, machine-wide — not scoped to whichever
+   * caller happens to ask. This is what lets a lead agent discover what
+   * subagents already have running without being told a sessionId first.
+   * Deliberately does not touch `lastActivity` for any listed session
+   * (matching `reapIdle`'s own precedent: inspecting state is not activity).
+   */
+  listSessions(): SessionSummary[] {
+    return [...this.sessions.values()].map(record => {
+      const activePage = record.pages.get(record.activePageId);
+      return {
+        sessionId: record.id,
+        createdAt: record.createdAt,
+        lastActivity: record.lastActivity,
+        pageId: record.activePageId,
+        url: activePage?.url(),
+        tabCount: record.pages.size
+      };
+    });
+  }
+
+  /** Buffered console messages for a session, optionally filtered to one tab. */
+  getConsoleMessages(sessionId: string, pageId?: string, clear = false): ConsoleEntry[] {
+    const record = this.getRecord(sessionId);
+    const matches = pageId ? record.consoleBuffer.filter(e => e.pageId === pageId) : [...record.consoleBuffer];
+    if (clear) {
+      record.consoleBuffer = pageId ? record.consoleBuffer.filter(e => e.pageId !== pageId) : [];
+    }
+    return matches;
+  }
+
+  /** Buffered network request/response entries for a session, optionally filtered to one tab. */
+  getNetworkEntries(sessionId: string, pageId?: string, clear = false): NetworkEntry[] {
+    const record = this.getRecord(sessionId);
+    const matches = pageId ? record.networkBuffer.filter(e => e.pageId === pageId) : [...record.networkBuffer];
+    if (clear) {
+      record.networkBuffer = pageId ? record.networkBuffer.filter(e => e.pageId !== pageId) : [];
+    }
+    return matches;
   }
 
   async releaseSession(sessionId: string): Promise<void> {

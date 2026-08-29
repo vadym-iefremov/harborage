@@ -1,6 +1,6 @@
 {
   "name": "harborage",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A shared, on-demand pool of isolated headless browser sessions for Claude Code subagents.",
   "license": "MIT",
   "type": "module",

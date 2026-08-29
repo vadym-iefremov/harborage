@@ -27,13 +27,18 @@ one shared headless Chromium process.
 
 ## What it gives a subagent
 
-Eleven MCP tools: `create_session` (optionally seeded from previously
+Fifteen MCP tools: `create_session` (optionally seeded from previously
 exported storage state), `navigate`, `click`, `fill`, `evaluate`,
 `snapshot` (an AI-readable accessibility tree), `list_tabs`,
-`screenshot` (inline base64, never written to disk), `export_state`
-(for seeding future sessions), `escalate_session` (hands a stuck session
-to a human via a real Chrome DevTools Protocol WebSocket URL), and
-`release_session`.
+`screenshot` (inline base64 by default, or `mode: 'cached'` to write it to
+a TTL-expiring local cache instead), `export_state` (for seeding future
+sessions), `escalate_session` (hands a stuck session to a *human* via a
+real Chrome DevTools Protocol WebSocket URL), `release_session`,
+`list_sessions` (every active session machine-wide, discoverable without
+already knowing a sessionId), `read_console` and `list_network_requests`
+(buffered browser console/network activity, since session creation), and
+`send_cdp_command` (raw CDP access for an *agent*, no human in the loop —
+escalate_session's counterpart).
 
 ## Requirements
 
@@ -88,6 +93,10 @@ once at startup by both the daemon and the client wrapper:
 | `HARBORAGE_SWEEP_INTERVAL_MS` | `60000` (1m) | How often the daemon reaps idle sessions and prunes its client registry. |
 | `HARBORAGE_SHUTDOWN_GRACE_MS` | `10000` | Minimum daemon uptime before an empty client registry is allowed to trigger self-shutdown. |
 | `HARBORAGE_STATE_DIR` | `~/.harborage` | Registry file + daemon log live here. |
+| `HARBORAGE_SCREENSHOT_CACHE_DIR` | `~/.harborage/screenshots` | Where `screenshot`'s `mode: 'cached'` writes PNGs. |
+| `HARBORAGE_SCREENSHOT_CACHE_TTL_MS` | `1800000` (30m) | A cached screenshot older than this (by file mtime) gets deleted by the same sweep that reaps idle sessions. |
+| `HARBORAGE_CONSOLE_BUFFER_SIZE` | `200` | Max buffered `console` messages kept per session tab (oldest dropped first). |
+| `HARBORAGE_NETWORK_BUFFER_SIZE` | `200` | Max buffered network request/response entries kept per session tab (oldest dropped first). |
 
 ## Development
 

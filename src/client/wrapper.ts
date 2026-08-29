@@ -34,7 +34,7 @@ function createReadyClient(config: Config): () => Promise<Client> {
       console.error('[harborage] could not determine this process\'s own start time; skipping registry registration');
     }
 
-    const client = new Client({ name: 'harborage-client-wrapper', version: '0.1.0' });
+    const client = new Client({ name: 'harborage-client-wrapper', version: '0.2.0' });
     await client.connect(new StreamableHTTPClientTransport(new URL(`http://${config.host}:${config.port}/mcp`)));
     return client;
   }
@@ -61,7 +61,7 @@ function forwardTool<T extends ToolName>(name: T, ensureReady: () => Promise<Cli
 }
 
 function buildStdioServer(ensureReady: () => Promise<Client>): McpServer {
-  const server = new McpServer({ name: 'harborage', version: '0.1.0' });
+  const server = new McpServer({ name: 'harborage', version: '0.2.0' });
 
   server.registerTool(
     'create_session',
@@ -117,6 +117,26 @@ function buildStdioServer(ensureReady: () => Promise<Client>): McpServer {
     'release_session',
     { description: toolDescriptions.release_session, inputSchema: toolInputSchemas.release_session },
     forwardTool('release_session', ensureReady)
+  );
+  server.registerTool(
+    'list_sessions',
+    { description: toolDescriptions.list_sessions, inputSchema: toolInputSchemas.list_sessions },
+    forwardTool('list_sessions', ensureReady)
+  );
+  server.registerTool(
+    'read_console',
+    { description: toolDescriptions.read_console, inputSchema: toolInputSchemas.read_console },
+    forwardTool('read_console', ensureReady)
+  );
+  server.registerTool(
+    'list_network_requests',
+    { description: toolDescriptions.list_network_requests, inputSchema: toolInputSchemas.list_network_requests },
+    forwardTool('list_network_requests', ensureReady)
+  );
+  server.registerTool(
+    'send_cdp_command',
+    { description: toolDescriptions.send_cdp_command, inputSchema: toolInputSchemas.send_cdp_command },
+    forwardTool('send_cdp_command', ensureReady)
   );
 
   return server;

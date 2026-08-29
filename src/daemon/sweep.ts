@@ -1,4 +1,5 @@
 import { pruneDead, readRegistry, writeRegistry, type RegistryEntry } from '../shared/registry.js';
+import { cleanScreenshotCache } from './screenshotCache.js';
 import type { SessionStore } from './sessions.js';
 
 export interface SweepDeps {
@@ -8,6 +9,10 @@ export interface SweepDeps {
   /** Minimum daemon uptime before an empty registry is allowed to trigger shutdown. */
   shutdownGraceMs: number;
   daemonStartedAt: number;
+  /** Directory `screenshot`'s `mode: 'cached'` writes PNGs to. */
+  screenshotCacheDir: string;
+  /** A cached screenshot file older than this (by mtime) gets deleted. */
+  screenshotCacheTtlMs: number;
   /** Called (and awaited) once, the moment the registry is confirmed empty past the grace period. */
   onEmptyRegistryShutdown: () => Promise<void>;
 }
@@ -16,22 +21,26 @@ export interface SweepOutcome {
   reapedSessions: string[];
   prunedClients: RegistryEntry[];
   remainingClients: number;
+  removedScreenshots: string[];
   triggeredShutdown: boolean;
 }
 
 /**
  * One pass of the daemon's single periodic job: reap idle browser sessions,
- * then prune the client registry and self-shut-down if it's now empty.
+ * prune the client registry (self-shutting-down if it's now empty), and
+ * delete cached screenshots past their TTL.
  *
- * Both jobs share one timer (see docs/superpowers/specs for why a second,
- * externally-scheduled process was rejected in favor of this): the daemon
- * is already a long-lived process once started, so an in-process
+ * All three jobs share one timer (see docs/superpowers/specs for why a
+ * second, externally-scheduled process was rejected in favor of this): the
+ * daemon is already a long-lived process once started, so an in-process
  * `setInterval` is strictly simpler than coordinating a second scheduled
  * script against the same state, with no correctness gap versus that
  * alternative.
  */
 export async function runSweepOnce(deps: SweepDeps): Promise<SweepOutcome> {
   const reapedSessions = await deps.sessions.reapIdle(deps.idleTimeoutMs);
+
+  const removedScreenshots = await cleanScreenshotCache(deps.screenshotCacheDir, deps.screenshotCacheTtlMs);
 
   const entries = await readRegistry(deps.registryPath);
   const { kept, dropped } = await pruneDead(entries);
@@ -46,7 +55,7 @@ export async function runSweepOnce(deps: SweepDeps): Promise<SweepOutcome> {
     await deps.onEmptyRegistryShutdown();
   }
 
-  return { reapedSessions, prunedClients: dropped, remainingClients: kept.length, triggeredShutdown };
+  return { reapedSessions, prunedClients: dropped, remainingClients: kept.length, removedScreenshots, triggeredShutdown };
 }
 
 export interface SweepHandle {

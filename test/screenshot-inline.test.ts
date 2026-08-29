@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import { BrowserManager } from '../src/daemon/browserManager.js';
 import { createToolHandlers } from '../src/daemon/tools/handlers.js';
 import { SessionStore } from '../src/daemon/sessions.js';
@@ -9,11 +13,13 @@ import { getFreePort, snapshotRepoFiles } from './helpers.js';
 let browserManager: BrowserManager;
 let sessions: SessionStore;
 let debugPort: number;
+let screenshotCacheDir: string;
 
 before(async () => {
   debugPort = await getFreePort();
   browserManager = new BrowserManager(debugPort);
   sessions = new SessionStore(browserManager);
+  screenshotCacheDir = join(mkdtempSync(join(tmpdir(), 'harborage-test-')), 'screenshots');
 });
 
 after(async () => {
@@ -24,7 +30,7 @@ after(async () => {
 test('screenshot returns inline base64 image data and writes nothing to disk anywhere in the repo', async () => {
   const filesBefore = snapshotRepoFiles();
 
-  const handlers = createToolHandlers(sessions, debugPort);
+  const handlers = createToolHandlers(sessions, { debugPort, screenshotCacheDir, screenshotCacheTtlMs: 30 * 60 * 1000 });
   const { sessionId } = await sessions.createSession();
   await sessions.resolve(sessionId).page.goto('data:text/html,<h1 style="color:blue">inline screenshot check</h1>');
 

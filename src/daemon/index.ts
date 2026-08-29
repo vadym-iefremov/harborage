@@ -20,7 +20,10 @@ async function main(): Promise<void> {
   const startedAt = Date.now();
 
   const browserManager = new BrowserManager(config.debugPort);
-  const sessions = new SessionStore(browserManager);
+  const sessions = new SessionStore(browserManager, {
+    console: config.consoleBufferSize,
+    network: config.networkBufferSize
+  });
 
   let shuttingDown = false;
   async function shutdown(reason: string): Promise<void> {
@@ -35,7 +38,16 @@ async function main(): Promise<void> {
 
   let http: Awaited<ReturnType<typeof startHttpServer>>;
   try {
-    http = await startHttpServer(config.host, config.port, createServerFactory(sessions, config.debugPort), startedAt);
+    http = await startHttpServer(
+      config.host,
+      config.port,
+      createServerFactory(sessions, {
+        debugPort: config.debugPort,
+        screenshotCacheDir: config.screenshotCacheDir,
+        screenshotCacheTtlMs: config.screenshotCacheTtlMs
+      }),
+      startedAt
+    );
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'EADDRINUSE') {
       // Another daemon instance is already serving this port — nothing to do.
@@ -52,6 +64,8 @@ async function main(): Promise<void> {
       idleTimeoutMs: config.idleTimeoutMs,
       shutdownGraceMs: config.shutdownGraceMs,
       daemonStartedAt: startedAt,
+      screenshotCacheDir: config.screenshotCacheDir,
+      screenshotCacheTtlMs: config.screenshotCacheTtlMs,
       onEmptyRegistryShutdown: async () => {
         await shutdown('client registry is empty');
         process.exit(0);

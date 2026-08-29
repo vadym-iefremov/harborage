@@ -38,6 +38,19 @@ export interface Config {
   registryPath: string;
   /** Path the detached daemon's stdout/stderr get redirected to. */
   daemonLogPath: string;
+  /** Directory `screenshot`'s `mode: 'cached'` writes PNGs to. `~/.harborage/screenshots` by default. */
+  screenshotCacheDir: string;
+  /**
+   * A cached screenshot older than this (by file mtime) gets deleted by the
+   * same sweep that already reaps idle sessions and prunes the client
+   * registry (see §4.2 of the design spec for why this rides the one
+   * existing timer instead of a second scheduled job).
+   */
+  screenshotCacheTtlMs: number;
+  /** Max buffered `console` messages kept per session tab (oldest dropped first). */
+  consoleBufferSize: number;
+  /** Max buffered network request/response entries kept per session tab (oldest dropped first). */
+  networkBufferSize: number;
   /** Max time the client wrapper's first tool call will wait for the daemon to become healthy. */
   daemonReadyTimeoutMs: number;
   /** Poll interval while waiting for the daemon to become healthy. */
@@ -84,6 +97,10 @@ export function loadConfig(): Config {
     stateDir,
     registryPath: str('HARBORAGE_REGISTRY_PATH', join(stateDir, 'registry.json')),
     daemonLogPath: str('HARBORAGE_DAEMON_LOG_PATH', join(stateDir, 'daemon.log')),
+    screenshotCacheDir: str('HARBORAGE_SCREENSHOT_CACHE_DIR', join(stateDir, 'screenshots')),
+    screenshotCacheTtlMs: num('HARBORAGE_SCREENSHOT_CACHE_TTL_MS', 30 * 60 * 1000),
+    consoleBufferSize: num('HARBORAGE_CONSOLE_BUFFER_SIZE', 200),
+    networkBufferSize: num('HARBORAGE_NETWORK_BUFFER_SIZE', 200),
     daemonReadyTimeoutMs: num('HARBORAGE_DAEMON_READY_TIMEOUT_MS', 60 * 1000),
     daemonHealthPollMs: num('HARBORAGE_DAEMON_HEALTH_POLL_MS', 200),
     testStartupDelayMs: num('HARBORAGE_TEST_STARTUP_DELAY_MS', 0)
