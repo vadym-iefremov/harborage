@@ -52,12 +52,13 @@ Wanted, beyond just fixing that:
   question: is any Claude Code process that ever registered as a
   potential user still alive at all. That's deliberately simpler than
   a real usage-based idle timer, and good enough for this.
-- **Not auto-fetching/cloning this wrapper on every use, yet.** Until
-  this is published to npm, the wrapper repo is set up once by hand by
-  whoever wants to use it, and the local `.mcp.json` just points at
-  that fixed path. The `npx <package>@latest`-style zero-setup
-  experience is explicitly deferred to the npm-distribution phase (see
-  §8).
+- **Not blocking the MCP handshake on slow first-time setup.** A
+  first run or an update may need to `docker pull` or fetch/install the
+  wrapper itself, work that can plausibly take 30-90+ seconds. Rather
+  than trying to make that fast, the wrapper never makes the MCP
+  `initialize` handshake wait on it at all (see §7). This sidesteps
+  needing to know Claude Code's exact startup-handshake timeout, which,
+  as of this writing, isn't documented upstream.
 
 ## 3. Why Steel, not a custom build
 
@@ -98,12 +99,17 @@ Gaps Steel doesn't cover, which this project supplies:
 
 ```
 Claude Code session (any project)
-        │  .mcp.json → "steel-qa": { command: node, args: [.../bin/cli.js] }
+        │  .mcp.json → "steel-qa": { command: npx,
+        │              args: [-y, "github:<you>/steel-qa-pool#<pinned-ref>"] }
         ▼
  our wrapper CLI (bin/cli.js)
-        │  1. ensure Steel's Compose stack is running (start if not)
-        │  2. register {pid, startedAt} into the shared registry file
-        │  3. exec/hand off stdio to Steel's official steel-mcp-server
+        │  1. reply to the MCP `initialize` handshake immediately,
+        │     before touching Docker at all (see §7)
+        │  2. ensure Steel's Compose stack is running (start if not) —
+        │     this is where any slow first-time pull/install happens,
+        │     deferred until the first real tool call, not the handshake
+        │  3. register {pid, startedAt} into the shared registry file
+        │  4. exec/hand off stdio to Steel's official steel-mcp-server
         ▼
  steel-mcp-server  ──HTTP──▶  Steel (Docker Compose, official image)
                                    │
@@ -138,10 +144,12 @@ have to babysit:
 
 1. **`docker-compose.yml`** — references Steel's official published
    image only, no vendored source.
-2. **`bin/cli.js`** — the wrapper: ensure-running, register, handoff.
-   Registered in `.mcp.json` for now as
-   `{"command": "node", "args": ["<absolute path>/bin/cli.js"]}`
-   (see §8 for why this isn't `npx` yet).
+2. **`bin/cli.js`** — the wrapper: handshake-first, then
+   ensure-running, register, handoff. Registered in `.mcp.json` as
+   `{"command": "npx", "args": ["-y", "github:<you>/steel-qa-pool#<pinned-ref>"], "env": {"MCP_TIMEOUT": "120000"}}`
+   (see §8 for why this works without an npm publish, and §7 for why
+   `MCP_TIMEOUT` is set explicitly rather than relying on Claude Code's
+   undocumented default).
 3. **Registry file** — a small JSON file, `[{pid, startedAt}, ...]`,
    living in a fixed machine-level location outside any single
    project (e.g. `~/.steel-qa-pool/registry.json`), since this is a
@@ -201,20 +209,43 @@ a failure.
   it a few seconds later. Not a correctness issue, just latency.
 - **PID reuse.** Guarded by storing and re-checking the process's start
   time alongside its PID, not PID existence alone.
+- **Slow first-time setup vs. the MCP connection timeout.** Claude Code
+  has a startup-handshake timeout (`MCP_TIMEOUT`) whose default value
+  isn't documented anywhere, confirmed unconfirmable as of this
+  writing, not just something I failed to find. A `docker pull` or a
+  cold `npx` fetch on first use could plausibly exceed an unknown
+  default and get the connection killed before it ever finishes. Two
+  layers of defense, not relying on either alone: (1) the wrapper
+  answers the `initialize` handshake immediately and only blocks on
+  Docker/Steel readiness inside the first actual tool call, which has a
+  far more generous budget (a per-server `timeout` in `.mcp.json`, or
+  roughly 28 hours by default, plus a 30-minute idle allowance); (2) we
+  still set `MCP_TIMEOUT` explicitly and generously (120000ms) in our
+  own `.mcp.json` entry, so we're never depending on an undocumented
+  default in the first place.
 
 ## 8. Distribution (this phase vs. later)
 
-**Now:** the repo is cloned locally by hand by whoever wants to use it.
-`.mcp.json` points at the absolute local path
-(`node <path>/bin/cli.js`), no auto-clone, no `npx` resolution. This is
-a deliberate simplification, not a missing feature, until there's a
-published package to fetch.
+**Now:** verified directly (a local git repo with a real dependency,
+run multiple ways) that `npx` supports installing straight from a git
+spec, `npx github:<you>/steel-qa-pool#<ref>`, with no npm registry
+publish involved at all. This is a real one-liner today, not something
+deferred to a later phase. The detail that matters: **pin an exact
+commit or tag, don't track a floating branch.** A floating ref (e.g.
+just `main`) gets re-resolved against the remote on every single
+invocation, real network latency every time against a real GitHub
+remote, not just on first use. A pinned ref resolves the same way
+every time and is what actually gives "already fetched this exact
+version, don't redo the work" behavior. Cutting a new version means
+deliberately updating the pinned ref in `.mcp.json`, not just pushing
+to `main` and expecting it to propagate.
 
-**Later (out of scope for this spec):** publish to npm, so
+**Later (out of scope for this spec):** publish to npm anyway, so
 `.mcp.json` can use `"command": "npx", "args": ["-y", "steel-qa-pool@latest"]`
-the same way `@playwright/mcp` is used today, no local clone needed at
-all. This is the point at which "no setup beyond having Docker" becomes
-literally true for anyone.
+the same way `@playwright/mcp` is used today. The GitHub-based install
+already works without it; npm mainly buys a shorter install spec and
+the conventional `@latest`/version-tag ergonomics people expect from an
+MCP server.
 
 ## 9. Open items (deliberately unresolved here, resolve during implementation)
 
@@ -240,3 +271,6 @@ literally true for anyone.
 - Kill a fake registered PID, wait past one sweep interval, confirm the
   Steel stack actually stops.
 - Confirm ensure-running cleanly restarts Steel after a stop.
+- Simulate a slow cold start (e.g. temporarily delay the Docker step)
+  and confirm the MCP connection still completes its handshake
+  immediately, only the first tool call is slow.
