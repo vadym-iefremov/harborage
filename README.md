@@ -1,24 +1,22 @@
 # harborage
 
 A shared, on-demand pool of isolated headless browser sessions for
-Claude Code subagents, built on [Steel](https://github.com/steel-dev/steel-browser)
-(self-hosted, unmodified) and its official MCP server.
+Claude Code subagents, built directly on
+[Playwright](https://playwright.dev/).
 
 Run several browser-driving subagents in parallel without them fighting
 over the same tab, without a visible window flickering on screen, and
-without duplicating a browser MCP server per project. See
-[`docs/superpowers/specs/2026-08-29-harborage-design.md`](docs/superpowers/specs/2026-08-29-harborage-design.md)
-for the full design and rationale.
+without duplicating a browser MCP server per project.
 
-**Status:** design complete, implementation in progress. Not usable yet.
+**Status:** redesigning from scratch (an earlier design built on a
+third-party self-hosted browser service turned out to hard-limit
+self-hosted use to one session at a time, a dealbreaker for this
+project's actual goal). New design in progress. Not usable yet.
 
 ## Requirements
 
-- [Docker](https://www.docker.com/) installed and running.
 - Node.js.
 
 ## License
 
-MIT, see [LICENSE](LICENSE). Steel itself is Apache 2.0, this repo only
-wraps it as an unmodified upstream dependency and doesn't redistribute
-its source.
+MIT, see [LICENSE](LICENSE).
