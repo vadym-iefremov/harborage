@@ -41,6 +41,58 @@ export function pngDimensions(buffer: Buffer): { width: number; height: number }
  */
 const ansiEscape = new RegExp('\\u001b\\[[0-9;]*m', 'g');
 
+/**
+ * CDP domains Chromium routes to the BROWSER rather than to the tab a page
+ * session is attached to, and which therefore reach straight past session
+ * isolation.
+ *
+ * Measured against real Chromium rather than assumed. From an ordinary
+ * page-scoped CDP session, one harborage session could:
+ * - `Target.getTargets`: list every other session's tabs, with their URLs,
+ *   titles and browserContextIds.
+ * - `Target.closeTarget`: close another session's only tab, leaving that
+ *   session alive but unusable by every tool that resolves a pageId.
+ * - `Target.createTarget` with another session's browserContextId: open a
+ *   tab INSIDE that session, which harborage then adopts and makes active,
+ *   so the victim's next call that omits pageId runs in a tab an unrelated
+ *   agent opened.
+ * - `Browser.close`: terminate the single shared Chromium, destroying every
+ *   session on the machine.
+ *
+ * Everything else stays inside the tab on its own: Chromium itself refuses
+ * `SystemInfo.getInfo`, and a `browserContextId` on `Storage.getCookies`,
+ * from a page session ("only supported on the browser target"), and
+ * Playwright refuses `Target.createBrowserContext` and
+ * `Target.disposeBrowserContext`. So the guard is exactly these two domains,
+ * rather than an allow-list that would defeat the point of a raw escape hatch.
+ */
+const browserScopedCdpDomains = new Set(['Browser', 'Target']);
+
+/**
+ * The refusal message for a command that would leave this session, or null
+ * if the command is genuinely confined to the caller's own tab.
+ *
+ * `Target.getTargetInfo` asked about the caller's own tab is page-scoped, and
+ * is how escalate_session finds its own target id, so it stays allowed. Given
+ * a `targetId` or a `browserContextId` it reads another session's tab
+ * instead, so that form does not.
+ */
+export function cdpScopeRefusal(method: string, params: unknown): string | null {
+  const domain = method.split('.')[0] ?? '';
+  if (!browserScopedCdpDomains.has(domain)) return null;
+
+  const named = typeof params === 'object' && params !== null ? (params as Record<string, unknown>) : {};
+  const namesAnotherTarget = named.targetId !== undefined || named.browserContextId !== undefined;
+  if (method === 'Target.getTargetInfo' && !namesAnotherTarget) return null;
+
+  return (
+    `send_cdp_command refuses "${method}": Chromium routes the ${domain} domain to the browser rather than to this ` +
+    'session\'s tab, so it reaches every other session sharing this daemon\'s Chromium. Use list_tabs, new_tab, ' +
+    'close_tab and select_tab for this session\'s own tabs, escalate_session for a human-drivable CDP URL, and ' +
+    'release_session to end a session. Every domain outside Browser and Target is still available here.'
+  );
+}
+
 function messageOf(err: unknown): string {
   return (err instanceof Error ? err.message : String(err)).replace(ansiEscape, '');
 }
@@ -529,7 +581,14 @@ export const inspectTools = defineTools({
       'Send a raw Chrome DevTools Protocol command directly to a session\'s tab and get the structured result back. ' +
       'This is the agent-facing counterpart to escalate_session\'s human-facing CDP access. ' +
       'Not for captures: Page.captureScreenshot hands back bare base64 with no dimensions and no route into the ' +
-      'screenshot cache, so use the screenshot tool, with selector or clip, for anything you want to look at.',
+      'screenshot cache, so use the screenshot tool, with selector or clip, for anything you want to look at. ' +
+      'The Browser and Target domains are REFUSED, because Chromium routes them to the browser rather than to your ' +
+      'tab: through them one session could list, close and even open tabs inside other sessions, and close the ' +
+      'shared Chromium every session on this machine is using. Use list_tabs, new_tab, close_tab and select_tab for ' +
+      'your own tabs instead. Target.getTargetInfo about your own tab (no targetId) is still allowed. ' +
+      'Also note this tool DETACHES after every call, so any Emulation.set*Override sent through it is reverted ' +
+      'before the result comes back: use set_user_agent, set_timezone, set_locale and set_network_conditions, which ' +
+      'hold their CDP session open.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -539,6 +598,11 @@ export const inspectTools = defineTools({
       params: z.unknown().optional().describe('Params object for the CDP method, if the method takes any.')
     }),
     async handler(ctx, args) {
+      // Before resolving anything: a command that would leave this session is
+      // refused outright rather than sent and then regretted.
+      const refusal = cdpScopeRefusal(args.method, args.params);
+      if (refusal !== null) throw new Error(refusal);
+
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
       const cdpSession = await target.session.context.newCDPSession(target.page);
       try {

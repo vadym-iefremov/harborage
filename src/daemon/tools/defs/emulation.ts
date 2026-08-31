@@ -40,6 +40,13 @@ import { pageId, sessionId } from './common.js';
  */
 const overrideSessions = new WeakMap<Page, Promise<CDPSession>>();
 
+/**
+ * Pages whose close handler is already registered, so a retried attach after
+ * a failed one does not add a second copy. The map entry is evicted on
+ * failure; the listener was not, and each retry used to leave one behind.
+ */
+const overrideCloseHooked = new WeakSet<Page>();
+
 /** Which permission names this session has granted, so clear_permissions can report what it actually took away. */
 const grantedPermissions = new WeakMap<BrowserContext, Set<string>>();
 
@@ -64,9 +71,12 @@ function overrideSession(target: ResolvedTarget): Promise<CDPSession> {
     throw err;
   });
   overrideSessions.set(page, pending);
-  page.on('close', () => {
-    overrideSessions.delete(page);
-  });
+  if (!overrideCloseHooked.has(page)) {
+    overrideCloseHooked.add(page);
+    page.on('close', () => {
+      overrideSessions.delete(page);
+    });
+  }
   return pending;
 }
 

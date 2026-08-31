@@ -39,13 +39,16 @@ export async function invokeTool(
   const sessionId = typeof args.sessionId === 'string' ? args.sessionId : undefined;
   // Tools that name no session (create_session, list_sessions) have nothing
   // to keep alive; an unknown sessionId is the handler's to complain about,
-  // so that callers keep getting the real SessionNotFoundError.
-  if (sessionId === undefined || !ctx.sessions.beginCall(sessionId)) return def.handler(ctx, args);
+  // so that callers keep getting the real SessionNotFoundError. (create_session
+  // is not unprotected: SessionStore counts a creation in progress itself,
+  // since there is no sessionId to key one on until it returns.)
+  const callId = sessionId === undefined ? null : ctx.sessions.beginCall(sessionId);
+  if (sessionId === undefined || callId === null) return def.handler(ctx, args);
 
   try {
     return await def.handler(ctx, args);
   } finally {
-    ctx.sessions.endCall(sessionId);
+    ctx.sessions.endCall(sessionId, callId);
   }
 }
 

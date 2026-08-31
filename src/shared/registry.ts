@@ -83,3 +83,39 @@ export async function pruneDead(entries: RegistryEntry[]): Promise<PruneResult> 
   }
   return { kept, dropped };
 }
+
+/** Identity of one registration: a PID alone is not one, since PIDs get reused. */
+function keyOf(entry: RegistryEntry): string {
+  return `${entry.pid} ${entry.startedAt}`;
+}
+
+/**
+ * Prunes the registry FILE: reads it, works out which entries are dead, then
+ * writes back the file as it stands at that moment minus exactly the entries
+ * proven dead.
+ *
+ * The re-read is the point. `pruneDead` runs one `ps` per entry, so a busy
+ * registry holds the read and the write tens of milliseconds apart, and a
+ * client wrapper registering itself in that window used to be erased by the
+ * sweep's write: the wrapper believed it was registered, the daemon saw an
+ * empty registry, and with no live session to veto it the daemon exited under
+ * a client that was about to use it. Re-reading immediately before the write
+ * removes that window, and subtracting by pid+startedAt rather than by pid
+ * alone means a fresh process that reused a dead PID is not dropped with it.
+ *
+ * What this is NOT: a lock. Two processes writing at the same instant can
+ * still lose one update, but the window is now the microseconds between the
+ * re-read and an atomic rename, rather than the whole `ps` sweep. A real file
+ * lock would be the next step if that ever proves to matter.
+ */
+export async function pruneRegistryFile(path: string): Promise<PruneResult> {
+  const entries = await readRegistry(path);
+  const { kept, dropped } = await pruneDead(entries);
+  if (dropped.length === 0) return { kept, dropped };
+
+  const deadKeys = new Set(dropped.map(keyOf));
+  const fresh = await readRegistry(path);
+  const survivors = fresh.filter(entry => !deadKeys.has(keyOf(entry)));
+  await writeRegistry(path, survivors);
+  return { kept: survivors, dropped };
+}

@@ -141,21 +141,24 @@ interface SessionRecord {
   createdAt: number;
   lastActivity: number;
   /**
-   * How many tool calls are running against this session right now.
+   * Every tool call running against this session right now, call token to
+   * the moment it started.
    *
-   * Without it, `lastActivity` only moves when a call STARTS, so a
-   * `navigate` or an `evaluate` that runs longer than `idleTimeoutMs` had
-   * its own BrowserContext closed underneath it by the sweep. A session is
-   * only idle if nothing is happening in it, and a call in flight is
-   * something happening in it.
+   * The map exists rather than a plain counter because the reaper needs the
+   * age of the OLDEST running call, not the time since the session last had
+   * nothing running. A single counter plus a since-timestamp cannot tell
+   * those apart, and gets both directions wrong: a busy session whose calls
+   * overlap so the count never reaches zero looks wedged after
+   * `maxInFlightAgeMs` and is reaped mid-work, while resetting the
+   * timestamp on every new call would let a stream of short calls hide a
+   * genuinely wedged one forever.
+   *
+   * Why any of this is tracked at all: `lastActivity` only moves when a call
+   * STARTS, so a `navigate` or an `evaluate` running longer than
+   * `idleTimeoutMs` had its own BrowserContext closed underneath it by the
+   * sweep. A session is only idle if nothing is happening in it.
    */
-  inFlight: number;
-  /**
-   * When `inFlight` last rose from zero, so the reaper can tell a call that
-   * is merely slow from one that is never coming back. Cleared the moment
-   * the count returns to zero.
-   */
-  inFlightSince: number | undefined;
+  inFlightCalls: Map<number, number>;
   /**
    * When this session was handed to a human via `escalate_session`, if it
    * was. A human driving the session over CDP touches no tool, so nothing
@@ -224,6 +227,21 @@ export class SessionStore {
   private readonly sessions = new Map<string, SessionRecord>();
   private readonly bufferLimits: BufferLimits;
   private readonly timeouts: Required<SessionTimeouts>;
+  /** Hands out the token that pairs one `beginCall` with its own `endCall`. */
+  private nextCallId = 1;
+  /**
+   * Sessions being built right now: past `createSession` starting, before it
+   * has returned a sessionId.
+   *
+   * A create is invisible to `count()`, because there is no record to count
+   * yet, and it is invisible to the in-flight machinery, because the caller
+   * has no sessionId to name. That left the one hole in the daemon's
+   * live-session veto: with the client registry empty, a sweep landing during
+   * a create_session found zero sessions, shut the daemon down and took the
+   * half-built context (and, on a cold daemon, the Chromium still launching)
+   * with it.
+   */
+  private pendingCreations = 0;
 
   /**
    * The logger is injected rather than imported as a module-level singleton
@@ -475,6 +493,18 @@ export class SessionStore {
    * not appear in the object at all.
    */
   async createSession(options: CreateSessionOptions = {}): Promise<{ sessionId: string; pageId: string }> {
+    // Counted from here, and only given back in the `finally` below, so the
+    // daemon's shutdown gate can see work that has not produced a sessionId
+    // yet. On a cold daemon this stretch includes launching Chromium.
+    this.pendingCreations += 1;
+    try {
+      return await this.buildSession(options);
+    } finally {
+      this.pendingCreations -= 1;
+    }
+  }
+
+  private async buildSession(options: CreateSessionOptions): Promise<{ sessionId: string; pageId: string }> {
     const browser = await this.browserManager.getBrowser();
 
     const contextOptions: BrowserContextOptions = {};
@@ -494,8 +524,7 @@ export class SessionStore {
       activePageId: '0',
       createdAt: now,
       lastActivity: now,
-      inFlight: 0,
-      inFlightSince: undefined,
+      inFlightCalls: new Map(),
       escalatedAt: undefined,
       consoleBuffer: [],
       networkBuffer: [],
@@ -648,7 +677,7 @@ export class SessionStore {
         pageId: record.activePageId,
         url: activePage?.url(),
         tabCount: record.pages.size,
-        inFlight: record.inFlight,
+        inFlight: record.inFlightCalls.size,
         escalated: record.escalatedAt !== undefined,
         escalatedAt: record.escalatedAt
       };
@@ -773,6 +802,16 @@ export class SessionStore {
     return this.sessions.size;
   }
 
+  /**
+   * Sessions plus creations still in progress: what the daemon's self-
+   * shutdown gate must read, since a `create_session` that has not returned
+   * yet is work the daemon would destroy by exiting, exactly like a live
+   * session, and it is not in `count()` because it has no record yet.
+   */
+  liveOrPendingCount(): number {
+    return this.sessions.size + this.pendingCreations;
+  }
+
   /** All session ids currently held, for the reaper and for tests/introspection. */
   listSessionIds(): string[] {
     return [...this.sessions.keys()];
@@ -792,14 +831,14 @@ export class SessionStore {
    * counter is worse than the bug this fixes, because it makes a session
    * permanently unreapable rather than reapable too early.
    */
-  beginCall(sessionId: string): boolean {
+  beginCall(sessionId: string): number | null {
     const record = this.sessions.get(sessionId);
-    if (!record) return false;
+    if (!record) return null;
     const now = Date.now();
-    if (record.inFlight === 0) record.inFlightSince = now;
-    record.inFlight += 1;
+    const callId = this.nextCallId++;
+    record.inFlightCalls.set(callId, now);
     record.lastActivity = now;
-    return true;
+    return callId;
   }
 
   /**
@@ -807,18 +846,22 @@ export class SessionStore {
    * Refreshing on COMPLETION, not just on start, is what stops a long call
    * from returning a session that is already stale enough for the next
    * sweep to reap.
+   *
+   * Takes the token `beginCall` handed out rather than just the session id,
+   * so the call that ends is the call that started. Ending "the oldest one"
+   * instead would let a short call retire a long call's start time and reset
+   * a wedged call's age.
    */
-  endCall(sessionId: string): void {
+  endCall(sessionId: string, callId: number): void {
     const record = this.sessions.get(sessionId);
     if (!record) return;
-    record.inFlight = Math.max(0, record.inFlight - 1);
-    if (record.inFlight === 0) record.inFlightSince = undefined;
+    record.inFlightCalls.delete(callId);
     record.lastActivity = Date.now();
   }
 
   /** Tool calls currently running against a session. Zero for an unknown session. */
   inFlightCount(sessionId: string): number {
-    return this.sessions.get(sessionId)?.inFlight ?? 0;
+    return this.sessions.get(sessionId)?.inFlightCalls.size ?? 0;
   }
 
   /**
@@ -855,12 +898,16 @@ export class SessionStore {
       // reaper stops believing the call and says so in the log, because a
       // session disappearing out from under a caller needs to be explicable
       // afterwards.
-      if (record.inFlight > 0) {
-        const inFlightAgeMs = now - (record.inFlightSince ?? now);
+      if (record.inFlightCalls.size > 0) {
+        // The OLDEST running call, not the most recent one and not the time
+        // since the session was last quiet: only the oldest can tell a call
+        // that is never coming back from a session that is merely busy.
+        const oldestStartedAt = Math.min(...record.inFlightCalls.values());
+        const inFlightAgeMs = now - oldestStartedAt;
         if (inFlightAgeMs <= this.timeouts.maxInFlightAgeMs) continue;
         this.logger.log('session.reap-stuck', {
           sessionId: id,
-          inFlight: record.inFlight,
+          inFlight: record.inFlightCalls.size,
           inFlightAgeMs,
           maxInFlightAgeMs: this.timeouts.maxInFlightAgeMs,
           reason: 'call-never-returned'

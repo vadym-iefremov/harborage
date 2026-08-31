@@ -119,6 +119,17 @@ interface SessionNetState {
   throttle: Throttle | null;
   /** CDP sessions held open per page. Held, not detached, because detaching drops the emulation. */
   cdp: Map<Page, CDPSession>;
+  /**
+   * Pages whose close handler is already registered.
+   *
+   * Without it, every attach registered another `once('close')` and every
+   * detach left it behind, so toggling a throttle profile on and off piled up
+   * one dead listener per cycle on the same tab: at ten Node warns about a
+   * leak, and a long QA run does far more than ten. One handler per page is
+   * enough, since all it does is drop that page from the map, which is a
+   * no-op when there is nothing to drop.
+   */
+  closeHooked: WeakSet<Page>;
 }
 
 /**
@@ -149,7 +160,13 @@ function stateFor(ctx: ToolContext, id: string): { state: SessionNetState; targe
   const existing = netStates.get(id);
   if (existing) return { state: existing, target };
 
-  const state: SessionNetState = { rules: [], offline: false, throttle: null, cdp: new Map() };
+  const state: SessionNetState = {
+    rules: [],
+    offline: false,
+    throttle: null,
+    cdp: new Map(),
+    closeHooked: new WeakSet()
+  };
   netStates.set(id, state);
   target.session.context.once('close', () => {
     netStates.delete(id);
@@ -310,15 +327,29 @@ function conditionsFor(state: SessionNetState): {
   };
 }
 
+/**
+ * Registers this state's page-close handler exactly once per page.
+ *
+ * Once, because the handler is only ever needed to drop the page from
+ * `state.cdp`, and re-registering it on every attach (while every detach left
+ * the old one behind) grew the tab's listener list by one per throttle
+ * on/off cycle.
+ */
+function hookClose(state: SessionNetState, page: Page): void {
+  if (state.closeHooked.has(page)) return;
+  state.closeHooked.add(page);
+  page.once('close', () => {
+    state.cdp.delete(page);
+  });
+}
+
 /** Attaches to one page and applies the current conditions, if there is anything to apply. */
 async function attachThrottleToPage(state: SessionNetState, target: ResolvedTarget, page: Page): Promise<void> {
   if (state.throttle === null || page.isClosed() || state.cdp.has(page)) return;
   const cdp = await target.session.context.newCDPSession(page);
   await cdp.send('Network.enable');
   state.cdp.set(page, cdp);
-  page.once('close', () => {
-    state.cdp.delete(page);
-  });
+  hookClose(state, page);
   await cdp.send('Network.emulateNetworkConditions', conditionsFor(state));
 }
 
@@ -345,10 +376,7 @@ async function syncConditions(state: SessionNetState, target: ResolvedTarget): P
       cdp = await target.session.context.newCDPSession(page);
       await cdp.send('Network.enable');
       state.cdp.set(page, cdp);
-      const held = page;
-      held.once('close', () => {
-        state.cdp.delete(held);
-      });
+      hookClose(state, page);
     }
     await cdp.send('Network.emulateNetworkConditions', conditionsFor(state)).catch(() => {});
     applied.push(pageId);
