@@ -18,25 +18,31 @@ import { buildStdioServer } from '../src/client/wrapper.js';
 const expectedToolNames = [
   'click',
   'create_session',
+  'drag',
   'escalate_session',
   'evaluate',
   'export_state',
+  'file_upload',
   'fill',
   'hover',
   'list_network_requests',
   'list_sessions',
   'list_tabs',
   'navigate',
+  'navigate_back',
+  'navigate_forward',
   'press_key',
   'read_console',
   'release_session',
   'reload',
   'resize',
   'screenshot',
+  'select_option',
   'send_cdp_command',
   'snapshot',
   'type',
-  'wait_for'
+  'wait_for',
+  'wheel'
 ];
 
 /**
@@ -70,9 +76,9 @@ test('every tool definition is complete', () => {
   }
 });
 
-test('the tool surface is exactly the twenty-one tools listed here', () => {
+test('the tool surface is exactly the twenty-seven tools listed here', () => {
   assert.deepEqual([...toolNames].sort(), expectedToolNames);
-  assert.equal(toolNames.length, 21);
+  assert.equal(toolNames.length, 27);
   assert.equal(new Set(toolNames).size, toolNames.length, 'duplicate tool name in toolDefs');
 });
 
