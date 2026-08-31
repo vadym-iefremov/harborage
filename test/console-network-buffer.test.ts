@@ -91,7 +91,7 @@ test('clear: true drains the buffer after reading it', async () => {
   await sessions.releaseSession(sessionId);
 });
 
-test('the console buffer is bounded — oldest entries are dropped once over the limit', async () => {
+test('the console buffer is bounded: oldest entries are dropped once over the limit', async () => {
   const { sessions, handlers } = makeStore({ console: 5, network: 200 });
   const { sessionId } = await sessions.createSession();
   const target = sessions.resolve(sessionId);

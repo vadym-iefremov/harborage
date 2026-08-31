@@ -49,11 +49,11 @@ test('mode: "cached" writes a real PNG to the cache dir and returns a reference,
   assert.ok(fileBytes.size > 0);
   assert.ok(fileBytes.size === payload.sizeBytes);
 
-  // No image content block when caching — the point is avoiding the inline payload.
+  // No image content block when caching: the point is avoiding the inline payload.
   const hasImageBlock = (result.content as { type: string }[]).some(b => b.type === 'image');
   assert.equal(hasImageBlock, false);
 
-  // The repo itself is untouched — the cache lives entirely under the state dir.
+  // The repo itself is untouched: the cache lives entirely under the state dir.
   assert.deepEqual(snapshotRepoFiles(), filesBeforeInRepo);
 
   await sessions.releaseSession(sessionId);

@@ -2,7 +2,7 @@ import { chromium, type Browser } from 'playwright';
 
 /**
  * Owns the single Chromium process this daemon runs. Launched lazily, on
- * the first call to `getBrowser()` — not eagerly at daemon startup.
+ * the first call to `getBrowser()`, not eagerly at daemon startup.
  *
  * Why lazy: the client wrapper's ensure-running step spawns the daemon
  * unconditionally whenever a Claude Code session opens the MCP connection,
@@ -17,7 +17,7 @@ import { chromium, type Browser } from 'playwright';
  * Two more decisions worth calling out:
  * - `chromiumSandbox: true` is passed explicitly. Playwright's own default
  *   for this option is `false` (it adds `--no-sandbox` itself unless told
- *   otherwise) — simply not passing `--no-sandbox` in `args` is NOT enough
+ *   otherwise). Simply not passing `--no-sandbox` in `args` is NOT enough
  *   to keep the OS sandbox on, confirmed by directly inspecting the
  *   launched process's command line. This is the actual mechanism that
  *   satisfies "don't inherit @playwright/mcp's disabled-sandbox default".

@@ -37,11 +37,11 @@ test('pruneDead drops an entry whose PID no longer exists', async () => {
   assert.equal(dropped.length, 1);
 });
 
-test('pruneDead drops a live PID whose recorded startedAt does not match — the PID-reuse guard', async () => {
+test('pruneDead drops a live PID whose recorded startedAt does not match: the PID-reuse guard', async () => {
   const proc = spawnInertProcess();
   try {
     // A real, live PID, but a startedAt that does not match this process's
-    // actual start time — simulating "a different process now holds this
+    // actual start time, simulating "a different process now holds this
     // PID than the one that registered it".
     const bogusStartedAt = 'Thu Jan  1 00:00:00 1970';
     const { kept, dropped } = await pruneDead([{ pid: proc.pid, startedAt: bogusStartedAt }]);

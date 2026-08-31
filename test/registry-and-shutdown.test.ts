@@ -26,7 +26,7 @@ test('a fresh daemon does NOT self-shut-down before its grace period, even with 
   // Registry is empty from the moment it starts (nobody has registered).
   // Several sweeps fire well before the 3s grace period elapses.
   await new Promise(resolve => setTimeout(resolve, 800));
-  assert.equal(await isDaemonHealthy(config), true, 'daemon should still be alive — grace period has not elapsed');
+  assert.equal(await isDaemonHealthy(config), true, 'daemon should still be alive, the grace period has not elapsed');
 
   daemon.kill();
   await daemon.exited;

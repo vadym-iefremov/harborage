@@ -29,7 +29,7 @@ test('the launched Chromium process is genuinely headless and sandboxed', async 
   await sessions.createSession();
 
   // Find the OS process bound to the debug port we asked Chromium to open,
-  // then inspect its real command line — the only way to actually prove
+  // then inspect its real command line, the only way to actually prove
   // "headless" and "sandbox on" rather than just trusting our own launch
   // options were honored.
   const { stdout: lsofOut } = await execFileAsync('lsof', ['-nP', `-iTCP:${debugPort}`, '-sTCP:LISTEN']);

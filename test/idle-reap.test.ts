@@ -26,7 +26,7 @@ test('a session idle past the threshold gets reaped', async () => {
   const { sessionId } = await sessions.createSession();
   assert.ok(sessions.listSessionIds().includes(sessionId));
 
-  // Idle threshold shorter than the wait below — this session has done
+  // Idle threshold shorter than the wait below. This session has done
   // nothing since creation, so it must be past the threshold already.
   await sleep(60);
   const reaped = await sessions.reapIdle(30);
@@ -36,7 +36,7 @@ test('a session idle past the threshold gets reaped', async () => {
   assert.throws(() => sessions.resolve(sessionId), SessionNotFoundError);
 });
 
-test('activity resets the idle clock — an active session is not reaped', async () => {
+test('activity resets the idle clock: an active session is not reaped', async () => {
   const { sessionId } = await sessions.createSession();
 
   await sleep(60);

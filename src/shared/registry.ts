@@ -6,7 +6,7 @@ import { getProcessStartTime } from './processInfo.js';
 /** One client wrapper process that has registered as a potential user of the daemon. */
 export interface RegistryEntry {
   pid: number;
-  /** The `ps -o lstart=` value for `pid` at the moment it registered — the PID-reuse guard. */
+  /** The `ps -o lstart=` value for `pid` at the moment it registered. This is the PID-reuse guard. */
   startedAt: string;
 }
 
@@ -68,7 +68,7 @@ export interface PruneResult {
 /**
  * Drops any entry whose process is no longer alive, or whose live `lstart`
  * no longer matches what was recorded (a different process has since reused
- * that PID). Does not write anything itself — callers decide when to persist.
+ * that PID). Does not write anything itself: callers decide when to persist.
  */
 export async function pruneDead(entries: RegistryEntry[]): Promise<PruneResult> {
   const kept: RegistryEntry[] = [];

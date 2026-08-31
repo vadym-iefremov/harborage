@@ -21,7 +21,7 @@ test('the client wrapper answers the MCP initialize handshake immediately, even 
     daemonHealthPollMs: 100,
     // Fast enough that this test's own teardown (closing the wrapper, which
     // deregisters it) is followed quickly by the daemon it spawned noticing
-    // an empty registry and shutting itself down — see the assertion below.
+    // an empty registry and shutting itself down. See the assertion below.
     sweepIntervalMs: 200,
     shutdownGraceMs: 100
   });
@@ -56,7 +56,7 @@ test('the client wrapper answers the MCP initialize handshake immediately, even 
     `expected the handshake to complete well before the ${startupDelayMs}ms artificial daemon delay; took ${handshakeMs}ms`
   );
 
-  // The daemon is still cold-starting at this point — the FIRST real tool
+  // The daemon is still cold-starting at this point. The FIRST real tool
   // call is where that cost should actually be paid.
   const firstCallStart = Date.now();
   const result = await client.callTool({ name: 'create_session', arguments: {} });
@@ -78,7 +78,7 @@ test('the client wrapper answers the MCP initialize handshake immediately, even 
   // Closing the client kills the wrapper process (StdioClientTransport's
   // documented teardown), which deregisters itself on the way out; the
   // daemon it spawned should then notice the empty registry and shut
-  // itself down on its own — full real lifecycle, not just the direct
+  // itself down on its own: a full real lifecycle, not just the direct
   // spawnDaemonProcess path covered in registry-and-shutdown.test.ts.
   await client.close();
   clients.length = 0;

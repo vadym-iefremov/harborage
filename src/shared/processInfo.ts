@@ -19,7 +19,7 @@ export async function getProcessStartTime(pid: number): Promise<string | null> {
     const trimmed = stdout.trim();
     return trimmed.length > 0 ? trimmed : null;
   } catch {
-    // Non-zero exit (no such PID) or `ps` unavailable — either way, treat as "not alive".
+    // Non-zero exit (no such PID) or `ps` unavailable. Either way, treat as "not alive".
     return null;
   }
 }
