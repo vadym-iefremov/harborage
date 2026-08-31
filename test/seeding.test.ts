@@ -35,7 +35,7 @@ test('export_state -> create_session(seed) carries cookies and localStorage over
     'expected the exported state to include the localStorage value set in the source session'
   );
 
-  const { sessionId: seededId } = await sessions.createSession(storageState);
+  const { sessionId: seededId } = await sessions.createSession({ storageState });
   const seeded = sessions.resolve(seededId);
 
   // A brand-new session, seeded from export_state, already has the cookie

@@ -54,7 +54,7 @@ export async function waitForHealthy(config: Config): Promise<void> {
  * healthy, do nothing; otherwise spawn it and wait for it to come up.
  *
  * Callers are responsible for making sure this only ever runs off the MCP
- * `initialize` handshake's critical path — see wrapper.ts.
+ * `initialize` handshake's critical path. See wrapper.ts.
  */
 export async function ensureDaemonRunning(config: Config): Promise<void> {
   if (await checkHealth(config)) return;

@@ -1,5 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/server';
 
+import { invokeTool } from './tools/handlers.js';
 import { toolDefs, toolNames, type ToolName } from './tools/schemas.js';
 import type { ToolContext, ToolDef, ToolHandlerConfig } from './tools/types.js';
 import type { SessionStore } from './sessions.js';
@@ -7,7 +8,10 @@ import type { SessionStore } from './sessions.js';
 /**
  * Registers one tool from its definition. The handler takes its context as
  * its first argument, so binding it here is the whole adaptation needed
- * between a `ToolDef` and what `registerTool` expects.
+ * between a `ToolDef` and what `registerTool` expects. It goes through
+ * `invokeTool` rather than calling `def.handler` directly so that the daemon
+ * and the flat `createToolHandlers` shape share one choke point, and so a
+ * long-running call keeps its own session alive past the idle sweep.
  *
  * Taking a single `ToolDef` (rather than looping inline over `toolDefs`) is
  * what keeps `registerTool`'s overload resolution happy: `def.inputSchema`
@@ -18,7 +22,7 @@ import type { SessionStore } from './sessions.js';
  */
 function registerToolDef(server: McpServer, name: ToolName, def: ToolDef, ctx: ToolContext): void {
   server.registerTool(name, { description: def.description, inputSchema: def.inputSchema }, args =>
-    def.handler(ctx, args)
+    invokeTool(def, ctx, args)
   );
 }
 
