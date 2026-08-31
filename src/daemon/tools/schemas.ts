@@ -1,6 +1,9 @@
+import { emulationTools } from './defs/emulation.js';
 import { inspectTools } from './defs/inspect.js';
 import { interactionTools } from './defs/interaction.js';
+import { networkTools } from './defs/network.js';
 import { sessionTools } from './defs/session.js';
+import { storageTools } from './defs/storage.js';
 
 /**
  * The single source of truth for every tool: its name, description, input
@@ -16,7 +19,10 @@ import { sessionTools } from './defs/session.js';
 export const toolDefs = {
   ...sessionTools,
   ...interactionTools,
-  ...inspectTools
+  ...inspectTools,
+  ...emulationTools,
+  ...networkTools,
+  ...storageTools
 };
 
 export type ToolName = keyof typeof toolDefs;
