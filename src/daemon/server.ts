@@ -1,95 +1,45 @@
 import { McpServer } from '@modelcontextprotocol/server';
 
-import { toolDescriptions, toolInputSchemas } from './tools/schemas.js';
-import { createToolHandlers, type ToolHandlerConfig } from './tools/handlers.js';
+import { toolDefs, toolNames, type ToolName } from './tools/schemas.js';
+import type { ToolContext, ToolDef, ToolHandlerConfig } from './tools/types.js';
 import type { SessionStore } from './sessions.js';
+
+/**
+ * Registers one tool from its definition. The handler takes its context as
+ * its first argument, so binding it here is the whole adaptation needed
+ * between a `ToolDef` and what `registerTool` expects.
+ *
+ * Taking a single `ToolDef` (rather than looping inline over `toolDefs`) is
+ * what keeps `registerTool`'s overload resolution happy: `def.inputSchema`
+ * and `def.handler` are one concrete pair here, not the union of all
+ * fifteen. At this width the argument type is `Record<string, unknown>` on
+ * both sides, so no cast is needed. Each tool's precise argument type is
+ * still enforced where it matters, at its definition in `defs/`.
+ */
+function registerToolDef(server: McpServer, name: ToolName, def: ToolDef, ctx: ToolContext): void {
+  server.registerTool(name, { description: def.description, inputSchema: def.inputSchema }, args =>
+    def.handler(ctx, args)
+  );
+}
 
 /**
  * Builds the `createServer` factory `createMcpHandler` needs. Each HTTP
  * request gets a fresh `McpServer` instance (that's the SDK's per-request
- * model — see docs/superpowers/specs), but every instance registers tools
- * that close over the *same* `SessionStore`, which is the actual shared,
- * long-lived state: the browser sessions themselves outlive any single
- * request, only the protocol-level `McpServer` object is per-request.
- *
- * Each tool is registered by an explicit call (rather than looped over
- * `toolNames`) so each one's Zod schema and handler stay paired as a single
- * concrete type — looping over the union of all fifteen schemas defeats
- * `registerTool`'s own overload resolution.
+ * model, see docs/superpowers/specs), but every instance registers tools
+ * that share the *same* `ToolContext`, and so the same `SessionStore`, which
+ * is the actual shared, long-lived state: the browser sessions themselves
+ * outlive any single request, only the protocol-level `McpServer` object is
+ * per-request.
  */
 export function createServerFactory(sessions: SessionStore, config: ToolHandlerConfig) {
-  const handlers = createToolHandlers(sessions, config);
+  const ctx: ToolContext = { sessions, config };
 
   return function createServer(): McpServer {
     const server = new McpServer({ name: 'harborage', version: '0.2.0' });
 
-    server.registerTool(
-      'create_session',
-      { description: toolDescriptions.create_session, inputSchema: toolInputSchemas.create_session },
-      handlers.create_session
-    );
-    server.registerTool(
-      'navigate',
-      { description: toolDescriptions.navigate, inputSchema: toolInputSchemas.navigate },
-      handlers.navigate
-    );
-    server.registerTool('click', { description: toolDescriptions.click, inputSchema: toolInputSchemas.click }, handlers.click);
-    server.registerTool('fill', { description: toolDescriptions.fill, inputSchema: toolInputSchemas.fill }, handlers.fill);
-    server.registerTool(
-      'evaluate',
-      { description: toolDescriptions.evaluate, inputSchema: toolInputSchemas.evaluate },
-      handlers.evaluate
-    );
-    server.registerTool(
-      'snapshot',
-      { description: toolDescriptions.snapshot, inputSchema: toolInputSchemas.snapshot },
-      handlers.snapshot
-    );
-    server.registerTool(
-      'list_tabs',
-      { description: toolDescriptions.list_tabs, inputSchema: toolInputSchemas.list_tabs },
-      handlers.list_tabs
-    );
-    server.registerTool(
-      'screenshot',
-      { description: toolDescriptions.screenshot, inputSchema: toolInputSchemas.screenshot },
-      handlers.screenshot
-    );
-    server.registerTool(
-      'export_state',
-      { description: toolDescriptions.export_state, inputSchema: toolInputSchemas.export_state },
-      handlers.export_state
-    );
-    server.registerTool(
-      'escalate_session',
-      { description: toolDescriptions.escalate_session, inputSchema: toolInputSchemas.escalate_session },
-      handlers.escalate_session
-    );
-    server.registerTool(
-      'release_session',
-      { description: toolDescriptions.release_session, inputSchema: toolInputSchemas.release_session },
-      handlers.release_session
-    );
-    server.registerTool(
-      'list_sessions',
-      { description: toolDescriptions.list_sessions, inputSchema: toolInputSchemas.list_sessions },
-      handlers.list_sessions
-    );
-    server.registerTool(
-      'read_console',
-      { description: toolDescriptions.read_console, inputSchema: toolInputSchemas.read_console },
-      handlers.read_console
-    );
-    server.registerTool(
-      'list_network_requests',
-      { description: toolDescriptions.list_network_requests, inputSchema: toolInputSchemas.list_network_requests },
-      handlers.list_network_requests
-    );
-    server.registerTool(
-      'send_cdp_command',
-      { description: toolDescriptions.send_cdp_command, inputSchema: toolInputSchemas.send_cdp_command },
-      handlers.send_cdp_command
-    );
+    for (const name of toolNames) {
+      registerToolDef(server, name, toolDefs[name], ctx);
+    }
 
     return server;
   };

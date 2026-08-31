@@ -2,3 +2,6 @@ node_modules/
 *.log
 .DS_Store
 dist/
+.claude/worktrees/
+node_modules
+.probe-*.mjs

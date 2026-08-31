@@ -5,7 +5,8 @@ import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import { loadConfig, type Config } from '../shared/config.js';
 import { getProcessStartTime } from '../shared/processInfo.js';
 import { deregisterSelf, registerSelf } from '../shared/registry.js';
-import { toolDescriptions, toolInputSchemas, type ToolName } from '../daemon/tools/schemas.js';
+import { toolDefs, toolNames, type ToolName } from '../daemon/tools/schemas.js';
+import type { ToolDef } from '../daemon/tools/types.js';
 import { ensureDaemonRunning } from './daemonManager.js';
 
 /**
@@ -60,84 +61,27 @@ function forwardTool<T extends ToolName>(name: T, ensureReady: () => Promise<Cli
   };
 }
 
-function buildStdioServer(ensureReady: () => Promise<Client>): McpServer {
+/**
+ * Registers one pass-through tool: same name, same description, same schema
+ * as the daemon's, with a forwarder in place of the real handler.
+ *
+ * Taking a single `ToolDef` (rather than looping inline over `toolDefs`) is
+ * what keeps `registerTool`'s overload resolution happy: the schema is one
+ * concrete type here, not the union of all fifteen. Note this file never
+ * touches `def.handler`, which is why the wrapper process needs neither a
+ * `SessionStore` nor a browser.
+ */
+function registerForwardingTool(server: McpServer, name: ToolName, def: ToolDef, ensureReady: () => Promise<Client>): void {
+  server.registerTool(name, { description: def.description, inputSchema: def.inputSchema }, forwardTool(name, ensureReady));
+}
+
+/** The stdio server this wrapper exposes to its host, one pass-through tool per daemon tool. */
+export function buildStdioServer(ensureReady: () => Promise<Client>): McpServer {
   const server = new McpServer({ name: 'harborage', version: '0.2.0' });
 
-  server.registerTool(
-    'create_session',
-    { description: toolDescriptions.create_session, inputSchema: toolInputSchemas.create_session },
-    forwardTool('create_session', ensureReady)
-  );
-  server.registerTool(
-    'navigate',
-    { description: toolDescriptions.navigate, inputSchema: toolInputSchemas.navigate },
-    forwardTool('navigate', ensureReady)
-  );
-  server.registerTool(
-    'click',
-    { description: toolDescriptions.click, inputSchema: toolInputSchemas.click },
-    forwardTool('click', ensureReady)
-  );
-  server.registerTool(
-    'fill',
-    { description: toolDescriptions.fill, inputSchema: toolInputSchemas.fill },
-    forwardTool('fill', ensureReady)
-  );
-  server.registerTool(
-    'evaluate',
-    { description: toolDescriptions.evaluate, inputSchema: toolInputSchemas.evaluate },
-    forwardTool('evaluate', ensureReady)
-  );
-  server.registerTool(
-    'snapshot',
-    { description: toolDescriptions.snapshot, inputSchema: toolInputSchemas.snapshot },
-    forwardTool('snapshot', ensureReady)
-  );
-  server.registerTool(
-    'list_tabs',
-    { description: toolDescriptions.list_tabs, inputSchema: toolInputSchemas.list_tabs },
-    forwardTool('list_tabs', ensureReady)
-  );
-  server.registerTool(
-    'screenshot',
-    { description: toolDescriptions.screenshot, inputSchema: toolInputSchemas.screenshot },
-    forwardTool('screenshot', ensureReady)
-  );
-  server.registerTool(
-    'export_state',
-    { description: toolDescriptions.export_state, inputSchema: toolInputSchemas.export_state },
-    forwardTool('export_state', ensureReady)
-  );
-  server.registerTool(
-    'escalate_session',
-    { description: toolDescriptions.escalate_session, inputSchema: toolInputSchemas.escalate_session },
-    forwardTool('escalate_session', ensureReady)
-  );
-  server.registerTool(
-    'release_session',
-    { description: toolDescriptions.release_session, inputSchema: toolInputSchemas.release_session },
-    forwardTool('release_session', ensureReady)
-  );
-  server.registerTool(
-    'list_sessions',
-    { description: toolDescriptions.list_sessions, inputSchema: toolInputSchemas.list_sessions },
-    forwardTool('list_sessions', ensureReady)
-  );
-  server.registerTool(
-    'read_console',
-    { description: toolDescriptions.read_console, inputSchema: toolInputSchemas.read_console },
-    forwardTool('read_console', ensureReady)
-  );
-  server.registerTool(
-    'list_network_requests',
-    { description: toolDescriptions.list_network_requests, inputSchema: toolInputSchemas.list_network_requests },
-    forwardTool('list_network_requests', ensureReady)
-  );
-  server.registerTool(
-    'send_cdp_command',
-    { description: toolDescriptions.send_cdp_command, inputSchema: toolInputSchemas.send_cdp_command },
-    forwardTool('send_cdp_command', ensureReady)
-  );
+  for (const name of toolNames) {
+    registerForwardingTool(server, name, toolDefs[name], ensureReady);
+  }
 
   return server;
 }
@@ -161,7 +105,7 @@ export async function runWrapper(): Promise<void> {
     cleaningUp = true;
     console.error(`[harborage] client wrapper exiting: ${reason}`);
     await deregisterSelf(config.registryPath, process.pid).catch(() => {
-      // Best-effort only — the daemon's own sweep prunes a dead/stale PID regardless.
+      // Best-effort only: the daemon's own sweep prunes a dead/stale PID regardless.
     });
   }
 
