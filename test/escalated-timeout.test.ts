@@ -2,12 +2,7 @@ import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 
 import { BrowserManager } from '../src/daemon/browserManager.js';
-import {
-  DEFAULT_ESCALATED_IDLE_TIMEOUT_MS,
-  resolveEscalatedIdleTimeoutMs,
-  SessionStore,
-  type SessionSummary
-} from '../src/daemon/sessions.js';
+import { SessionStore, type SessionSummary } from '../src/daemon/sessions.js';
 import { createToolHandlers, type ToolHandlers } from '../src/daemon/tools/handlers.js';
 import { getFreePort } from './helpers.js';
 
@@ -21,7 +16,7 @@ let handlers: ToolHandlers;
 before(async () => {
   const debugPort = await getFreePort();
   browserManager = new BrowserManager(debugPort);
-  sessions = new SessionStore(browserManager, {}, undefined, escalatedIdleTimeoutMs);
+  sessions = new SessionStore(browserManager, {}, undefined, { escalatedIdleTimeoutMs });
   handlers = createToolHandlers(sessions, {
     debugPort,
     screenshotCacheDir: '/dev/null/unused',
@@ -84,16 +79,5 @@ test('an escalated session outlives the ordinary idle timeout while a human work
     reapedLater,
     [handedOver.sessionId],
     'a forgotten escalation must not hold a browser context open forever'
-  );
-});
-
-test('the escalated idle timeout defaults to an hour and is overridable by environment variable', () => {
-  assert.equal(DEFAULT_ESCALATED_IDLE_TIMEOUT_MS, 60 * 60 * 1000);
-  assert.equal(resolveEscalatedIdleTimeoutMs({}), 60 * 60 * 1000);
-  assert.equal(resolveEscalatedIdleTimeoutMs({ HARBORAGE_ESCALATED_IDLE_TIMEOUT_MS: '1234' }), 1234);
-  assert.equal(
-    resolveEscalatedIdleTimeoutMs({ HARBORAGE_ESCALATED_IDLE_TIMEOUT_MS: 'not-a-number' }),
-    60 * 60 * 1000,
-    'an unparseable override must fall back to the default rather than reaping instantly'
   );
 });

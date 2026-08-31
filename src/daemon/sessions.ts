@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { BrowserContext, BrowserContextOptions, Page } from 'playwright';
+import type { BrowserContext, BrowserContextOptions, Dialog, Page } from 'playwright';
 
 import { noopLogger, type Logger } from '../shared/logger.js';
 import type { BrowserManager } from './browserManager.js';
@@ -38,46 +38,91 @@ export interface NetworkEntry {
   timestamp: number;
 }
 
-/** Max buffered entries kept per session (console + network, each independently bounded). */
+/** What a caller may do with a JavaScript dialog. */
+export type DialogAction = 'accept' | 'dismiss';
+
+/** One `alert`, `confirm`, `prompt` or `beforeunload` dialog the page raised, and what was done with it. */
+export interface DialogEntry {
+  pageId: string;
+  type: string;
+  message: string;
+  defaultValue: string;
+  action: DialogAction;
+  /** Text supplied to a `prompt`, when the dialog was accepted with one. */
+  promptText?: string;
+  timestamp: number;
+}
+
+/** What to do with dialogs from now on, armed by `handle_dialog` before the action that triggers one. */
+export interface DialogPolicy {
+  action: DialogAction;
+  promptText?: string;
+  /** `next` is consumed by the first dialog it meets; `all` stays until replaced. */
+  appliesTo: 'next' | 'all';
+}
+
+/**
+ * One uncaught exception or unhandled promise rejection from a page.
+ *
+ * `stack` is not optional out of tidiness: a bare message is exactly what
+ * made an "[object Event]" rejection impossible to trace in this project's
+ * own history, so anything that has a stack carries it, and anything that
+ * does not carries `valueType`, `eventType` and `detail` instead.
+ */
+export interface PageErrorEntry {
+  pageId: string;
+  type: 'uncaught-exception' | 'unhandled-rejection';
+  /** Constructor name of the thrown or rejected value: `Error`, `TypeError`, `Event`, `String`. */
+  valueType: string;
+  message: string;
+  stack?: string;
+  /** For a rejected `Event`, its `type` (`error`, `unhandledrejection`), which is what names the culprit. */
+  eventType?: string;
+  /** JSON dump of a non-Error rejected value, for when there is no stack to read. */
+  detail?: string;
+  timestamp: number;
+}
+
+/** Max buffered entries kept per session, each channel independently bounded. */
 export interface BufferLimits {
   console: number;
   network: number;
+  dialog: number;
+  pageError: number;
 }
 
-const defaultBufferLimits: BufferLimits = { console: 200, network: 200 };
+const defaultBufferLimits: BufferLimits = { console: 200, network: 200, dialog: 200, pageError: 200 };
 
 /**
- * How long a session handed to a human may sit idle before it is reaped
- * anyway. An hour, against fifteen minutes for an ordinary session.
- *
- * Why a longer timeout rather than an exemption: escalation is for the cases
- * an agent cannot finish alone, a CAPTCHA or an ambiguous form, and a person
- * plausibly spends far longer than fifteen minutes on one of those. But an
- * escalation nobody ever comes back to must not pin a browser context open
- * for the daemon's whole life, so it expires too, just far later.
+ * Name of the page-side function the unhandled-rejection hook calls back
+ * through. Deliberately unlikely to collide with anything a real page
+ * defines, since it is a global this tool adds to every page it drives.
  */
-export const DEFAULT_ESCALATED_IDLE_TIMEOUT_MS = 60 * 60 * 1000;
+const rejectionBindingName = '__harborageReportUnhandledRejection';
 
 /**
- * Resolves the escalated idle timeout from the environment.
- *
- * This reads `process.env` here rather than going through
- * `shared/config.ts` like every other tunable, which is a deliberate,
- * temporary exception: `HARBORAGE_ESCALATED_IDLE_TIMEOUT_MS` belongs on
- * `Config` alongside `idleTimeoutMs`, and this function should collapse into
- * one `num()` call there once that file can be touched. Takes its env as an
- * argument so a test never has to mutate global state to check it.
+ * The two lifecycle bounds a `SessionStore` needs that are not the ordinary
+ * idle timeout. Both are passed in rather than read from the environment
+ * here: `shared/config.ts` owns every tunable, and the daemon threads these
+ * through from there.
  */
-export function resolveEscalatedIdleTimeoutMs(
-  env: Record<string, string | undefined> = process.env
-): number {
-  const raw = env.HARBORAGE_ESCALATED_IDLE_TIMEOUT_MS;
-  if (raw === undefined || raw === '') return DEFAULT_ESCALATED_IDLE_TIMEOUT_MS;
-  const parsed = Number(raw);
-  // An unparseable override falls back rather than throwing: a typo here
-  // would otherwise reap every escalated session the instant it started.
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_ESCALATED_IDLE_TIMEOUT_MS;
+export interface SessionTimeouts {
+  /** Idle timeout for a session `escalate_session` has handed to a human. */
+  escalatedIdleTimeoutMs?: number;
+  /** How long a single running call may keep vetoing the reaper. */
+  maxInFlightAgeMs?: number;
 }
+
+/**
+ * Defaults for a `SessionStore` built without a config, which in practice
+ * means a test that does not care. The real daemon always passes
+ * `config.escalatedIdleTimeoutMs` and `config.maxInFlightAgeMs`, and those
+ * two are where the reasoning behind these numbers is written down.
+ */
+const defaultTimeouts: Required<SessionTimeouts> = {
+  escalatedIdleTimeoutMs: 60 * 60 * 1000,
+  maxInFlightAgeMs: 10 * 60 * 1000
+};
 
 /** Pushes onto a bounded array, dropping the oldest entries once over `max`. */
 function pushBounded<T>(buffer: T[], entry: T, max: number): void {
@@ -106,6 +151,12 @@ interface SessionRecord {
    */
   inFlight: number;
   /**
+   * When `inFlight` last rose from zero, so the reaper can tell a call that
+   * is merely slow from one that is never coming back. Cleared the moment
+   * the count returns to zero.
+   */
+  inFlightSince: number | undefined;
+  /**
    * When this session was handed to a human via `escalate_session`, if it
    * was. A human driving the session over CDP touches no tool, so nothing
    * refreshes `lastActivity` for as long as they work: the very scenario
@@ -115,6 +166,10 @@ interface SessionRecord {
   escalatedAt: number | undefined;
   consoleBuffer: ConsoleEntry[];
   networkBuffer: NetworkEntry[];
+  dialogBuffer: DialogEntry[];
+  pageErrorBuffer: PageErrorEntry[];
+  /** What the next dialog (or every dialog) gets. Undefined means the safe default, dismiss. */
+  dialogPolicy: DialogPolicy | undefined;
 }
 
 /**
@@ -168,6 +223,7 @@ export interface SessionSummary {
 export class SessionStore {
   private readonly sessions = new Map<string, SessionRecord>();
   private readonly bufferLimits: BufferLimits;
+  private readonly timeouts: Required<SessionTimeouts>;
 
   /**
    * The logger is injected rather than imported as a module-level singleton
@@ -179,9 +235,10 @@ export class SessionStore {
     private readonly browserManager: BrowserManager,
     bufferLimits: Partial<BufferLimits> = {},
     private readonly logger: Logger = noopLogger,
-    private readonly escalatedIdleTimeoutMs: number = resolveEscalatedIdleTimeoutMs()
+    timeouts: SessionTimeouts = {}
   ) {
     this.bufferLimits = { ...defaultBufferLimits, ...bufferLimits };
+    this.timeouts = { ...defaultTimeouts, ...timeouts };
   }
 
   /**
@@ -213,6 +270,62 @@ export class SessionStore {
         this.bufferLimits.network
       );
     });
+    // Registering ANY dialog listener switches Playwright's own auto-dismiss
+    // off, which makes this handler the only thing that can ever unblock a
+    // page showing a modal. Verified directly against real Chromium: with a
+    // listener that does not resolve the dialog, the triggering click and
+    // every later call on that tab hang forever. So this handler resolves
+    // the dialog on every path it can take, and decides afterwards.
+    page.on('dialog', dialog => {
+      let action: DialogAction = 'dismiss';
+      let promptText: string | undefined;
+      try {
+        const policy = record.dialogPolicy;
+        if (policy) {
+          action = policy.action;
+          promptText = policy.promptText;
+          if (policy.appliesTo === 'next') record.dialogPolicy = undefined;
+        }
+        pushBounded(
+          record.dialogBuffer,
+          {
+            pageId,
+            type: dialog.type(),
+            message: dialog.message(),
+            defaultValue: dialog.defaultValue(),
+            action,
+            promptText,
+            timestamp: Date.now()
+          },
+          this.bufferLimits.dialog
+        );
+      } catch {
+        // Swallowed on purpose. Bookkeeping failing is a lost log line;
+        // leaving the modal open is a wedged tab, so the resolve below runs
+        // either way.
+      }
+      void this.resolveDialog(dialog, action, promptText);
+    });
+
+    // Uncaught exceptions. Unhandled rejections come in through the init
+    // script instead, which marks them handled so they do not also surface
+    // here as a duplicate.
+    page.on('pageerror', err => {
+      const stack = typeof err.stack === 'string' && err.stack.trim() !== '' ? err.stack : undefined;
+      pushBounded(
+        record.pageErrorBuffer,
+        {
+          pageId,
+          type: 'uncaught-exception',
+          valueType: err.name && err.name !== '' ? err.name : 'Error',
+          message: err.message,
+          stack,
+          timestamp: Date.now()
+        },
+        this.bufferLimits.pageError
+      );
+    });
+
     page.on('response', res => {
       pushBounded(
         record.networkBuffer,
@@ -227,6 +340,130 @@ export class SessionStore {
         this.bufferLimits.network
       );
     });
+  }
+
+  /**
+   * Applies a decision to one dialog. Never rethrows: by the time this runs
+   * the page may have navigated or closed, and a failure to resolve an
+   * already-gone dialog is not something a caller can act on.
+   */
+  private async resolveDialog(dialog: Dialog, action: DialogAction, promptText?: string): Promise<void> {
+    try {
+      if (action === 'accept') await dialog.accept(promptText);
+      else await dialog.dismiss();
+    } catch {
+      // Already resolved, or its page is gone. Attempting the other action
+      // here would only raise a second error against the same dead dialog.
+    }
+  }
+
+  /**
+   * Installs the unhandled-rejection channel on a whole context, before any
+   * page exists in it, so every tab is covered including ones opened later.
+   *
+   * Why this exists at all, established by probing real Chromium rather than
+   * assumed: `page.on('pageerror')` DOES receive unhandled rejections, but
+   * for a non-Error reason it reports `name: ""`, an empty stack and a
+   * message of just "Event". That is the exact shape that made an
+   * "[object Event]" rejection untraceable. Catching the rejection in the
+   * page instead yields the constructor name, the event's own `type` and a
+   * JSON dump, which is what actually identifies the culprit.
+   *
+   * The hook calls `preventDefault()`, which is what stops the same
+   * rejection also arriving through `pageerror` as a second, poorer copy. It
+   * suppresses the browser's default reporting of unhandled rejections,
+   * which Playwright does not surface on any channel anyway.
+   */
+  private async installRejectionHook(record: SessionRecord, context: BrowserContext): Promise<void> {
+    await context.exposeBinding(rejectionBindingName, (source, payload) => {
+      const entry = payload as Omit<PageErrorEntry, 'pageId' | 'type' | 'timestamp'>;
+      pushBounded(
+        record.pageErrorBuffer,
+        {
+          pageId: this.adoptPage(record, source.page),
+          type: 'unhandled-rejection',
+          valueType: entry.valueType,
+          message: entry.message,
+          stack: entry.stack,
+          eventType: entry.eventType,
+          detail: entry.detail,
+          timestamp: Date.now()
+        },
+        this.bufferLimits.pageError
+      );
+    });
+
+    // Typed through `globalThis` rather than `window`: this function is
+    // serialized and run inside the page, so the DOM lib is deliberately not
+    // in scope on the daemon's side of the compile.
+    await context.addInitScript((bindingName: string) => {
+      const scope = globalThis as unknown as {
+        [key: string]: unknown;
+        addEventListener(
+          type: string,
+          listener: (event: { reason: unknown; preventDefault: () => void }) => void
+        ): void;
+      };
+      const notify = scope[bindingName] as ((payload: unknown) => void) | undefined;
+      if (typeof notify !== 'function') return;
+
+      scope.addEventListener('unhandledrejection', event => {
+        // Marking it handled is what stops Chromium reporting the same
+        // rejection a second time through Playwright's `pageerror` channel,
+        // where it would arrive stripped of everything useful.
+        event.preventDefault();
+        const reason: unknown = event.reason;
+        let payload: Record<string, unknown>;
+        if (reason instanceof Error) {
+          payload = { valueType: reason.name || 'Error', message: reason.message, stack: reason.stack };
+        } else {
+          const asRecord = reason as { constructor?: { name?: string }; type?: unknown } | null;
+          let detail: string | undefined;
+          try {
+            detail = JSON.stringify(reason);
+          } catch {
+            detail = undefined;
+          }
+          payload = {
+            valueType: reason === null ? 'null' : asRecord?.constructor?.name ?? typeof reason,
+            message: String(reason),
+            eventType: typeof asRecord?.type === 'string' ? asRecord.type : undefined,
+            detail
+          };
+        }
+        try {
+          notify(payload);
+        } catch {
+          // The binding is gone because the page is being torn down. There
+          // is nowhere left to report to, and throwing inside an event
+          // listener would only surface as another page error.
+        }
+      });
+    }, rejectionBindingName);
+  }
+
+  /**
+   * Gives one page an id in this session, wires up its buffers, and arranges
+   * for it to drop out of the table when it closes.
+   *
+   * Idempotent on purpose. Playwright fires `context.on('page')` for tabs the
+   * page opened itself AND for tabs we opened ourselves with `newPage()`, so
+   * both paths land here for the same page. Returning the existing id rather
+   * than minting a second one is what stops `new_tab` from reporting a tab id
+   * that no longer matches the one `list_tabs` shows.
+   */
+  private adoptPage(record: SessionRecord, page: Page, preferredId?: string): string {
+    for (const [existingId, existing] of record.pages) {
+      if (existing === page) return existingId;
+    }
+
+    const id = preferredId ?? String(record.nextPageSeq++);
+    record.pages.set(id, page);
+    this.attachBuffers(record, page, id);
+    page.on('close', () => {
+      record.pages.delete(id);
+    });
+    return id;
   }
 
   /**
@@ -246,23 +483,25 @@ export class SessionStore {
     if (options.deviceScaleFactor !== undefined) contextOptions.deviceScaleFactor = options.deviceScaleFactor;
 
     const context = await browser.newContext(contextOptions);
-    const page = await context.newPage();
 
     const sessionId = randomUUID();
-    const pageId = '0';
     const now = Date.now();
     const record: SessionRecord = {
       id: sessionId,
       context,
-      pages: new Map([[pageId, page]]),
-      nextPageSeq: 1,
-      activePageId: pageId,
+      pages: new Map(),
+      nextPageSeq: 0,
+      activePageId: '0',
       createdAt: now,
       lastActivity: now,
       inFlight: 0,
+      inFlightSince: undefined,
       escalatedAt: undefined,
       consoleBuffer: [],
-      networkBuffer: []
+      networkBuffer: [],
+      dialogBuffer: [],
+      pageErrorBuffer: [],
+      dialogPolicy: undefined
     };
 
     // A tab opened by the page itself (window.open, a target="_blank" link,
@@ -270,19 +509,29 @@ export class SessionStore {
     // the new active tab, matching what a person driving the browser would
     // expect "the tab I just caused to open" to mean.
     context.on('page', newPage => {
-      const id = String(record.nextPageSeq++);
-      record.pages.set(id, newPage);
-      record.activePageId = id;
-      this.attachBuffers(record, newPage, id);
-      newPage.on('close', () => {
-        record.pages.delete(id);
-      });
+      record.activePageId = this.adoptPage(record, newPage);
     });
 
-    page.on('close', () => {
-      record.pages.delete(pageId);
-    });
-    this.attachBuffers(record, page, pageId);
+    // Both of these happen before the first page exists, which is the whole
+    // point: buffering that starts at create_session is what lets a caller
+    // read back what a page did while loading, rather than only what it did
+    // after somebody thought to look.
+    await this.installRejectionHook(record, context);
+    const page = await context.newPage();
+
+    // The context's own `page` event has already adopted this one; asking
+    // again just reads back the id it was given.
+    const pageId = this.adoptPage(record, page);
+    record.activePageId = pageId;
+
+    // Re-stamped now that the session is actually usable, rather than left
+    // at the time construction started. Building a context, installing the
+    // rejection hook and opening the first page all take real time, and on
+    // the very first session of a daemon's life that includes launching
+    // Chromium. None of that should come out of the session's idle budget:
+    // a caller's clock starts when it gets the sessionId back.
+    record.createdAt = Date.now();
+    record.lastActivity = record.createdAt;
 
     this.sessions.set(sessionId, record);
     this.logger.log('session.create', { sessionId, sessions: this.sessions.size });
@@ -306,15 +555,80 @@ export class SessionStore {
     return { session, page, pageId: targetPageId };
   }
 
-  async listTabs(sessionId: string): Promise<{ pageId: string; url: string; title: string }[]> {
+  async listTabs(sessionId: string): Promise<{ pageId: string; url: string; title: string; active: boolean }[]> {
     const session = this.getRecord(sessionId);
     return Promise.all(
       [...session.pages.entries()].map(async ([pageId, page]) => ({
         pageId,
         url: page.url(),
-        title: await page.title().catch(() => '')
+        title: await page.title().catch(() => ''),
+        // Which tab a call that omits pageId will hit. Without this the
+        // caller has to infer the default target from call ordering.
+        active: pageId === session.activePageId
       }))
     );
+  }
+
+  /**
+   * Opens a new tab in an existing session and makes it the active one.
+   *
+   * Active, because that matches what happens when the page opens a tab
+   * itself: the thing you just caused to open is the thing you meant to work
+   * in. `select_tab` is there for when it is not.
+   */
+  async newTab(sessionId: string, url?: string): Promise<{ pageId: string; url: string }> {
+    const record = this.getRecord(sessionId);
+    const page = await record.context.newPage();
+    const pageId = this.adoptPage(record, page);
+    record.activePageId = pageId;
+    if (url !== undefined) await page.goto(url);
+    this.logger.log('tab.open', { sessionId, pageId, tabs: record.pages.size });
+    return { pageId, url: page.url() };
+  }
+
+  /**
+   * Closes one tab, and returns the tab later calls will target instead.
+   *
+   * Refuses the last tab. A session with no tabs is not a usable session:
+   * every tool that resolves a pageId would fail on it from then on, and
+   * nothing short of `new_tab` could bring it back. Refusing keeps the
+   * invariant `resolve()` already assumes, and the error names both ways out.
+   * Note this governs the tool only: a page that closes itself through
+   * `window.close()` can still empty a session, which is pre-existing
+   * behaviour and not something the store can veto.
+   */
+  async closeTab(sessionId: string, pageId: string): Promise<{ closed: string; activePageId: string }> {
+    const record = this.getRecord(sessionId);
+    const page = record.pages.get(pageId);
+    if (!page) throw new PageNotFoundError(sessionId, pageId);
+    if (record.pages.size === 1) {
+      throw new Error(
+        `Refusing to close the last tab of session "${sessionId}". A session with no tabs cannot be used by any ` +
+          'other tool. Call release_session to end the session, or new_tab first if you meant to replace this tab.'
+      );
+    }
+
+    record.pages.delete(pageId);
+    await page.close().catch(() => {
+      // Already gone (the page closed itself, or its context died); the tab
+      // is out of the table either way, which is what the caller asked for.
+    });
+
+    if (record.activePageId === pageId) {
+      // The most recently opened survivor. In the flow this actually comes up
+      // in, closing a popup, that is the tab the popup was opened from.
+      record.activePageId = [...record.pages.keys()].sort((a, b) => Number(b) - Number(a))[0]!;
+    }
+    this.logger.log('tab.close', { sessionId, pageId, tabs: record.pages.size });
+    return { closed: pageId, activePageId: record.activePageId };
+  }
+
+  /** Makes one tab the default target for later calls that omit `pageId`. */
+  selectTab(sessionId: string, pageId: string): { activePageId: string } {
+    const record = this.getRecord(sessionId);
+    if (!record.pages.has(pageId)) throw new PageNotFoundError(sessionId, pageId);
+    record.activePageId = pageId;
+    return { activePageId: pageId };
   }
 
   /**
@@ -341,24 +655,100 @@ export class SessionStore {
     });
   }
 
-  /** Buffered console messages for a session, optionally filtered to one tab. */
-  getConsoleMessages(sessionId: string, pageId?: string, clear = false): ConsoleEntry[] {
+  /**
+   * Reads one bounded buffer, and when `clear` is set removes exactly the
+   * entries it returned, matched by identity.
+   *
+   * By identity, and not by re-deriving the filter, because `clear` used to
+   * drop everything belonging to the page it was given. Any read that
+   * narrowed further, by level or by substring, therefore discarded entries
+   * the caller never saw and had no way to notice were gone. Whatever a
+   * caller filters by, it can now only ever clear what it actually read.
+   */
+  private readBuffer<T extends { pageId: string }>(
+    buffer: T[],
+    pageId: string | undefined,
+    clear: boolean,
+    match: ((entry: T) => boolean) | undefined
+  ): { matches: T[]; remaining: T[] } {
+    const matches = buffer.filter(
+      entry => (pageId === undefined || entry.pageId === pageId) && (match === undefined || match(entry))
+    );
+    if (!clear) return { matches, remaining: buffer };
+    const removed = new Set<T>(matches);
+    return { matches, remaining: buffer.filter(entry => !removed.has(entry)) };
+  }
+
+  /**
+   * Buffered console messages, optionally narrowed to one tab and to
+   * whatever else the caller cares about. `match` exists so a tool that
+   * filters by level or by text filters here rather than on the way out,
+   * which is what keeps `clear` honest.
+   */
+  getConsoleMessages(
+    sessionId: string,
+    pageId?: string,
+    clear = false,
+    match?: (entry: ConsoleEntry) => boolean
+  ): ConsoleEntry[] {
     const record = this.getRecord(sessionId);
-    const matches = pageId ? record.consoleBuffer.filter(e => e.pageId === pageId) : [...record.consoleBuffer];
-    if (clear) {
-      record.consoleBuffer = pageId ? record.consoleBuffer.filter(e => e.pageId !== pageId) : [];
-    }
+    const { matches, remaining } = this.readBuffer(record.consoleBuffer, pageId, clear, match);
+    record.consoleBuffer = remaining;
     return matches;
   }
 
-  /** Buffered network request/response entries for a session, optionally filtered to one tab. */
-  getNetworkEntries(sessionId: string, pageId?: string, clear = false): NetworkEntry[] {
+  /** Buffered network request/response entries, same filtering and same `clear` guarantee. */
+  getNetworkEntries(
+    sessionId: string,
+    pageId?: string,
+    clear = false,
+    match?: (entry: NetworkEntry) => boolean
+  ): NetworkEntry[] {
     const record = this.getRecord(sessionId);
-    const matches = pageId ? record.networkBuffer.filter(e => e.pageId === pageId) : [...record.networkBuffer];
-    if (clear) {
-      record.networkBuffer = pageId ? record.networkBuffer.filter(e => e.pageId !== pageId) : [];
-    }
+    const { matches, remaining } = this.readBuffer(record.networkBuffer, pageId, clear, match);
+    record.networkBuffer = remaining;
     return matches;
+  }
+
+  /** Buffered dialogs the page raised, and what each one was answered with. */
+  getDialogs(
+    sessionId: string,
+    pageId?: string,
+    clear = false,
+    match?: (entry: DialogEntry) => boolean
+  ): DialogEntry[] {
+    const record = this.getRecord(sessionId);
+    const { matches, remaining } = this.readBuffer(record.dialogBuffer, pageId, clear, match);
+    record.dialogBuffer = remaining;
+    return matches;
+  }
+
+  /** Buffered uncaught exceptions and unhandled rejections. */
+  getPageErrors(
+    sessionId: string,
+    pageId?: string,
+    clear = false,
+    match?: (entry: PageErrorEntry) => boolean
+  ): PageErrorEntry[] {
+    const record = this.getRecord(sessionId);
+    const { matches, remaining } = this.readBuffer(record.pageErrorBuffer, pageId, clear, match);
+    record.pageErrorBuffer = remaining;
+    return matches;
+  }
+
+  /**
+   * Arms what dialogs get from now on. Session-wide rather than per tab: a
+   * dialog blocks whichever tab raised it, and an agent arming "accept the
+   * confirm I am about to trigger" is thinking about the action, not the tab.
+   */
+  setDialogPolicy(sessionId: string, policy: DialogPolicy | undefined): void {
+    const record = this.getRecord(sessionId);
+    record.dialogPolicy = policy;
+  }
+
+  /** The policy currently armed, so `handle_dialog` can report back what it set. */
+  getDialogPolicy(sessionId: string): DialogPolicy | undefined {
+    return this.sessions.get(sessionId)?.dialogPolicy;
   }
 
   async releaseSession(sessionId: string): Promise<void> {
@@ -405,8 +795,10 @@ export class SessionStore {
   beginCall(sessionId: string): boolean {
     const record = this.sessions.get(sessionId);
     if (!record) return false;
+    const now = Date.now();
+    if (record.inFlight === 0) record.inFlightSince = now;
     record.inFlight += 1;
-    record.lastActivity = Date.now();
+    record.lastActivity = now;
     return true;
   }
 
@@ -420,6 +812,7 @@ export class SessionStore {
     const record = this.sessions.get(sessionId);
     if (!record) return;
     record.inFlight = Math.max(0, record.inFlight - 1);
+    if (record.inFlight === 0) record.inFlightSince = undefined;
     record.lastActivity = Date.now();
   }
 
@@ -454,11 +847,33 @@ export class SessionStore {
       // A call in flight is activity, even though nothing has touched
       // `lastActivity` since it started. Closing the context here is what
       // made a slow navigate or evaluate die halfway through.
-      if (record.inFlight > 0) continue;
+      //
+      // The veto is bounded, though. A call that never returns would
+      // otherwise pin its session forever, and a live session also vetoes
+      // the daemon's self-shutdown, so one wedged `evaluate` could hold this
+      // machine-wide daemon open indefinitely. Past `maxInFlightAgeMs` the
+      // reaper stops believing the call and says so in the log, because a
+      // session disappearing out from under a caller needs to be explicable
+      // afterwards.
+      if (record.inFlight > 0) {
+        const inFlightAgeMs = now - (record.inFlightSince ?? now);
+        if (inFlightAgeMs <= this.timeouts.maxInFlightAgeMs) continue;
+        this.logger.log('session.reap-stuck', {
+          sessionId: id,
+          inFlight: record.inFlight,
+          inFlightAgeMs,
+          maxInFlightAgeMs: this.timeouts.maxInFlightAgeMs,
+          reason: 'call-never-returned'
+        });
+        this.sessions.delete(id);
+        reaped.push(id);
+        await record.context.close().catch(() => {});
+        continue;
+      }
       // A human driving an escalated session over CDP touches no tool, so
       // its lastActivity stops moving the moment it is handed over. It gets
       // a far longer rope, not an unlimited one.
-      const timeout = record.escalatedAt === undefined ? idleTimeoutMs : this.escalatedIdleTimeoutMs;
+      const timeout = record.escalatedAt === undefined ? idleTimeoutMs : this.timeouts.escalatedIdleTimeoutMs;
       if (now - record.lastActivity > timeout) {
         this.sessions.delete(id);
         reaped.push(id);

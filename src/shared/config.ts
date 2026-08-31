@@ -7,7 +7,7 @@ import { join } from 'node:path';
  * Every value has a documented default and can be overridden with an
  * environment variable, but code should almost always go through
  * `loadConfig()` (which reads `process.env` once) rather than reading
- * `process.env` scattered across the codebase — that keeps tests able to
+ * `process.env` scattered across the codebase. That keeps tests able to
  * build a fully isolated `Config` object without mutating global env state.
  */
 export interface Config {
@@ -24,6 +24,39 @@ export interface Config {
   debugPort: number;
   /** A browser context (session) idle longer than this gets reaped. */
   idleTimeoutMs: number;
+  /**
+   * The idle timeout an *escalated* session gets instead, once
+   * `escalate_session` has handed it to a human.
+   *
+   * A human driving a session over CDP calls no tools, so nothing refreshes
+   * its `lastActivity` for as long as they work: the very scenario
+   * escalation exists for is the one that used to get the session reaped
+   * out from under them. An hour, against fifteen minutes ordinarily,
+   * because a CAPTCHA or an ambiguous form plausibly takes far longer than
+   * fifteen minutes of a person's attention. It is a longer rope and not an
+   * exemption, so an escalation nobody comes back to still gives its
+   * browser context back eventually.
+   */
+  escalatedIdleTimeoutMs: number;
+  /**
+   * How long one running tool call may keep vetoing the reaper before the
+   * reaper stops believing it.
+   *
+   * A call in flight suspends idle reaping for its session, which is what
+   * stops a slow navigate from having its own context closed halfway
+   * through. Without a bound, though, a call that never returns
+   * (`evaluate("new Promise(() => {})")` is enough) pins its session
+   * forever, and because a live session also vetoes the daemon's
+   * self-shutdown, it pins this machine-wide shared daemon along with it.
+   *
+   * Ten minutes. Every bounded Playwright operation is an order of
+   * magnitude under that (30s is the longest built-in default), and the MCP
+   * client gives up on a request long before it too, so a call still
+   * running at ten minutes is one nobody is waiting for. It also sits below
+   * the ordinary fifteen-minute idle timeout, so a wedged session can never
+   * outlive a merely idle one.
+   */
+  maxInFlightAgeMs: number;
   /** How often the daemon's single in-process timer sweeps sessions + registry. */
   sweepIntervalMs: number;
   /**
@@ -59,6 +92,10 @@ export interface Config {
   consoleBufferSize: number;
   /** Max buffered network request/response entries kept per session tab (oldest dropped first). */
   networkBufferSize: number;
+  /** Max buffered JavaScript dialogs (alert/confirm/prompt) kept per session (oldest dropped first). */
+  dialogBufferSize: number;
+  /** Max buffered uncaught exceptions and unhandled rejections kept per session (oldest dropped first). */
+  pageErrorBufferSize: number;
   /** Max time the client wrapper's first tool call will wait for the daemon to become healthy. */
   daemonReadyTimeoutMs: number;
   /** Poll interval while waiting for the daemon to become healthy. */
@@ -100,6 +137,8 @@ export function loadConfig(): Config {
     port: num('HARBORAGE_PORT', 4599),
     debugPort: num('HARBORAGE_DEBUG_PORT', 4600),
     idleTimeoutMs: num('HARBORAGE_IDLE_TIMEOUT_MS', 15 * 60 * 1000),
+    escalatedIdleTimeoutMs: num('HARBORAGE_ESCALATED_IDLE_TIMEOUT_MS', 60 * 60 * 1000),
+    maxInFlightAgeMs: num('HARBORAGE_MAX_IN_FLIGHT_AGE_MS', 10 * 60 * 1000),
     sweepIntervalMs: num('HARBORAGE_SWEEP_INTERVAL_MS', 60 * 1000),
     shutdownGraceMs: num('HARBORAGE_SHUTDOWN_GRACE_MS', 10 * 1000),
     stateDir,
@@ -109,6 +148,8 @@ export function loadConfig(): Config {
     screenshotCacheTtlMs: num('HARBORAGE_SCREENSHOT_CACHE_TTL_MS', 4 * 60 * 60 * 1000),
     consoleBufferSize: num('HARBORAGE_CONSOLE_BUFFER_SIZE', 200),
     networkBufferSize: num('HARBORAGE_NETWORK_BUFFER_SIZE', 200),
+    dialogBufferSize: num('HARBORAGE_DIALOG_BUFFER_SIZE', 200),
+    pageErrorBufferSize: num('HARBORAGE_PAGE_ERROR_BUFFER_SIZE', 200),
     daemonReadyTimeoutMs: num('HARBORAGE_DAEMON_READY_TIMEOUT_MS', 60 * 1000),
     daemonHealthPollMs: num('HARBORAGE_DAEMON_HEALTH_POLL_MS', 200),
     testStartupDelayMs: num('HARBORAGE_TEST_STARTUP_DELAY_MS', 0)
