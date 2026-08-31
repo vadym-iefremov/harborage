@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import type { Page } from 'playwright';
+import type { Frame, Locator, Page } from 'playwright';
 import * as z from 'zod/v4';
 
 import { sessionCacheDir } from '../../screenshotCache.js';
@@ -149,6 +149,399 @@ function failure(rendered: string, payload: Record<string, unknown>): ToolResult
   return { content: [{ type: 'text', text: rendered }], structuredContent: payload, isError: true };
 }
 
+// ---------------------------------------------------------------------------
+// Diagnostics: computed style, geometry, frames, find
+// ---------------------------------------------------------------------------
+
+/**
+ * The browser globals the in-page snippets further down actually touch.
+ *
+ * The daemon's own tsconfig has no "dom" lib on purpose: it is a Node
+ * process, and pulling the whole DOM in would let browser APIs leak into
+ * daemon code unnoticed. Declaring exactly what these snippets use keeps them
+ * type-checked without opening that door. The declarations are module-scoped,
+ * so they shadow rather than clash with lib.dom under the test tsconfig.
+ */
+interface ProbeRect {
+  x: number;
+  y: number;
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+  width: number;
+  height: number;
+}
+
+interface ProbeStyle {
+  getPropertyValue(property: string): string;
+}
+
+interface ProbeElement {
+  tagName: string;
+  id: string;
+  parentElement: ProbeElement | null;
+  children: ArrayLike<ProbeElement>;
+  scrollWidth: number;
+  scrollHeight: number;
+  scrollTop: number;
+  scrollLeft: number;
+  clientWidth: number;
+  clientHeight: number;
+  textContent: string | null;
+  getBoundingClientRect(): ProbeRect;
+  getAttribute(name: string): string | null;
+  hasAttribute(name: string): boolean;
+  setAttribute(name: string, value: string): void;
+  removeAttribute(name: string): void;
+  checkVisibility?(options?: Record<string, boolean>): boolean;
+  // Loosely typed on purpose: the real DOM signature takes a Node, and the
+  // test tsconfig does pull in lib.dom, so anything narrower stops these
+  // callbacks type-checking under it.
+  contains(other: any): boolean;
+}
+
+declare const document: {
+  documentElement: ProbeElement;
+  body: ProbeElement | null;
+  querySelectorAll(selector: string): ArrayLike<ProbeElement>;
+  getElementsByTagName(tag: string): ArrayLike<ProbeElement>;
+  elementFromPoint(x: number, y: number): ProbeElement | null;
+};
+declare const window: {
+  innerWidth: number;
+  innerHeight: number;
+  scrollX: number;
+  scrollY: number;
+  devicePixelRatio: number;
+};
+declare function getComputedStyle(element: unknown, pseudoElement?: string | null): ProbeStyle;
+declare const CSS: { escape(value: string): string };
+
+/** The property set computed_style fetches when a caller names none. */
+const defaultStyleProperties = [
+  'color',
+  'background-color',
+  'font-size',
+  'font-weight',
+  'font-family',
+  'line-height',
+  'border',
+  'border-color',
+  'border-width',
+  'border-style',
+  'border-radius',
+  'outline',
+  'outline-color',
+  'outline-width',
+  'outline-style',
+  'outline-offset',
+  'box-shadow',
+  'opacity',
+  'display',
+  'visibility'
+];
+
+/** Pseudo-classes Chromium's CSS.forcePseudoState can be told to pretend are active. */
+const forceablePseudoStates = ['hover', 'focus', 'focus-within', 'focus-visible', 'active', 'visited', 'target'] as const;
+
+/**
+ * The attribute computed_style tags matched elements with while it forces a
+ * pseudo-state. It exists only because CDP addresses nodes by nodeId and
+ * Playwright hands out no nodeIds, so the element has to be findable from the
+ * CDP side. Removed again in a finally.
+ */
+const probeAttribute = 'data-harborage-probe';
+
+/** How many matches a diagnostics tool reports per selector unless told otherwise. */
+const defaultMatchLimit = 20;
+
+interface Rgba {
+  r: number;
+  g: number;
+  b: number;
+  a: number;
+}
+
+const opaqueWhite: Rgba = { r: 255, g: 255, b: 255, a: 1 };
+const fullyTransparent: Rgba = { r: 0, g: 0, b: 0, a: 0 };
+
+/**
+ * Parses the colour syntaxes getComputedStyle actually returns in Chromium:
+ * "rgb(r, g, b)", "rgba(r, g, b, a)" and the keyword "transparent". Anything
+ * else (a wide-gamut color() function, say) returns null, and the caller
+ * reports that it could not composite rather than inventing a number.
+ */
+export function parseCssColor(value: string): Rgba | null {
+  const raw = value.trim().toLowerCase();
+  if (raw === 'transparent') return { ...fullyTransparent };
+  const match = /^rgba?\(([^)]*)\)$/.exec(raw);
+  if (!match) return null;
+  const parts = match[1].split(/[\s,/]+/).filter(part => part.length > 0);
+  if (parts.length < 3) return null;
+  const channel = (part: string): number =>
+    part.endsWith('%') ? (Number(part.slice(0, -1)) * 255) / 100 : Number(part);
+  const alphaPart = parts[3];
+  const alpha =
+    alphaPart === undefined ? 1 : alphaPart.endsWith('%') ? Number(alphaPart.slice(0, -1)) / 100 : Number(alphaPart);
+  const color: Rgba = { r: channel(parts[0]), g: channel(parts[1]), b: channel(parts[2]), a: alpha };
+  if (![color.r, color.g, color.b, color.a].every(n => Number.isFinite(n))) return null;
+  return color;
+}
+
+/** An opaque "rgb(r, g, b)" string, rounded, which is what a caller can paste back into CSS. */
+function formatRgb(color: Rgba): string {
+  return `rgb(${Math.round(color.r)}, ${Math.round(color.g)}, ${Math.round(color.b)})`;
+}
+
+/** Standard source-over compositing with straight (non-premultiplied) alpha. */
+function over(source: Rgba, backdrop: Rgba): Rgba {
+  const alpha = source.a + backdrop.a * (1 - source.a);
+  if (alpha === 0) return { ...fullyTransparent };
+  const mix = (s: number, d: number): number => (s * source.a + d * backdrop.a * (1 - source.a)) / alpha;
+  return { r: mix(source.r, backdrop.r), g: mix(source.g, backdrop.g), b: mix(source.b, backdrop.b), a: alpha };
+}
+
+interface PaintLayer {
+  bg: Rgba;
+  opacity: number;
+}
+
+/**
+ * Paints layers[index..] as one standalone layer over transparency.
+ *
+ * The recursion is what makes `opacity` come out right. CSS opacity is a
+ * group operation: it fades everything the element and its descendants paint,
+ * as one unit, against whatever is behind the element. So the inner layers
+ * have to be composited first, then the whole result faded, rather than each
+ * layer's alpha being multiplied on the way down.
+ */
+function paintGroup(layers: PaintLayer[], index: number, innermost: Rgba): Rgba {
+  const layer = layers[index];
+  const inner = index + 1 < layers.length ? paintGroup(layers, index + 1, innermost) : innermost;
+  const painted = over(inner, layer.bg);
+  return { ...painted, a: painted.a * layer.opacity };
+}
+
+/**
+ * The pixel a viewer actually sees: the whole ancestor stack composited onto
+ * an opaque white canvas. White because that is what a browser paints behind
+ * a page that declares no background of its own, and because the stack
+ * already includes the document root, so a page that does declare one has
+ * covered it before this matters.
+ */
+function flattenOntoCanvas(layers: PaintLayer[], innermost: Rgba): Rgba {
+  if (layers.length === 0) return over(innermost, opaqueWhite);
+  return over(paintGroup(layers, 0, innermost), opaqueWhite);
+}
+
+/** WCAG 2.x sRGB channel transfer function. */
+function channelLuminance(value: number): number {
+  const scaled = value / 255;
+  return scaled <= 0.03928 ? scaled / 12.92 : Math.pow((scaled + 0.055) / 1.055, 2.4);
+}
+
+/** WCAG 2.x relative luminance. Alpha is ignored: only composite (opaque) colours belong here. */
+function relativeLuminance(color: Rgba): number {
+  return (
+    0.2126 * channelLuminance(color.r) + 0.7152 * channelLuminance(color.g) + 0.0722 * channelLuminance(color.b)
+  );
+}
+
+/** WCAG 2.x contrast ratio, 1 to 21. */
+function contrastRatio(a: Rgba, b: Rgba): number {
+  const first = relativeLuminance(a);
+  const second = relativeLuminance(b);
+  const lighter = Math.max(first, second);
+  const darker = Math.min(first, second);
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
+/**
+ * WCAG's "large text": 18pt, which is 24 CSS px, or 14pt (18.667 CSS px) at
+ * weight 700 or more. It matters because it moves the AA threshold from
+ * 4.5:1 down to 3:1, which is the difference between a real finding and a
+ * false one.
+ */
+function isLargeText(fontSizePx: number, fontWeight: number): boolean {
+  if (!Number.isFinite(fontSizePx)) return false;
+  if (fontSizePx >= 24) return true;
+  return fontWeight >= 700 && fontSizePx >= 18.6667;
+}
+
+function round(value: number, places: number): number {
+  const factor = Math.pow(10, places);
+  return Math.round(value * factor) / factor;
+}
+
+interface RawLayer {
+  tagName: string;
+  id: string;
+  backgroundColor: string;
+  opacity: string;
+}
+
+/** One frame of a tab, with the id and the selector prefix an agent can act on. */
+interface FrameNode {
+  frame: Frame;
+  frameId: string;
+  parentFrameId?: string;
+}
+
+/**
+ * Every frame in a tab, main frame first, each with a positional id.
+ *
+ * The id is a path ("main", "main/0", "main/0/1") rather than an opaque
+ * handle because harborage keeps no per-session state and an id has to be
+ * re-derivable from the live page on the next call. The cost of that choice
+ * is honest and worth saying out loud: the ids are positional, so adding or
+ * removing an iframe renumbers its siblings.
+ */
+function frameTree(page: Page): FrameNode[] {
+  const nodes: FrameNode[] = [];
+  const walk = (frame: Frame, frameId: string, parentFrameId?: string): void => {
+    nodes.push({ frame, frameId, parentFrameId });
+    frame.childFrames().forEach((child, index) => walk(child, `${frameId}/${index}`, frameId));
+  };
+  walk(page.mainFrame(), 'main');
+  return nodes;
+}
+
+/** Resolves a frame id from list_frames, or explains which ids do exist. */
+function resolveFrame(page: Page, frameId: string | undefined): Frame | undefined {
+  if (frameId === undefined) return undefined;
+  const nodes = frameTree(page);
+  const hit = nodes.find(node => node.frameId === frameId);
+  if (!hit) {
+    throw new Error(
+      `no frame with id ${JSON.stringify(frameId)} in this tab. Ids currently present: ` +
+        `${nodes.map(node => node.frameId).join(', ')}. Call list_frames for their urls and selector prefixes. ` +
+        'Frame ids are positional, so they shift when the page adds or removes an iframe: re-read them rather ' +
+        'than caching one across a navigation.'
+    );
+  }
+  return hit.frame;
+}
+
+/**
+ * The one selector segment that steps from a frame's parent into the frame,
+ * or undefined when the frame has no reachable owning element (the main
+ * frame, or a frame that detached mid-call).
+ */
+async function frameSelectorSegment(frame: Frame): Promise<string | undefined> {
+  try {
+    const element = await frame.frameElement();
+    try {
+      const info = await element.evaluate(node => {
+        const tag = String((node as unknown as { tagName: string }).tagName).toLowerCase();
+        const index = Array.prototype.indexOf.call(document.getElementsByTagName(tag), node);
+        return { tag, index: index as number };
+      });
+      if (info.index < 0) return undefined;
+      return `${info.tag} >> nth=${info.index} >> internal:control=enter-frame >> `;
+    } finally {
+      await element.dispose().catch(() => {});
+    }
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * A selector prefix that reaches from the page into this frame, built by
+ * chaining one segment per level. Prepending it to any selector lets the
+ * tools that take a raw selector (click, fill, screenshot, computed_style,
+ * element_box) act inside an iframe without any of them knowing frames exist.
+ */
+async function frameSelectorPrefix(page: Page, frame: Frame): Promise<string | undefined> {
+  if (frame === page.mainFrame()) return '';
+  const segments: string[] = [];
+  let current: Frame | null = frame;
+  while (current && current !== page.mainFrame()) {
+    const segment = await frameSelectorSegment(current);
+    if (segment === undefined) return undefined;
+    segments.unshift(segment);
+    current = current.parentFrame();
+  }
+  return segments.join('');
+}
+
+interface CdpNode {
+  nodeId: number;
+  attributes?: string[];
+  children?: CdpNode[];
+  contentDocument?: CdpNode;
+  shadowRoots?: CdpNode[];
+}
+
+/**
+ * Every node carrying the probe attribute, anywhere in the pierced document
+ * tree. Walking the tree rather than calling DOM.querySelector is what makes
+ * this work inside an iframe: querySelector is scoped to one document, while
+ * a pierced DOM.getDocument already contains them all.
+ */
+function collectProbeNodes(node: CdpNode, into: number[]): void {
+  const attributes = node.attributes ?? [];
+  for (let index = 0; index < attributes.length; index += 2) {
+    if (attributes[index] === probeAttribute) {
+      into.push(node.nodeId);
+      break;
+    }
+  }
+  for (const child of node.children ?? []) collectProbeNodes(child, into);
+  for (const shadowRoot of node.shadowRoots ?? []) collectProbeNodes(shadowRoot, into);
+  if (node.contentDocument) collectProbeNodes(node.contentDocument, into);
+}
+
+/**
+ * Runs `read` with `states` forced on every element the locator matches, then
+ * puts the page back exactly as it was.
+ *
+ * CSS.forcePseudoState is the same mechanism DevTools' "force element state"
+ * checkbox uses, and it really does reach getComputedStyle, which is what
+ * makes a resting-versus-hover comparison possible at all without synthesising
+ * a real pointer. The restore is in a finally because a leaked forced :hover
+ * would silently poison every later measurement of the same page.
+ */
+async function withForcedStates<T>(
+  page: Page,
+  root: Page | Frame,
+  matches: Locator,
+  states: readonly string[],
+  read: () => Promise<T>
+): Promise<T> {
+  await matches.evaluateAll((nodes, attribute: string) => {
+    const elements = Array.prototype.slice.call(nodes) as ProbeElement[];
+    elements.forEach((element, index) => element.setAttribute(attribute, String(index)));
+  }, probeAttribute);
+
+  const cdpSession = await page.context().newCDPSession(page);
+  const forced: number[] = [];
+  try {
+    await cdpSession.send('DOM.enable');
+    await cdpSession.send('CSS.enable');
+    const tree = (await cdpSession.send('DOM.getDocument', { depth: -1, pierce: true })) as unknown as {
+      root: CdpNode;
+    };
+    collectProbeNodes(tree.root, forced);
+    for (const nodeId of forced) {
+      await cdpSession.send('CSS.forcePseudoState', { nodeId, forcedPseudoClasses: [...states] });
+    }
+    return await read();
+  } finally {
+    for (const nodeId of forced) {
+      await cdpSession.send('CSS.forcePseudoState', { nodeId, forcedPseudoClasses: [] }).catch(() => {});
+    }
+    await cdpSession.detach().catch(() => {});
+    await root
+      .evaluate((attribute: string) => {
+        const tagged = document.querySelectorAll(`[${attribute}]`);
+        for (let index = 0; index < tagged.length; index += 1) tagged[index].removeAttribute(attribute);
+      }, probeAttribute)
+      .catch(() => {});
+  }
+}
+
 /** Tools that read something back out of a tab: page state, pixels, buffers, raw CDP. */
 export const inspectTools = defineTools({
   evaluate: defineTool({
@@ -166,6 +559,14 @@ export const inspectTools = defineTools({
     inputSchema: z.object({
       sessionId,
       pageId,
+      frame: z
+        .string()
+        .optional()
+        .describe(
+          'Frame id from list_frames to evaluate inside, e.g. "main/0" for the first iframe. Defaults to the ' +
+            'tab\'s main frame. Each frame has its own JavaScript context, so a variable set in one is not ' +
+            'visible in another.'
+        ),
       expression: z
         .string()
         .describe('JavaScript evaluated in the page context. The resolved value is JSON-serialized back.'),
@@ -182,6 +583,8 @@ export const inspectTools = defineTools({
     }),
     async handler(ctx, args) {
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
+      const evaluationRoot: Page | Frame = resolveFrame(target.page, args.frame) ?? target.page;
+      const inFrame = args.frame !== undefined ? { frame: args.frame } : {};
       const timeoutMs = args.timeoutMs ?? defaultEvaluateTimeoutMs;
       // Playwright trims before evaluating, so this is the text its line and
       // column numbers actually refer to.
@@ -195,7 +598,7 @@ export const inspectTools = defineTools({
       // Promise.race has already attached handlers to the evaluation, so its
       // later rejection stays handled and never surfaces as an unhandled
       // rejection in the daemon.
-      const pending = target.page.evaluate(args.expression);
+      const pending = evaluationRoot.evaluate(args.expression);
       const timedOut = Symbol('timeout');
       let timer: NodeJS.Timeout | undefined;
 
@@ -218,6 +621,7 @@ export const inspectTools = defineTools({
               numberedSource(source),
             {
               pageId: target.pageId,
+              ...inFrame,
               error: `evaluate timed out after ${timeoutMs}ms`,
               timedOut: true,
               timeoutMs,
@@ -227,7 +631,7 @@ export const inspectTools = defineTools({
           );
         }
 
-        return text({ pageId: target.pageId, result: raced });
+        return text({ pageId: target.pageId, ...inFrame, result: raced });
       } catch (err) {
         const message = messageOf(err);
         const headline = message.split('\n')[0]?.replace(/^page\.evaluate:\s*/, '') ?? message;
@@ -243,6 +647,7 @@ export const inspectTools = defineTools({
             numberedSource(source, fault),
           {
             pageId: target.pageId,
+            ...inFrame,
             error: headline,
             positionKnown: fault !== undefined,
             ...(fault ? { line: fault.line, column: fault.column } : {}),
@@ -257,15 +662,31 @@ export const inspectTools = defineTools({
   }),
 
   snapshot: defineTool({
-    description: 'Get an AI-readable accessibility snapshot of a session\'s tab (structure and text, not pixels).',
+    description:
+      'Get an AI-readable accessibility snapshot of a session\'s tab (structure and text, not pixels). ' +
+      'Iframe contents are included inline, nested under the iframe node, with their refs prefixed by frame ' +
+      '("ref=f1e2"). Pass frame (from list_frames) to snapshot one frame on its own instead, which is much ' +
+      'smaller when only part of the page matters. ' +
+      'The "ref=eN" ids in the output are NOT selectors: click and fill will not take them. Use find to get a ' +
+      'selector those tools accept.',
     inputSchema: z.object({
       sessionId,
-      pageId
+      pageId,
+      frame: z
+        .string()
+        .optional()
+        .describe('Frame id from list_frames to snapshot instead of the whole tab. Defaults to the main frame.')
     }),
     async handler(ctx, args) {
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
-      const snapshot = await target.page.locator('body').ariaSnapshot({ mode: 'ai' });
-      return text({ pageId: target.pageId, url: target.page.url(), snapshot });
+      const snapshotRoot: Page | Frame = resolveFrame(target.page, args.frame) ?? target.page;
+      const snapshot = await snapshotRoot.locator('body').ariaSnapshot({ mode: 'ai' });
+      return text({
+        pageId: target.pageId,
+        ...(args.frame !== undefined ? { frame: args.frame } : {}),
+        url: snapshotRoot.url(),
+        snapshot
+      });
     }
   }),
 
@@ -521,6 +942,664 @@ export const inspectTools = defineTools({
       // "0 of 200" knows its filter was wrong, while "0 of 0" says the traffic
       // genuinely was not there, or has already aged out.
       return text({ total: entries.length, returned: requests.length, requests });
+    }
+  }),
+
+  computed_style: defineTool({
+    description:
+      'Read getComputedStyle for the elements a selector matches, and work out what those colours actually look ' +
+      'like on screen. This exists so that measuring contrast stops being hand-rolled: an agent compositing ' +
+      'colours through a canvas gets a number nobody can check, and pollutes the console it is about to assert on. ' +
+      'Per element you get three things. "styles": the raw computed values for the properties asked for (colour, ' +
+      'background colour, font size and weight, border, outline, box-shadow, opacity, display and visibility by ' +
+      'default). "effective": the colour and background composited down the ancestor chain, so a background of ' +
+      '"rgba(0, 0, 0, 0)" or a half-transparent overlay reports what the eye sees instead of what the cascade ' +
+      'literally says, with the stack it composited shown as layers. "contrast": the WCAG 2.x contrast ratio ' +
+      'between those two effective colours, plus the thresholds that apply and whether they are met. ' +
+      'WCAG thresholds used: 4.5:1 for normal text at level AA, 3:1 for large text (18pt, which is 24px, or 14pt ' +
+      '/ 18.67px at weight 700 or more), 7:1 and 4.5:1 for the same two cases at AAA, and 3:1 for non-text ' +
+      'contrast (borders, icons, focus indicators) under 1.4.11. largeText in the result says which text rule was ' +
+      'applied. ' +
+      'What the compositing does NOT account for, and these are common: background images and gradients, CSS ' +
+      'filters, blend modes, backdrop-filter, box shadows and text shadows, transforms, and anything a sibling or ' +
+      'an overlay paints on top (element_box\'s topmostAtCentre is what catches that last one). It composites ' +
+      'background-color and opacity only, up to the document root of the frame the element is in, onto an opaque ' +
+      'white canvas, and it reports colours it could not parse rather than guessing. When any of those features ' +
+      'are in play the ratio is a strong hint, not a verdict: look at a screenshot too.',
+    inputSchema: z.object({
+      sessionId,
+      pageId,
+      frame: z
+        .string()
+        .optional()
+        .describe('Frame id from list_frames to resolve the selector inside. Defaults to the tab\'s main frame.'),
+      selector: z
+        .string()
+        .describe(
+          'Playwright selector (CSS, text=, role=, etc.) for the elements to measure. A frame selectorPrefix from ' +
+            'list_frames can be prepended to reach inside an iframe.'
+        ),
+      properties: z
+        .array(z.string().min(1))
+        .optional()
+        .describe(
+          'CSS property names to fetch, in kebab-case, e.g. ["color", "border-bottom-width"]. Defaults to a set ' +
+            'covering colour, background colour, font size and weight, line height, border, outline, box-shadow, ' +
+            'opacity, display and visibility. Shorthands such as "border" can come back empty when the four sides ' +
+            'differ, which is why the longhands are in the default set too.'
+        ),
+      pseudoElement: z
+        .string()
+        .optional()
+        .describe(
+          'Read a pseudo-element instead of the element itself, e.g. "::before" or "::after". The pseudo-element ' +
+            'is treated as painting on top of its host, so compositing and contrast account for the host behind it.'
+        ),
+      states: z
+        .array(z.enum(forceablePseudoStates))
+        .optional()
+        .describe(
+          'Pseudo-classes to force while measuring, e.g. ["hover"] or ["focus-visible"], which is how you compare ' +
+            'a resting style against a hover or focus style without moving a real pointer. Forced through the ' +
+            'Chrome DevTools Protocol, the same mechanism as DevTools\' "force element state", and released again ' +
+            'before the call returns. Caveat worth knowing: to address the elements over CDP they are tagged with ' +
+            'a temporary data-harborage-probe attribute for the duration of the call, so a page whose CSS or ' +
+            'MutationObserver reacts to attribute changes can in principle notice.'
+        ),
+      all: z
+        .boolean()
+        .optional()
+        .describe(
+          'Return every matching element instead of only the first (default false). matched always reports the ' +
+            'true total either way, so a selector that quietly matched twelve things is visible without this.'
+        ),
+      limit: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe('Cap on elements returned when all is true (default 20). Ignored otherwise.')
+    }),
+    async handler(ctx, args) {
+      const target = ctx.sessions.resolve(args.sessionId, args.pageId);
+      const frame = resolveFrame(target.page, args.frame);
+      const root: Page | Frame = frame ?? target.page;
+      const properties = args.properties ?? defaultStyleProperties;
+      const limit = args.all ? (args.limit ?? defaultMatchLimit) : 1;
+      const matches = root.locator(args.selector);
+      const matched = await matches.count();
+
+      interface StyleProbe {
+        tagName: string;
+        id: string;
+        classes: string | null;
+        text: string;
+        styles: Record<string, string>;
+        layers: RawLayer[];
+        color: string;
+        fontSizePx: number;
+        fontWeight: number;
+      }
+
+      const read = (): Promise<StyleProbe[]> =>
+        matches.evaluateAll(
+          (nodes, arg: { properties: string[]; pseudoElement: string | null; limit: number }) => {
+            const elements = Array.prototype.slice.call(nodes, 0, arg.limit) as ProbeElement[];
+            const out: StyleProbe[] = [];
+            for (const element of elements) {
+              const own = getComputedStyle(element, arg.pseudoElement);
+              const styles: Record<string, string> = {};
+              for (const property of arg.properties) styles[property] = own.getPropertyValue(property);
+
+              const layers: RawLayer[] = [];
+              let node: ProbeElement | null = element;
+              while (node) {
+                const style = getComputedStyle(node);
+                layers.push({
+                  tagName: String(node.tagName).toLowerCase(),
+                  id: node.id || '',
+                  backgroundColor: style.getPropertyValue('background-color'),
+                  opacity: style.getPropertyValue('opacity')
+                });
+                node = node.parentElement;
+              }
+              layers.reverse();
+              if (arg.pseudoElement) {
+                layers.push({
+                  tagName: String(element.tagName).toLowerCase() + arg.pseudoElement,
+                  id: element.id || '',
+                  backgroundColor: own.getPropertyValue('background-color'),
+                  opacity: own.getPropertyValue('opacity')
+                });
+              }
+
+              const text = (element.textContent || '').replace(/\s+/g, ' ').trim();
+              out.push({
+                tagName: String(element.tagName).toLowerCase(),
+                id: element.id || '',
+                classes: element.getAttribute('class'),
+                text: text.length > 80 ? `${text.slice(0, 80)}...` : text,
+                styles,
+                layers,
+                color: own.getPropertyValue('color'),
+                fontSizePx: parseFloat(own.getPropertyValue('font-size')),
+                fontWeight: parseFloat(own.getPropertyValue('font-weight'))
+              });
+            }
+            return out;
+          },
+          { properties, pseudoElement: args.pseudoElement ?? null, limit }
+        ) as Promise<StyleProbe[]>;
+
+      const probes =
+        args.states !== undefined && args.states.length > 0
+          ? await withForcedStates(target.page, root, matches, args.states, read)
+          : await read();
+
+      const elements = probes.map((probe, index) => {
+        const unparsed: string[] = [];
+        const paintLayers: PaintLayer[] = probe.layers.map(layer => {
+          const parsed = parseCssColor(layer.backgroundColor);
+          if (parsed === null) unparsed.push(`${layer.tagName}: ${layer.backgroundColor}`);
+          const opacity = Number(layer.opacity);
+          return { bg: parsed ?? { ...fullyTransparent }, opacity: Number.isFinite(opacity) ? opacity : 1 };
+        });
+        const textColor = parseCssColor(probe.color);
+        if (textColor === null) unparsed.push(`color: ${probe.color}`);
+
+        const background = flattenOntoCanvas(paintLayers, { ...fullyTransparent });
+        const foreground = flattenOntoCanvas(paintLayers, textColor ?? { ...fullyTransparent });
+        const largeText = isLargeText(probe.fontSizePx, probe.fontWeight);
+        const aaText = largeText ? 3 : 4.5;
+        const aaaText = largeText ? 4.5 : 7;
+        const ratio = round(contrastRatio(foreground, background), 4);
+
+        return {
+          index,
+          tagName: probe.tagName,
+          ...(probe.id ? { id: probe.id } : {}),
+          ...(probe.classes ? { classes: probe.classes } : {}),
+          ...(probe.text ? { text: probe.text } : {}),
+          ...(args.pseudoElement ? { pseudoElement: args.pseudoElement } : {}),
+          styles: probe.styles,
+          effective: {
+            color: formatRgb(foreground),
+            backgroundColor: formatRgb(background),
+            layers: probe.layers.map((layer, layerIndex) => ({
+              tagName: layer.tagName,
+              ...(layer.id ? { id: layer.id } : {}),
+              backgroundColor: layer.backgroundColor,
+              opacity: paintLayers[layerIndex].opacity
+            })),
+            ...(unparsed.length > 0
+              ? {
+                  unparsedColors: unparsed,
+                  warning:
+                    'Some colours could not be parsed as rgb/rgba and were treated as transparent, so the ' +
+                    'composited result and the contrast ratio below are unreliable for this element.'
+                }
+              : {})
+          },
+          contrast: {
+            ratio,
+            foreground: formatRgb(foreground),
+            background: formatRgb(background),
+            fontSizePx: Number.isFinite(probe.fontSizePx) ? probe.fontSizePx : null,
+            fontWeight: Number.isFinite(probe.fontWeight) ? probe.fontWeight : null,
+            largeText,
+            thresholds: { aaText, aaaText, nonText: 3 },
+            passes: { aaText: ratio >= aaText, aaaText: ratio >= aaaText, nonText: ratio >= 3 }
+          }
+        };
+      });
+
+      return text({
+        pageId: target.pageId,
+        ...(args.frame !== undefined ? { frame: args.frame } : {}),
+        selector: args.selector,
+        ...(args.states !== undefined && args.states.length > 0 ? { forcedStates: args.states } : {}),
+        matched,
+        returned: elements.length,
+        properties,
+        elements
+      });
+    }
+  }),
+
+  element_box: defineTool({
+    description:
+      'Measure elements: bounding box, client and scroll dimensions, whether they are inside the viewport, ' +
+      'whether they are really visible, and whether anything is painted on top of them. ' +
+      'It takes a list of selectors rather than one, because the question that actually comes up is a comparison ' +
+      '("are these three left-aligned?", "is this row taller than that one?") and one call is far cheaper and far ' +
+      'easier to read than one call per element. ' +
+      'Coordinates are CSS pixels relative to the top left of the viewport, exactly what getBoundingClientRect ' +
+      'returns, which is also the coordinate space screenshot\'s clip expects. documentBox is the same point with ' +
+      'the current scroll offset added, for comparing things that are not on screen together. Inside an iframe ' +
+      'the coordinates are relative to that frame\'s own viewport, not the page\'s. ' +
+      'visible is Chromium\'s own checkVisibility (so an ancestor being display:none counts) plus a non-zero box, ' +
+      'and hiddenReasons says which test failed rather than leaving you to guess. topmostAtCentre hit-tests the ' +
+      'centre point: false means something else would receive a click there, and occludedBy names it, which is ' +
+      'how a fully transparent overlay that swallows clicks gets caught. ' +
+      'What it does NOT do: it never waits. A selector whose element has not rendered yet comes back as ' +
+      'matched: 0, not as a timeout, so settle the page first. It hit-tests one point, the centre, so an element ' +
+      'covered only at its edges still reports topmostAtCentre true. It does not tell you what an element looks ' +
+      'like: use computed_style for colour and screenshot for pixels.',
+    inputSchema: z.object({
+      sessionId,
+      pageId,
+      frame: z
+        .string()
+        .optional()
+        .describe('Frame id from list_frames to resolve the selectors inside. Defaults to the tab\'s main frame.'),
+      selectors: z
+        .array(z.string().min(1))
+        .min(1)
+        .describe(
+          'Playwright selectors to measure, one result block per selector, in the order given. A frame ' +
+            'selectorPrefix from list_frames can be prepended to any of them.'
+        ),
+      all: z
+        .boolean()
+        .optional()
+        .describe('Return every element each selector matches instead of only the first (default false).'),
+      limit: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe('Cap on elements returned per selector when all is true (default 20). Ignored otherwise.')
+    }),
+    async handler(ctx, args) {
+      const target = ctx.sessions.resolve(args.sessionId, args.pageId);
+      const frame = resolveFrame(target.page, args.frame);
+      const root: Page | Frame = frame ?? target.page;
+      const limit = args.all ? (args.limit ?? defaultMatchLimit) : 1;
+
+      const viewport = await root.evaluate(() => ({
+        width: window.innerWidth,
+        height: window.innerHeight,
+        scrollX: window.scrollX,
+        scrollY: window.scrollY,
+        devicePixelRatio: window.devicePixelRatio
+      }));
+
+      const results = [];
+      for (const selector of args.selectors) {
+        const matches = root.locator(selector);
+        const matched = await matches.count();
+        const elements =
+          matched === 0
+            ? []
+            : await matches.evaluateAll((nodes, arg: { limit: number }) => {
+                // No inner named functions in an in-page snippet: esbuild's
+                // keep-names transform (which the test runner applies) rewrites
+                // them into calls to a __name helper that does not exist in the
+                // page, and the snippet dies with a ReferenceError.
+                const scrolls = ['auto', 'scroll', 'overlay'];
+                const elements = Array.prototype.slice.call(nodes, 0, arg.limit) as ProbeElement[];
+                return elements.map((element, index) => {
+                  const rect = element.getBoundingClientRect();
+                  const style = getComputedStyle(element);
+                  const isRoot = element === document.documentElement || element === document.body;
+                  const overflowX = style.getPropertyValue('overflow-x');
+                  const overflowY = style.getPropertyValue('overflow-y');
+                  const scrollable =
+                    ((isRoot || scrolls.indexOf(overflowY) >= 0) && element.scrollHeight > element.clientHeight + 1) ||
+                    ((isRoot || scrolls.indexOf(overflowX) >= 0) && element.scrollWidth > element.clientWidth + 1);
+
+                  const rendered =
+                    typeof element.checkVisibility === 'function'
+                      ? element.checkVisibility({
+                          checkOpacity: true,
+                          checkVisibilityCSS: true,
+                          opacityProperty: true,
+                          visibilityProperty: true,
+                          contentVisibilityAuto: true
+                        })
+                      : rect.width > 0 && rect.height > 0;
+                  const visible = rendered && rect.width > 0 && rect.height > 0;
+
+                  const hiddenReasons: string[] = [];
+                  if (style.getPropertyValue('display') === 'none') hiddenReasons.push('display: none on the element itself');
+                  const visibility = style.getPropertyValue('visibility');
+                  if (visibility !== 'visible') hiddenReasons.push(`visibility: ${visibility}`);
+                  if (parseFloat(style.getPropertyValue('opacity')) === 0) hiddenReasons.push('opacity: 0');
+                  if (rect.width === 0 || rect.height === 0) hiddenReasons.push('the element has a zero-sized box');
+                  if (!visible && hiddenReasons.length === 0) {
+                    hiddenReasons.push('not rendered, most likely because an ancestor is display: none, hidden, or fully transparent');
+                  }
+
+                  const overlapX = Math.max(0, Math.min(rect.right, window.innerWidth) - Math.max(rect.left, 0));
+                  const overlapY = Math.max(0, Math.min(rect.bottom, window.innerHeight) - Math.max(rect.top, 0));
+                  const area = rect.width * rect.height;
+                  const coverage = area > 0 ? (overlapX * overlapY) / area : 0;
+                  const inViewport = coverage > 0;
+
+                  let topmostAtCentre: boolean | null = null;
+                  let occludedBy: { tagName: string; id: string; classes: string | null } | null = null;
+                  if (inViewport && visible) {
+                    const centreX = Math.min(Math.max(rect.left + rect.width / 2, 0), window.innerWidth - 1);
+                    const centreY = Math.min(Math.max(rect.top + rect.height / 2, 0), window.innerHeight - 1);
+                    const hit = document.elementFromPoint(centreX, centreY);
+                    if (hit) {
+                      topmostAtCentre = hit === element || element.contains(hit);
+                      if (!topmostAtCentre) {
+                        occludedBy = {
+                          tagName: String(hit.tagName).toLowerCase(),
+                          id: hit.id || '',
+                          classes: hit.getAttribute('class')
+                        };
+                      }
+                    }
+                  }
+
+                  return {
+                    index,
+                    tagName: String(element.tagName).toLowerCase(),
+                    id: element.id || '',
+                    box: {
+                      x: Math.round(rect.x * 100) / 100,
+                      y: Math.round(rect.y * 100) / 100,
+                      width: Math.round(rect.width * 100) / 100,
+                      height: Math.round(rect.height * 100) / 100
+                    },
+                    documentBox: {
+                      x: Math.round((rect.left + window.scrollX) * 100) / 100,
+                      y: Math.round((rect.top + window.scrollY) * 100) / 100
+                    },
+                    client: { width: element.clientWidth, height: element.clientHeight },
+                    scroll: {
+                      width: element.scrollWidth,
+                      height: element.scrollHeight,
+                      top: Math.round(element.scrollTop * 100) / 100,
+                      left: Math.round(element.scrollLeft * 100) / 100
+                    },
+                    scrollable,
+                    inViewport,
+                    viewportCoverage: Math.round(coverage * 100) / 100,
+                    visible,
+                    hiddenReasons,
+                    topmostAtCentre,
+                    occludedBy,
+                    position: style.getPropertyValue('position'),
+                    zIndex: style.getPropertyValue('z-index')
+                  };
+                });
+              }, { limit });
+
+        results.push({ selector, matched, returned: elements.length, elements });
+      }
+
+      return text({
+        pageId: target.pageId,
+        ...(args.frame !== undefined ? { frame: args.frame } : {}),
+        viewport,
+        results
+      });
+    }
+  }),
+
+  list_frames: defineTool({
+    description:
+      'List every frame in a session\'s tab: the main frame plus each iframe, nested ones included. ' +
+      'Each entry carries a frameId, which evaluate, snapshot, computed_style, element_box and find accept as ' +
+      'their "frame" argument, and a selectorPrefix, which is the thing that makes the rest of harborage work ' +
+      'inside an iframe: prepend it to any selector and click, fill, screenshot, computed_style and element_box ' +
+      'will resolve that selector inside the frame, with no frame argument of their own. So ' +
+      '"iframe >> nth=0 >> internal:control=enter-frame >> #submit" is a perfectly good selector for click. ' +
+      'Frame ids are positional paths ("main", "main/0", "main/0/1") derived from the live page rather than ' +
+      'stored, because harborage keeps no per-session state. The consequence is worth planning around: they ' +
+      'shift when the page adds or removes an iframe, so read them again after a navigation rather than caching ' +
+      'one. ' +
+      'What it does NOT do: it does not reach into shadow DOM (Playwright selectors already pierce open shadow ' +
+      'roots on their own, so no prefix is needed there), and a frame that is still loading may report ' +
+      'about:blank. A cross-origin frame is listed and reachable the same way as a same-origin one, but its ' +
+      'selectorPrefix is missing if its owning element could not be read.',
+    inputSchema: z.object({ sessionId, pageId }),
+    async handler(ctx, args) {
+      const target = ctx.sessions.resolve(args.sessionId, args.pageId);
+      const nodes = frameTree(target.page);
+      const frames = await Promise.all(
+        nodes.map(async node => {
+          const selectorPrefix = await frameSelectorPrefix(target.page, node.frame);
+          return {
+            frameId: node.frameId,
+            ...(node.parentFrameId !== undefined ? { parentFrameId: node.parentFrameId } : {}),
+            isMainFrame: node.frameId === 'main',
+            name: node.frame.name(),
+            url: node.frame.url(),
+            detached: node.frame.isDetached(),
+            ...(selectorPrefix !== undefined
+              ? { selectorPrefix }
+              : {
+                  selectorPrefixUnavailable:
+                    'the owning iframe element could not be read, so this frame is reachable only by frameId'
+                })
+          };
+        })
+      );
+
+      return text({ pageId: target.pageId, url: target.page.url(), count: frames.length, frames });
+    }
+  }),
+
+  find: defineTool({
+    description:
+      'Locate elements and get back a selector you can hand straight to click, fill or screenshot. ' +
+      'That is the point of it. snapshot returns accessibility-tree refs like "ref=e12", and those refs are NOT ' +
+      'accepted by click or fill, so an agent that found something in a snapshot still has to re-derive a ' +
+      'selector for it. find closes that loop from the other end: every result carries a selector that has been ' +
+      'checked against the live page and is flagged unique when it resolves to exactly one element. Search by ' +
+      'visible text, by ARIA role and accessible name, by test id, or by a raw selector, and combine a raw ' +
+      'selector with the others to scope the search to part of the page. ' +
+      'Each result also carries the element\'s tag, trimmed text, key attributes, box, and whether it is visible ' +
+      'and enabled, so choosing between several candidates rarely needs a second call. ' +
+      'What it does NOT do: it does not compute ARIA roles or the full accessibility tree, which is snapshot\'s ' +
+      'job, and it does not click anything. It does not wait for elements to appear. By default it returns only ' +
+      'visible elements, so a result of zero can mean "present but hidden": re-run with visibleOnly false to ' +
+      'tell those two apart. The generated selector is a snapshot of the DOM as it is right now, so a ' +
+      'position-based one (an nth-of-type path, used when the element has no id or test id) can go stale if the ' +
+      'page re-renders in between.',
+    inputSchema: z.object({
+      sessionId,
+      pageId,
+      frame: z
+        .string()
+        .optional()
+        .describe(
+          'Frame id from list_frames to search inside. Returned selectors come back already carrying that ' +
+            'frame\'s prefix, so they work with click and fill as they are.'
+        ),
+      selector: z
+        .string()
+        .optional()
+        .describe(
+          'Raw Playwright selector. On its own it is the search. Combined with role, text or testId it scopes ' +
+            'the search to the descendants of what it matches.'
+        ),
+      role: z
+        .string()
+        .optional()
+        .describe('ARIA role to match, e.g. "button", "link", "textbox", "heading". Pair with name to narrow it.'),
+      name: z
+        .string()
+        .optional()
+        .describe('Accessible name to match alongside role. Substring and case-insensitive unless exact is true.'),
+      text: z
+        .string()
+        .optional()
+        .describe('Visible text to match. Substring and case-insensitive unless exact is true.'),
+      testId: z.string().optional().describe('Value of the element\'s data-testid attribute.'),
+      exact: z
+        .boolean()
+        .optional()
+        .describe('Match name and text exactly, case-sensitively and whole-string (default false).'),
+      visibleOnly: z
+        .boolean()
+        .optional()
+        .describe(
+          'Only return elements that are actually visible (default true). Set false to find something that is ' +
+            'present but hidden, which is the difference between "not rendered" and "rendered but invisible".'
+        ),
+      limit: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe('Cap on elements returned (default 20). matched still reports the true total.')
+    }),
+    async handler(ctx, args) {
+      if (args.selector === undefined && args.role === undefined && args.text === undefined && args.testId === undefined) {
+        throw new Error(
+          'find needs something to search for: pass selector, role, text or testId. Passing a selector alone ' +
+            'searches with it; passing it alongside role, text or testId scopes the search to its descendants.'
+        );
+      }
+
+      const target = ctx.sessions.resolve(args.sessionId, args.pageId);
+      const frame = resolveFrame(target.page, args.frame);
+      const root: Page | Frame = frame ?? target.page;
+      const prefix = frame ? ((await frameSelectorPrefix(target.page, frame)) ?? '') : '';
+      const limit = args.limit ?? defaultMatchLimit;
+      const exact = args.exact ?? false;
+
+      const scope: Locator = root.locator(args.selector ?? ':root');
+      let matches: Locator;
+      if (args.role !== undefined) {
+        matches = scope.getByRole(args.role as Parameters<Locator['getByRole']>[0], {
+          ...(args.name !== undefined ? { name: args.name, exact } : {})
+        });
+      } else if (args.testId !== undefined) {
+        matches = scope.getByTestId(args.testId);
+      } else if (args.text !== undefined) {
+        matches = scope.getByText(args.text, { exact });
+      } else {
+        matches = scope;
+      }
+      if (args.visibleOnly !== false) matches = matches.filter({ visible: true });
+
+      const matched = await matches.count();
+      const elements =
+        matched === 0
+          ? []
+          : await matches.evaluateAll((nodes, arg: { limit: number; attributes: string[] }) => {
+              // Deliberately written without any inner named function: esbuild's
+              // keep-names transform (which the test runner applies) rewrites
+              // those into calls to a __name helper that does not exist in the
+              // page, and the whole snippet dies with a ReferenceError.
+              const found = Array.prototype.slice.call(nodes, 0, arg.limit) as ProbeElement[];
+              return found.map((element, index) => {
+                // Candidate selectors, most durable first. The last one is a
+                // positional path, which always exists but goes stale fastest.
+                const candidates: string[] = [];
+                const tag = String(element.tagName).toLowerCase();
+                if (element.id) candidates.push(`#${CSS.escape(element.id)}`);
+                for (const attribute of ['data-testid', 'data-test-id', 'data-test', 'name']) {
+                  const value = element.getAttribute(attribute);
+                  if (value) candidates.push(`${tag}[${attribute}="${value.replace(/(["\\])/g, '\\$1')}"]`);
+                }
+
+                const parts: string[] = [];
+                let node: ProbeElement | null = element;
+                while (node) {
+                  if (node === document.documentElement) {
+                    parts.unshift('html');
+                    break;
+                  }
+                  const nodeTag = String(node.tagName).toLowerCase();
+                  const parent: ProbeElement | null = node.parentElement;
+                  if (!parent) {
+                    parts.unshift(nodeTag);
+                    break;
+                  }
+                  let position = 0;
+                  let total = 0;
+                  for (let sibling = 0; sibling < parent.children.length; sibling += 1) {
+                    const child = parent.children[sibling];
+                    if (String(child.tagName).toLowerCase() !== nodeTag) continue;
+                    total += 1;
+                    if (child === node) position = total;
+                  }
+                  parts.unshift(total > 1 ? `${nodeTag}:nth-of-type(${position})` : nodeTag);
+                  node = parent;
+                }
+                candidates.push(parts.join(' > '));
+
+                let selector = candidates[candidates.length - 1];
+                let unique = false;
+                for (const candidate of candidates) {
+                  let hits: ArrayLike<ProbeElement> | null = null;
+                  try {
+                    hits = document.querySelectorAll(candidate);
+                  } catch {
+                    hits = null;
+                  }
+                  if (hits !== null && hits.length === 1 && hits[0] === element) {
+                    selector = candidate;
+                    unique = true;
+                    break;
+                  }
+                }
+
+                const rect = element.getBoundingClientRect();
+                const attributes: Record<string, string> = {};
+                for (const attribute of arg.attributes) {
+                  const value = element.getAttribute(attribute);
+                  if (value !== null) attributes[attribute] = value;
+                }
+                const rendered =
+                  typeof element.checkVisibility === 'function'
+                    ? element.checkVisibility({
+                        checkOpacity: true,
+                        checkVisibilityCSS: true,
+                        opacityProperty: true,
+                        visibilityProperty: true,
+                        contentVisibilityAuto: true
+                      })
+                    : rect.width > 0 && rect.height > 0;
+                const raw = (element.textContent || '').replace(/\s+/g, ' ').trim();
+                return {
+                  index,
+                  selector,
+                  unique,
+                  tagName: tag,
+                  text: raw.length > 120 ? `${raw.slice(0, 120)}...` : raw,
+                  attributes,
+                  visible: rendered && rect.width > 0 && rect.height > 0,
+                  enabled: !element.hasAttribute('disabled') && element.getAttribute('aria-disabled') !== 'true',
+                  box: {
+                    x: Math.round(rect.x * 100) / 100,
+                    y: Math.round(rect.y * 100) / 100,
+                    width: Math.round(rect.width * 100) / 100,
+                    height: Math.round(rect.height * 100) / 100
+                  }
+                };
+              });
+            }, {
+              limit,
+              attributes: [
+                'id',
+                'name',
+                'type',
+                'role',
+                'href',
+                'value',
+                'title',
+                'alt',
+                'placeholder',
+                'aria-label',
+                'data-testid'
+              ]
+            });
+
+      return text({
+        pageId: target.pageId,
+        ...(args.frame !== undefined ? { frame: args.frame } : {}),
+        matched,
+        returned: elements.length,
+        elements: elements.map(element => ({ ...element, selector: `${prefix}${element.selector}` }))
+      });
     }
   }),
 
