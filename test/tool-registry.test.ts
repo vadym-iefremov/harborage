@@ -22,15 +22,21 @@ const expectedToolNames = [
   'evaluate',
   'export_state',
   'fill',
+  'hover',
   'list_network_requests',
   'list_sessions',
   'list_tabs',
   'navigate',
+  'press_key',
   'read_console',
   'release_session',
+  'reload',
+  'resize',
   'screenshot',
   'send_cdp_command',
-  'snapshot'
+  'snapshot',
+  'type',
+  'wait_for'
 ];
 
 /**
@@ -64,9 +70,9 @@ test('every tool definition is complete', () => {
   }
 });
 
-test('the tool surface is exactly the fifteen tools listed here', () => {
+test('the tool surface is exactly the twenty-one tools listed here', () => {
   assert.deepEqual([...toolNames].sort(), expectedToolNames);
-  assert.equal(toolNames.length, 15);
+  assert.equal(toolNames.length, 21);
   assert.equal(new Set(toolNames).size, toolNames.length, 'duplicate tool name in toolDefs');
 });
 
