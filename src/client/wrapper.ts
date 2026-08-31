@@ -200,7 +200,7 @@ function forwardTool<T extends ToolName>(
  *
  * Taking a single `ToolDef` (rather than looping inline over `toolDefs`) is
  * what keeps `registerTool`'s overload resolution happy: the schema is one
- * concrete type here, not the union of all fifteen. Note this file never
+ * concrete type here, not the union of every tool's. Note this file never
  * touches `def.handler`, which is why the wrapper process needs neither a
  * `SessionStore` nor a browser.
  */

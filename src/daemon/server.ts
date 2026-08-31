@@ -16,7 +16,7 @@ import type { SessionStore } from './sessions.js';
  * Taking a single `ToolDef` (rather than looping inline over `toolDefs`) is
  * what keeps `registerTool`'s overload resolution happy: `def.inputSchema`
  * and `def.handler` are one concrete pair here, not the union of all
- * fifteen. At this width the argument type is `Record<string, unknown>` on
+ * all of them at once. At this width the argument type is `Record<string, unknown>` on
  * both sides, so no cast is needed. Each tool's precise argument type is
  * still enforced where it matters, at its definition in `defs/`.
  */
