@@ -220,7 +220,7 @@ export const emulationTools = defineTools({
       'Each of the four is independent: a key you omit is left exactly as it was, and a key set to "reset" drops that one override back to the host system default while the others stay in force. Omitting is NOT resetting. ' +
       'Scoped to one tab, and it outlives navigations and reloads in that tab, so set it once and drive the whole flow. It does not touch other tabs, other sessions, or the machine. ' +
       'It also does not change how the page BEHAVES beyond the media queries: a page that reads its theme out of localStorage, a cookie or a server preference will not follow this, and neither will one that only checks prefers-color-scheme at first paint. ' +
-      'Always reads the state back out of the page afterwards, so "effective" is what the browser reports rather than what was asked for. Note that Chromium reports "light" rather than "no-preference" when nothing is emulated. ' +
+      'Always reads the state back out of the page afterwards, so "effective" is what the browser reports rather than what was asked for, and reports "matched" plus a per-feature breakdown so a request the browser declined is stated rather than left to be spotted by diffing two objects. Note that Chromium reports "light" rather than "no-preference", both when nothing is emulated and when "no-preference" is what was asked for: that particular disagreement is expected and does not count as a mismatch. ' +
       'That readback proves the browser changed its mind, not that the page did anything about it, so confirm with a computed style (through evaluate) or a screenshot before concluding the theme actually works.',
     inputSchema: z.object({
       sessionId,
@@ -259,6 +259,26 @@ export const emulationTools = defineTools({
       }
 
       const effective = await probe<MediaState>(target, MEDIA_PROBE);
+
+      // Every other tool in this module computes a "matched", and leaving two
+      // objects side by side for the caller to diff themselves is the same gap
+      // in a friendlier costume. It also cannot be a plain equality check:
+      // Chromium answers "light" to a request for "no-preference" every time,
+      // and reporting that permanent, harmless disagreement as a mismatch is
+      // its own false alarm.
+      const agrees = (requested: string | undefined, actual: string): boolean => {
+        if (requested === undefined || requested === 'reset') return true;
+        if (requested === actual) return true;
+        return requested === 'no-preference' && actual === 'light';
+      };
+      const perFeature = {
+        colorScheme: agrees(args.colorScheme, effective.colorScheme),
+        reducedMotion: agrees(args.reducedMotion, effective.reducedMotion),
+        forcedColors: agrees(args.forcedColors, effective.forcedColors),
+        media: agrees(args.media, effective.media)
+      };
+      const disagreed = (Object.keys(perFeature) as (keyof typeof perFeature)[]).filter(key => !perFeature[key]);
+
       return text({
         pageId: target.pageId,
         requested: {
@@ -268,7 +288,12 @@ export const emulationTools = defineTools({
           ...(args.media !== undefined ? { media: args.media } : {})
         },
         effective,
+        matched: disagreed.length === 0,
+        perFeature,
         note:
+          (disagreed.length > 0
+            ? `The browser did not take ${disagreed.join(' and ')}: compare "requested" against "effective" and trust "effective". `
+            : '') +
           'The "effective" values were read back out of the page with matchMedia. A page whose CSS does not react to these queries will report the change here and still look identical: check a computed style or a screenshot before concluding the theme works.'
       });
     }

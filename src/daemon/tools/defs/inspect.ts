@@ -265,6 +265,34 @@ interface Rgba {
 }
 
 const opaqueWhite: Rgba = { r: 255, g: 255, b: 255, a: 1 };
+
+/**
+ * The colour the browser paints behind a page that declares no background of
+ * its own, read out of the page rather than assumed.
+ *
+ * Assuming white was wrong for every dark-mode site there is. Chromium paints
+ * rgb(18, 18, 18) behind a document whose used `color-scheme` is dark, and it
+ * does that whether the page asked for dark itself (`color-scheme: dark` in
+ * CSS) or the browser was told the user wants it (a `<meta name="color-scheme">`
+ * page under emulate_media). In both cases getComputedStyle on the root still
+ * reports `rgba(0, 0, 0, 0)`, so nothing about the cascade gives it away: white
+ * text over that canvas came out as 1:1 and a confident AA failure.
+ *
+ * The `Canvas` CSS system colour is exactly this value and resolves through
+ * getComputedStyle, so the browser answers the question directly. It needs an
+ * element to resolve against, hence the throwaway node, which is removed again
+ * before the snippet returns.
+ */
+const CANVAS_COLOR_PROBE = `(() => {
+  var probe = document.createElement('div');
+  probe.style.cssText = 'background-color: Canvas; position: fixed; left: -99999px; top: -99999px; width: 0; height: 0';
+  document.documentElement.appendChild(probe);
+  try {
+    return getComputedStyle(probe).backgroundColor;
+  } finally {
+    probe.remove();
+  }
+})()`;
 const fullyTransparent: Rgba = { r: 0, g: 0, b: 0, a: 0 };
 
 /**
@@ -326,14 +354,14 @@ function paintGroup(layers: PaintLayer[], index: number, innermost: Rgba): Rgba 
 
 /**
  * The pixel a viewer actually sees: the whole ancestor stack composited onto
- * an opaque white canvas. White because that is what a browser paints behind
- * a page that declares no background of its own, and because the stack
- * already includes the document root, so a page that does declare one has
- * covered it before this matters.
+ * the canvas the browser really paints. The stack already includes the
+ * document root, so a page that declares its own background has covered the
+ * canvas before this matters; it only shows through for a page that does not,
+ * which is precisely the dark-mode case that used to come out white.
  */
-function flattenOntoCanvas(layers: PaintLayer[], innermost: Rgba): Rgba {
-  if (layers.length === 0) return over(innermost, opaqueWhite);
-  return over(paintGroup(layers, 0, innermost), opaqueWhite);
+function flattenOntoCanvas(layers: PaintLayer[], innermost: Rgba, canvas: Rgba): Rgba {
+  if (layers.length === 0) return over(innermost, canvas);
+  return over(paintGroup(layers, 0, innermost), canvas);
 }
 
 /** WCAG 2.x sRGB channel transfer function. */
@@ -695,7 +723,9 @@ export const inspectTools = defineTools({
     description:
       'Capture pixels from a session\'s tab as a PNG. Every result reports the capture\'s real width and height, ' +
       'read back out of the PNG itself rather than from what was requested, so a viewport that is not what you ' +
-      'assumed is visible without opening the file. ' +
+      'assumed is visible without opening the file. Those two are DEVICE pixels, so at a deviceScaleFactor of 2 a ' +
+      '375x600 viewport reports 750x1200: cssWidth, cssHeight and deviceScaleFactor come back alongside them, and ' +
+      'cssWidth/cssHeight are the ones to compare against a clip or an element box, which are CSS pixels. ' +
       'Scope: the default is the whole viewport. Pass selector to capture one element, or clip for an explicit ' +
       'region, when what you care about is a small part of a large page. selector, clip and fullPage are mutually ' +
       'exclusive, and a contradictory combination is rejected rather than quietly half-applied. ' +
@@ -771,6 +801,16 @@ export const inspectTools = defineTools({
             : await target.page.screenshot({ type: 'png', fullPage: args.fullPage ?? false });
 
       const { width, height } = pngDimensions(buffer);
+      // The PNG is in DEVICE pixels while clip, selector geometry and the
+      // viewport are all in CSS pixels. At a deviceScaleFactor of 2 those sit
+      // side by side in one payload as 200 and 400 for the same edge, and a
+      // truncated clip then reads as untruncated: asking for 200x200 at the
+      // bottom right of a 375x600 viewport really returns 75x100 CSS pixels and
+      // used to report "width: 150, height: 200", which against the request
+      // says the height was not clipped at all. Both scales are reported now.
+      const deviceScaleFactor = await target.page
+        .evaluate(() => window.devicePixelRatio)
+        .catch(() => 1);
       const scope =
         args.selector !== undefined
           ? 'element'
@@ -786,6 +826,9 @@ export const inspectTools = defineTools({
         ...(args.clip !== undefined ? { clip: args.clip } : {}),
         width,
         height,
+        deviceScaleFactor,
+        cssWidth: Math.round((width / deviceScaleFactor) * 100) / 100,
+        cssHeight: Math.round((height / deviceScaleFactor) * 100) / 100,
         sizeBytes: buffer.length
       };
 
@@ -975,9 +1018,14 @@ export const inspectTools = defineTools({
       'What the compositing does NOT account for, and these are common: background images and gradients, CSS ' +
       'filters, blend modes, backdrop-filter, box shadows and text shadows, transforms, and anything a sibling or ' +
       'an overlay paints on top (element_box\'s topmostAtCentre is what catches that last one). It composites ' +
-      'background-color and opacity only, up to the document root of the frame the element is in, onto an opaque ' +
-      'white canvas, and it reports colours it could not parse rather than guessing. When any of those features ' +
-      'are in play the ratio is a strong hint, not a verdict: look at a screenshot too.',
+      'background-color and opacity only, up to the document root of the frame the element is in, onto the canvas the ' +
+      'browser really paints behind the page, and it reports colours it could not parse rather than guessing. That ' +
+      'canvas is read from the page through the CSS "Canvas" system colour rather than assumed to be white, so a ' +
+      'dark-mode page that paints no background of its own composites onto rgb(18, 18, 18) the way it looks on ' +
+      'screen; effective.canvasColor reports which one was used. Reading it appends a zero-sized node to the ' +
+      'document for the length of one getComputedStyle call and removes it again, the same kind of temporary ' +
+      'mutation the states option makes. When any of the unmodelled features above are in play the ratio is a ' +
+      'strong hint, not a verdict: look at a screenshot too.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -1108,6 +1156,11 @@ export const inspectTools = defineTools({
           ? await withForcedStates(target.page, root, matches, args.states, read)
           : await read();
 
+      // Asked of the frame the elements are in, not of the page: a same-origin
+      // iframe can carry its own color-scheme.
+      const rawCanvas = await root.evaluate<string>(CANVAS_COLOR_PROBE).catch(() => 'rgb(255, 255, 255)');
+      const canvasColor = parseCssColor(rawCanvas) ?? { ...opaqueWhite };
+
       const elements = probes.map((probe, index) => {
         const unparsed: string[] = [];
         const paintLayers: PaintLayer[] = probe.layers.map(layer => {
@@ -1119,8 +1172,8 @@ export const inspectTools = defineTools({
         const textColor = parseCssColor(probe.color);
         if (textColor === null) unparsed.push(`color: ${probe.color}`);
 
-        const background = flattenOntoCanvas(paintLayers, { ...fullyTransparent });
-        const foreground = flattenOntoCanvas(paintLayers, textColor ?? { ...fullyTransparent });
+        const background = flattenOntoCanvas(paintLayers, { ...fullyTransparent }, canvasColor);
+        const foreground = flattenOntoCanvas(paintLayers, textColor ?? { ...fullyTransparent }, canvasColor);
         const largeText = isLargeText(probe.fontSizePx, probe.fontWeight);
         const aaText = largeText ? 3 : 4.5;
         const aaaText = largeText ? 4.5 : 7;
@@ -1137,6 +1190,7 @@ export const inspectTools = defineTools({
           effective: {
             color: formatRgb(foreground),
             backgroundColor: formatRgb(background),
+            canvasColor: formatRgb(canvasColor),
             layers: probe.layers.map((layer, layerIndex) => ({
               tagName: layer.tagName,
               ...(layer.id ? { id: layer.id } : {}),
@@ -1181,7 +1235,7 @@ export const inspectTools = defineTools({
   element_box: defineTool({
     description:
       'Measure elements: bounding box, client and scroll dimensions, whether they are inside the viewport, ' +
-      'whether they are really visible, and whether anything is painted on top of them. ' +
+      'whether they are really visible, and whether anything would take a click aimed at them. ' +
       'It takes a list of selectors rather than one, because the question that actually comes up is a comparison ' +
       '("are these three left-aligned?", "is this row taller than that one?") and one call is far cheaper and far ' +
       'easier to read than one call per element. ' +
@@ -1190,13 +1244,19 @@ export const inspectTools = defineTools({
       'the current scroll offset added, for comparing things that are not on screen together. Inside an iframe ' +
       'the coordinates are relative to that frame\'s own viewport, not the page\'s. ' +
       'visible is Chromium\'s own checkVisibility (so an ancestor being display:none counts) plus a non-zero box, ' +
-      'and hiddenReasons says which test failed rather than leaving you to guess. topmostAtCentre hit-tests the ' +
-      'centre point: false means something else would receive a click there, and occludedBy names it, which is ' +
-      'how a fully transparent overlay that swallows clicks gets caught. ' +
+      'and hiddenReasons says which test failed rather than leaving you to guess. topmostAtCentre is a HIT TEST, ' +
+      'not a paint test: false means something else would receive a click there, and occludedBy names it, which is ' +
+      'how a fully transparent overlay that swallows clicks gets caught. The mirror case is the one to watch: an ' +
+      'opaque overlay with pointer-events: none completely hides an element on screen while this still reports ' +
+      'topmostAtCentre true and occludedBy null, correctly, because the click does reach through it. For "is it ' +
+      'actually visible to a human", take a screenshot. ' +
+      'The point tested comes back as hitTestPoint, with hitTestPointIsCentre alongside it, because an element ' +
+      'whose centre falls outside the viewport is tested at the nearest point inside it instead: without that, ' +
+      'occludedBy could name something sitting nowhere near the middle of the element. ' +
       'What it does NOT do: it never waits. A selector whose element has not rendered yet comes back as ' +
-      'matched: 0, not as a timeout, so settle the page first. It hit-tests one point, the centre, so an element ' +
-      'covered only at its edges still reports topmostAtCentre true. It does not tell you what an element looks ' +
-      'like: use computed_style for colour and screenshot for pixels.',
+      'matched: 0, not as a timeout, so settle the page first. It hit-tests one point, so an element covered only ' +
+      'at its edges still reports topmostAtCentre true. It does not tell you what an element looks like: use ' +
+      'computed_style for colour and screenshot for pixels.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -1290,9 +1350,22 @@ export const inspectTools = defineTools({
 
                   let topmostAtCentre: boolean | null = null;
                   let occludedBy: { tagName: string; id: string; classes: string | null } | null = null;
+                  let hitTestPoint: { x: number; y: number } | null = null;
+                  let hitTestPointIsCentre: boolean | null = null;
                   if (inViewport && visible) {
-                    const centreX = Math.min(Math.max(rect.left + rect.width / 2, 0), window.innerWidth - 1);
-                    const centreY = Math.min(Math.max(rect.top + rect.height / 2, 0), window.innerHeight - 1);
+                    // Clamped into the viewport, because elementFromPoint answers
+                    // null outside it. That means the point tested is NOT the
+                    // centre whenever the centre is off screen, and an unrelated
+                    // element sitting at the clamped point would otherwise be
+                    // reported as occluding this one under a field called
+                    // topmostAtCentre. Both the point and the fact that it moved
+                    // are reported for that reason.
+                    const trueX = rect.left + rect.width / 2;
+                    const trueY = rect.top + rect.height / 2;
+                    const centreX = Math.min(Math.max(trueX, 0), window.innerWidth - 1);
+                    const centreY = Math.min(Math.max(trueY, 0), window.innerHeight - 1);
+                    hitTestPoint = { x: Math.round(centreX * 100) / 100, y: Math.round(centreY * 100) / 100 };
+                    hitTestPointIsCentre = centreX === trueX && centreY === trueY;
                     const hit = document.elementFromPoint(centreX, centreY);
                     if (hit) {
                       topmostAtCentre = hit === element || element.contains(hit);
@@ -1334,6 +1407,8 @@ export const inspectTools = defineTools({
                     hiddenReasons,
                     topmostAtCentre,
                     occludedBy,
+                    hitTestPoint,
+                    hitTestPointIsCentre,
                     position: style.getPropertyValue('position'),
                     zIndex: style.getPropertyValue('z-index')
                   };
@@ -1402,7 +1477,11 @@ export const inspectTools = defineTools({
       'That is the point of it. snapshot returns accessibility-tree refs like "ref=e12", and those refs are NOT ' +
       'accepted by click or fill, so an agent that found something in a snapshot still has to re-derive a ' +
       'selector for it. find closes that loop from the other end: every result carries a selector that has been ' +
-      'checked against the live page and is flagged unique when it resolves to exactly one element. Search by ' +
+      'checked against the live page, with selectorHits (how many elements it really resolves to), ' +
+      'resolvesToTarget (whether one of them is the element described here) and unique (both, exactly once). ' +
+      'READ resolvesToTarget BEFORE USING A SELECTOR: false means it points somewhere else, or nowhere. That ' +
+      'happens for an element inside a shadow root, which Playwright finds but a CSS path cannot reach, and the ' +
+      'result carries a note whenever it does. Search by ' +
       'visible text, by ARIA role and accessible name, by test id, or by a raw selector, and combine a raw ' +
       'selector with the others to scope the search to part of the page. ' +
       'Each result also carries the element\'s tag, trimmed text, key attributes, box, and whether it is visible ' +
@@ -1554,6 +1633,28 @@ export const inspectTools = defineTools({
                   }
                 }
 
+                // unique false was the only signal, and it reads as "several
+                // candidates, pick carefully". The worse case it was hiding is a
+                // selector that resolves to a DIFFERENT element, or to nothing:
+                // the positional path is built by walking parentElement, which
+                // stops dead at a shadow boundary, so an element inside an open
+                // shadow root yields a path relative to the shadow root that the
+                // document may well match somewhere else entirely. Playwright
+                // pierces shadow roots and click does not require uniqueness, so
+                // that selector went straight into a click on the wrong thing.
+                let selectorHits = 0;
+                let resolvesToTarget = false;
+                try {
+                  const resolved = document.querySelectorAll(selector);
+                  selectorHits = resolved.length;
+                  for (let i = 0; i < resolved.length; i += 1) {
+                    if (resolved[i] === element) resolvesToTarget = true;
+                  }
+                } catch {
+                  selectorHits = 0;
+                }
+                const inShadowRoot = (element as unknown as { getRootNode(): unknown }).getRootNode() !== document;
+
                 const rect = element.getBoundingClientRect();
                 const attributes: Record<string, string> = {};
                 for (const attribute of arg.attributes) {
@@ -1575,6 +1676,9 @@ export const inspectTools = defineTools({
                   index,
                   selector,
                   unique,
+                  selectorHits,
+                  resolvesToTarget,
+                  inShadowRoot,
                   tagName: tag,
                   text: raw.length > 120 ? `${raw.slice(0, 120)}...` : raw,
                   attributes,
@@ -1605,11 +1709,27 @@ export const inspectTools = defineTools({
               ]
             });
 
+      const unusable = elements.filter(element => !element.resolvesToTarget);
       return text({
         pageId: target.pageId,
         ...(args.frame !== undefined ? { frame: args.frame } : {}),
         matched,
         returned: elements.length,
+        ...(unusable.length > 0
+          ? {
+              note:
+                `${unusable.length} of the ${elements.length} selector(s) below do NOT resolve to the element they ` +
+                'describe: resolvesToTarget is false. ' +
+                (unusable.some(element => element.inShadowRoot)
+                  ? 'These elements live inside a shadow root, and a CSS path cannot cross that boundary, so the ' +
+                    'generated path is relative to the shadow root and the document may match something else with ' +
+                    'it. Reach them through their host component instead, or through a testId or id the host ' +
+                    'exposes. '
+                  : '') +
+                'Do NOT hand such a selector to click or fill: click acts on the first match without complaining, ' +
+                'so it would press whatever else the selector happens to hit.'
+            }
+          : {}),
         elements: elements.map(element => ({ ...element, selector: `${prefix}${element.selector}` }))
       });
     }
@@ -1619,6 +1739,13 @@ export const inspectTools = defineTools({
     description:
       'Send a raw Chrome DevTools Protocol command directly to a session\'s tab and get the structured result back. ' +
       'This is the agent-facing counterpart to escalate_session\'s human-facing CDP access. ' +
+      'IT ATTACHES A FRESH DEVTOOLS SESSION PER CALL AND DETACHES BEFORE RETURNING, and that makes a whole class ' +
+      'of commands silently useless here: Chromium scopes every Emulation.set*Override to the session that set it ' +
+      'and reverts it the instant that session detaches, so Emulation.setUserAgentOverride, setTimezoneOverride, ' +
+      'setLocaleOverride and setDeviceMetricsOverride all return a clean success while the override is already ' +
+      'gone by the time you read it. Network.emulateNetworkConditions goes the same way. Use set_user_agent, ' +
+      'set_timezone, set_locale, resize, set_offline and set_network_conditions instead: those hold a CDP session ' +
+      'open for the life of the tab, which is the only way any of it sticks. ' +
       'Not for captures: Page.captureScreenshot hands back bare base64 with no dimensions and no route into the ' +
       'screenshot cache, so use the screenshot tool, with selector or clip, for anything you want to look at.',
     inputSchema: z.object({
