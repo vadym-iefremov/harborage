@@ -6,6 +6,7 @@ import type { Frame, Locator, Page } from 'playwright';
 import * as z from 'zod/v4';
 
 import { sessionCacheDir } from '../../screenshotCache.js';
+import { parseCssColor, type ParsedCssColor, type Rgba } from '../color.js';
 import type { NetworkEntry } from '../../sessions.js';
 import { defineTool, defineTools, text, type ToolResult } from '../types.js';
 import { clear, pageId, sessionId } from './common.js';
@@ -309,13 +310,6 @@ const probeAttribute = 'data-harborage-probe';
 /** How many matches a diagnostics tool reports per selector unless told otherwise. */
 const defaultMatchLimit = 20;
 
-interface Rgba {
-  r: number;
-  g: number;
-  b: number;
-  a: number;
-}
-
 const opaqueWhite: Rgba = { r: 255, g: 255, b: 255, a: 1 };
 
 /**
@@ -348,27 +342,12 @@ const CANVAS_COLOR_PROBE = `(() => {
 const fullyTransparent: Rgba = { r: 0, g: 0, b: 0, a: 0 };
 
 /**
- * Parses the colour syntaxes getComputedStyle actually returns in Chromium:
- * "rgb(r, g, b)", "rgba(r, g, b, a)" and the keyword "transparent". Anything
- * else (a wide-gamut color() function, say) returns null, and the caller
- * reports that it could not composite rather than inventing a number.
+ * Re-exported so the colour parser stays reachable from where it is used.
+ * The implementation, including every modern colour space and the reasoning
+ * behind clipping out-of-gamut colours rather than gamut-mapping them, lives
+ * in ../color.ts.
  */
-export function parseCssColor(value: string): Rgba | null {
-  const raw = value.trim().toLowerCase();
-  if (raw === 'transparent') return { ...fullyTransparent };
-  const match = /^rgba?\(([^)]*)\)$/.exec(raw);
-  if (!match) return null;
-  const parts = match[1].split(/[\s,/]+/).filter(part => part.length > 0);
-  if (parts.length < 3) return null;
-  const channel = (part: string): number =>
-    part.endsWith('%') ? (Number(part.slice(0, -1)) * 255) / 100 : Number(part);
-  const alphaPart = parts[3];
-  const alpha =
-    alphaPart === undefined ? 1 : alphaPart.endsWith('%') ? Number(alphaPart.slice(0, -1)) / 100 : Number(alphaPart);
-  const color: Rgba = { r: channel(parts[0]), g: channel(parts[1]), b: channel(parts[2]), a: alpha };
-  if (![color.r, color.g, color.b, color.a].every(n => Number.isFinite(n))) return null;
-  return color;
-}
+export { parseCssColor };
 
 /** An opaque "rgb(r, g, b)" string, rounded, which is what a caller can paste back into CSS. */
 function formatRgb(color: Rgba): string {
@@ -1071,7 +1050,20 @@ export const inspectTools = defineTools({
       'filters, blend modes, backdrop-filter, box shadows and text shadows, transforms, and anything a sibling or ' +
       'an overlay paints on top (element_box\'s topmostAtCentre is what catches that last one). It composites ' +
       'background-color and opacity only, up to the document root of the frame the element is in, onto the canvas the ' +
-      'browser really paints behind the page, and it reports colours it could not parse rather than guessing. That ' +
+      'browser really paints behind the page, and it reports colours it could not parse rather than guessing. ' +
+      'Colour syntaxes understood: rgb()/rgba() and hsl()/hsla() in both the legacy comma form and the modern ' +
+      'space form with a slash alpha, hwb(), lab(), lch(), oklab(), oklch(), color() in the predefined spaces ' +
+      'srgb, srgb-linear, display-p3, a98-rgb, prophoto-rgb, rec2020, xyz, xyz-d50 and xyz-d65, and the keyword ' +
+      'transparent, each with percentage components, "none" components and an alpha channel. That matters on a ' +
+      'Tailwind v4 page, which emits oklab() and oklch() for most colours and for every colour carrying alpha. ' +
+      'color-mix() and currentColor need no special handling because getComputedStyle has already resolved them, ' +
+      'into an oklab() and into an rgb() respectively. Anything left that cannot be parsed is still listed in ' +
+      'effective.unparsedColors with a warning, and is treated as transparent rather than guessed at, so a ' +
+      'result carrying no warning is one where every colour was genuinely understood. ' +
+      'Out-of-sRGB-gamut colours are CLIPPED per channel, not gamut-mapped: that is what Chromium itself paints ' +
+      'on an sRGB screen, and WCAG luminance is only defined over sRGB. When clipping happened the colours it ' +
+      'happened to are listed in effective.outOfGamutColors, so a caller can tell a plain sRGB measurement from ' +
+      'one that went through a wide-gamut colour. That ' +
       'canvas is read from the page through the CSS "Canvas" system colour rather than assumed to be white, so a ' +
       'dark-mode page that paints no background of its own composites onto rgb(18, 18, 18) the way it looks on ' +
       'screen; effective.canvasColor reports which one was used. Reading it appends a zero-sized node to the ' +
@@ -1211,18 +1203,23 @@ export const inspectTools = defineTools({
       // Asked of the frame the elements are in, not of the page: a same-origin
       // iframe can carry its own color-scheme.
       const rawCanvas = await root.evaluate<string>(CANVAS_COLOR_PROBE).catch(() => 'rgb(255, 255, 255)');
-      const canvasColor = parseCssColor(rawCanvas) ?? { ...opaqueWhite };
+      const parsedCanvas = parseCssColor(rawCanvas);
+      const canvasColor: Rgba = parsedCanvas ?? { ...opaqueWhite };
 
       const elements = probes.map((probe, index) => {
         const unparsed: string[] = [];
+        const clipped: string[] = [];
+        if (parsedCanvas?.outOfGamut === true) clipped.push(`canvas: ${rawCanvas}`);
         const paintLayers: PaintLayer[] = probe.layers.map(layer => {
           const parsed = parseCssColor(layer.backgroundColor);
           if (parsed === null) unparsed.push(`${layer.tagName}: ${layer.backgroundColor}`);
+          else if (parsed.outOfGamut) clipped.push(`${layer.tagName}: ${layer.backgroundColor}`);
           const opacity = Number(layer.opacity);
           return { bg: parsed ?? { ...fullyTransparent }, opacity: Number.isFinite(opacity) ? opacity : 1 };
         });
-        const textColor = parseCssColor(probe.color);
+        const textColor: ParsedCssColor | null = parseCssColor(probe.color);
         if (textColor === null) unparsed.push(`color: ${probe.color}`);
+        else if (textColor.outOfGamut) clipped.push(`color: ${probe.color}`);
 
         const background = flattenOntoCanvas(paintLayers, { ...fullyTransparent }, canvasColor);
         const foreground = flattenOntoCanvas(paintLayers, textColor ?? { ...fullyTransparent }, canvasColor);
@@ -1253,8 +1250,17 @@ export const inspectTools = defineTools({
               ? {
                   unparsedColors: unparsed,
                   warning:
-                    'Some colours could not be parsed as rgb/rgba and were treated as transparent, so the ' +
-                    'composited result and the contrast ratio below are unreliable for this element.'
+                    'Some colours could not be parsed and were treated as transparent, so the composited ' +
+                    'result and the contrast ratio below are unreliable for this element.'
+                }
+              : {}),
+            ...(clipped.length > 0
+              ? {
+                  outOfGamutColors: clipped,
+                  gamutNote:
+                    'These colours fall outside sRGB and were clipped per channel on the way in, which is what ' +
+                    'Chromium paints on an sRGB screen. The ratio is right for that rendering. On a wide-gamut ' +
+                    'display the colour shown is not exactly this one.'
                 }
               : {})
           },

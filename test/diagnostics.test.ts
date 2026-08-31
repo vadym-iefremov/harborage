@@ -5,6 +5,7 @@ import { after, before, test } from 'node:test';
 import { BrowserManager } from '../src/daemon/browserManager.js';
 import { createToolHandlers } from '../src/daemon/tools/handlers.js';
 import { SessionStore } from '../src/daemon/sessions.js';
+import { parseCssColor } from '../src/daemon/tools/color.js';
 import { inspectTools } from '../src/daemon/tools/defs/inspect.js';
 import { getFreePort } from './helpers.js';
 
@@ -36,6 +37,9 @@ const OUTER_HTML = `<!doctype html>
   #blueBase { background-color: rgb(0,0,255); width: 300px; height: 100px; }
   #halfWhite { background-color: rgba(255,255,255,0.5); color: rgb(0,0,0); width: 200px; height: 50px; font-size: 16px; }
   #faded { color: rgb(0,0,0); opacity: 0.5; background-color: transparent; font-size: 16px; }
+  #oklabPanel { background-color: oklab(0.21783 -0.000773765 -0.0144868 / 0.4); color: rgb(0,0,0); font-size: 16px; width: 200px; }
+  #labPair { background-color: lab(0 0 0); color: lab(100 0 0); font-size: 16px; width: 200px; }
+  #p3Red { background-color: color(display-p3 1 0 0); color: rgb(255,255,255); font-size: 16px; width: 200px; }
   #withBefore::before { content: "before"; color: rgb(1,2,3); font-size: 11px; }
   #hoverMe { background-color: rgb(0,0,255); width: 80px; height: 20px; }
   #hoverMe:hover { background-color: rgb(255,0,0); }
@@ -58,6 +62,9 @@ const OUTER_HTML = `<!doctype html>
   <p id="largeText">large text sample</p>
   <div id="blueBase"><div id="halfWhite">half white over blue</div></div>
   <p id="faded">faded text</p>
+  <div id="oklabPanel">tailwind shaped oklab with alpha</div>
+  <div id="labPair">lab white on lab black</div>
+  <div id="p3Red">white on a display-p3 red</div>
   <p id="withBefore">has a before</p>
   <div id="hoverMe"></div>
   <button id="focusMe">focus me</button>
@@ -289,6 +296,171 @@ test('computed_style leaves the page console alone', async () => {
   assert.equal(console_.total, 0, 'measuring must not write into the console it is often read alongside');
 
   await sessions.releaseSession(sessionId);
+});
+
+/**
+ * Modern colour spaces.
+ *
+ * The regression these guard is a real measurement on a Tailwind v4 page,
+ * where every ancestor carrying an alpha channel came back as an oklab() the
+ * tool could not read. It reported that honestly, which was the right
+ * behaviour, but it reported it on almost every element, so the contrast
+ * number was never usable on the pages people most want to measure.
+ *
+ * The expected pixels below are what Chromium itself paints. They were taken
+ * by screenshotting these exact fixtures and reading the pixel back, not by
+ * running this implementation and writing down whatever it said.
+ */
+test('computed_style composites a Tailwind shaped oklab with alpha instead of giving up on it', async () => {
+  const sessionId = await freshSession();
+  const el = await styleOf(sessionId, { selector: '#oklabPanel' });
+
+  assert.equal(
+    el.effective.unparsedColors,
+    undefined,
+    'oklab() with an alpha channel is the Tailwind v4 default and must not be reported as unreadable'
+  );
+  assert.equal(el.effective.warning, undefined, 'and with nothing unparsed there is nothing to warn about');
+  assert.equal(el.effective.outOfGamutColors, undefined, 'this colour is inside sRGB, so nothing was clipped');
+
+  // oklab(0.21783 -0.000773765 -0.0144868) is rgb(23, 26, 33). At 40% over
+  // the white page that is rgb(162, 163, 166), which is the pixel Chromium
+  // paints for this fixture.
+  assert.equal(el.effective.backgroundColor, 'rgb(162, 163, 166)');
+  assert.equal(el.effective.color, 'rgb(0, 0, 0)', 'the black text is opaque, so it composites to itself');
+  assert.ok(
+    Math.abs(el.contrast.ratio - 8.359882) < 0.005,
+    `expected about 8.36:1 for black on the composited oklab panel, got ${el.contrast.ratio}`
+  );
+  assert.equal(el.contrast.passes.aaText, true);
+
+  await sessions.releaseSession(sessionId);
+});
+
+test('computed_style reads lab() on both sides and gets the exact 21 to 1 extreme', async () => {
+  const sessionId = await freshSession();
+  const el = await styleOf(sessionId, { selector: '#labPair' });
+
+  // lab(100 0 0) is the reference white and lab(0 0 0) is black by
+  // definition, so this ratio is the maximum WCAG can produce. Any drift in
+  // the D50 to D65 adaptation shows up here immediately.
+  assert.equal(el.effective.unparsedColors, undefined);
+  assert.equal(el.effective.color, 'rgb(255, 255, 255)');
+  assert.equal(el.effective.backgroundColor, 'rgb(0, 0, 0)');
+  assert.equal(el.contrast.ratio, 21);
+
+  await sessions.releaseSession(sessionId);
+});
+
+test('computed_style clips a wide gamut colour the way the screen does, and reports that it did', async () => {
+  const sessionId = await freshSession();
+  const el = await styleOf(sessionId, { selector: '#p3Red' });
+
+  assert.equal(el.effective.unparsedColors, undefined, 'display-p3 is understood, not unreadable');
+  assert.equal(el.effective.backgroundColor, 'rgb(255, 0, 0)', 'clipped to the sRGB corner Chromium paints');
+  assert.deepEqual(
+    el.effective.outOfGamutColors,
+    ['div: color(display-p3 1 0 0)'],
+    'the caller has to be able to tell a clipped measurement from a plain sRGB one'
+  );
+  assert.match(String(el.effective.gamutNote), /clipped/i);
+  assert.ok(
+    Math.abs(el.contrast.ratio - 3.998477) < 0.005,
+    `expected about 4.00:1 for white on clipped p3 red, got ${el.contrast.ratio}`
+  );
+
+  await sessions.releaseSession(sessionId);
+});
+
+test('the colour parser agrees with what Chromium actually paints, across every syntax it claims', async () => {
+  const sessionId = await freshSession();
+  const values = [
+    'oklab(0.21783 -0.000773765 -0.0144868)',
+    'oklab(0.374973 -0.00218269 -0.0273316)',
+    'oklch(0.62796 0.25768 29.234)',
+    'oklch(0.7 0.15 200)',
+    'oklch(0.9 0.4 140)',
+    'lab(50 40 59.5)',
+    'lab(62.99017 82.23775 -88.46721)',
+    'lch(50 70 40)',
+    'lch(91.90824 48.54966 87.10296)',
+    'hwb(90 20% 30%)',
+    'hsl(120deg 50% 25%)',
+    'rgb(18 18 18)',
+    'color(srgb 0.5 0.25 0.125)',
+    'color(srgb-linear 0.5 0.2 0.9)',
+    'color(display-p3 1 0 0)',
+    'color(display-p3 0.2 0.7 0.5)',
+    'color(a98-rgb 0.5 0.2 0.9)',
+    'color(prophoto-rgb 0.5 0.2 0.9)',
+    'color(rec2020 0.5 0.2 0.9)',
+    'color(xyz 0.2 0.3 0.4)',
+    'color(xyz-d50 0.2 0.3 0.4)',
+    'color(xyz-d65 0.2 0.3 0.4)'
+  ];
+
+  // Painted as opaque swatches and read back out of a screenshot, so the
+  // reference is the pixel the browser puts on screen rather than a second
+  // opinion from another colour library. Opaque on purpose: a canvas
+  // premultiplies, which would cost a bit of precision on an alpha colour and
+  // blunt the comparison.
+  const painted = await evaluate<number[][]>(
+    sessionId,
+    `(() => {
+      var canvas = document.createElement('canvas');
+      canvas.width = 1; canvas.height = 1;
+      var ctx = canvas.getContext('2d', { willReadFrequently: true });
+      return ${JSON.stringify(values)}.map(function (value) {
+        ctx.fillStyle = '#010203';
+        ctx.fillStyle = value;
+        ctx.clearRect(0, 0, 1, 1);
+        ctx.fillRect(0, 0, 1, 1);
+        var d = ctx.getImageData(0, 0, 1, 1).data;
+        return [d[0], d[1], d[2], d[3]];
+      });
+    })()`
+  );
+
+  values.forEach((value, index) => {
+    const parsed = parseCssColor(value);
+    assert.ok(parsed !== null, `${value} must parse`);
+    const expected = painted[index];
+    assert.equal(expected[3], 255, `${value} should have been accepted by the browser as opaque`);
+    const mine = [parsed.r, parsed.g, parsed.b];
+    mine.forEach((channel, channelIndex) => {
+      // One unit of 255 is Chromium's own float32 rounding, not a modelling
+      // difference. Anything larger is a wrong matrix or a wrong transfer
+      // function, which is what this is here to catch.
+      assert.ok(
+        Math.abs(Math.round(channel) - expected[channelIndex]) <= 1,
+        `${value}: got ${JSON.stringify(mine.map(Math.round))}, browser paints ${JSON.stringify(expected.slice(0, 3))}`
+      );
+    });
+  });
+
+  await sessions.releaseSession(sessionId);
+});
+
+test('computed_style still names a colour it cannot read rather than guessing at one', () => {
+  // Chromium resolves so much now (color-mix into oklab, currentColor and
+  // relative colour syntax into a concrete colour) that a computed value this
+  // cannot read is hard to produce from a real stylesheet. The honest failure
+  // path still has to exist for the ones that do turn up, so it is pinned at
+  // the parser, which is where the decision is made.
+  assert.equal(parseCssColor('color(--house-profile 1 0 0)'), null);
+  assert.equal(parseCssColor('oklab(0.5 0.1)'), null);
+  const { description } = inspectTools.computed_style;
+  assert.match(description, /unparsedColors/);
+  assert.match(description, /transparent rather than guessed/);
+});
+
+test('computed_style documents which colour syntaxes it understands and how it treats wide gamut', () => {
+  const { description } = inspectTools.computed_style;
+  for (const syntax of ['oklab', 'oklch', 'lab', 'lch', 'hwb', 'display-p3', 'rec2020', 'xyz-d50', 'color-mix', 'currentColor']) {
+    assert.match(description, new RegExp(syntax.replace(/[()]/g, '')), `the description has to mention ${syntax}`);
+  }
+  assert.match(description, /CLIPPED/, 'the gamut decision is a number-changing one, so it is stated outright');
+  assert.match(description, /outOfGamutColors/);
 });
 
 test('computed_style says plainly what its compositing does not account for', () => {
