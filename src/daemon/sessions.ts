@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { BrowserContext, Page } from 'playwright';
 
+import { noopLogger, type Logger } from '../shared/logger.js';
 import type { BrowserManager } from './browserManager.js';
 
 export class SessionNotFoundError extends Error {
@@ -93,7 +94,17 @@ export class SessionStore {
   private readonly sessions = new Map<string, SessionRecord>();
   private readonly bufferLimits: BufferLimits;
 
-  constructor(private readonly browserManager: BrowserManager, bufferLimits: Partial<BufferLimits> = {}) {
+  /**
+   * The logger is injected rather than imported as a module-level singleton
+   * so a test can capture exactly the lines one store emitted, and so a
+   * caller that does not want session lifecycle output (most unit tests)
+   * simply gets the no-op default.
+   */
+  constructor(
+    private readonly browserManager: BrowserManager,
+    bufferLimits: Partial<BufferLimits> = {},
+    private readonly logger: Logger = noopLogger
+  ) {
     this.bufferLimits = { ...defaultBufferLimits, ...bufferLimits };
   }
 
@@ -184,6 +195,7 @@ export class SessionStore {
     this.attachBuffers(record, page, pageId);
 
     this.sessions.set(sessionId, record);
+    this.logger.log('session.create', { sessionId, sessions: this.sessions.size });
     return { sessionId, pageId };
   }
 
@@ -260,7 +272,22 @@ export class SessionStore {
     const record = this.sessions.get(sessionId);
     if (!record) throw new SessionNotFoundError(sessionId);
     this.sessions.delete(sessionId);
+    this.logger.log('session.release', { sessionId, sessions: this.sessions.size });
     await record.context.close();
+  }
+
+  /**
+   * How many sessions are live right now. The daemon's self-shutdown gate
+   * reads this every sweep: an empty client registry alone must never be
+   * enough to kill a browser that agents are still working in.
+   *
+   * Deliberately does not touch `lastActivity` for anything it counts, for
+   * the same reason `listSessions` and `reapIdle` do not: a bookkeeping
+   * read is not session activity, and letting it count as activity would
+   * mean the sweep itself kept every session alive forever.
+   */
+  count(): number {
+    return this.sessions.size;
   }
 
   /** All session ids currently held, for the reaper and for tests/introspection. */
@@ -284,6 +311,11 @@ export class SessionStore {
       if (now - record.lastActivity > idleTimeoutMs) {
         this.sessions.delete(id);
         reaped.push(id);
+        this.logger.log('session.reap', {
+          sessionId: id,
+          idleMs: now - record.lastActivity,
+          sessions: this.sessions.size
+        });
         await record.context.close().catch(() => {
           // Already gone (e.g. the underlying browser died) — nothing more to clean up.
         });

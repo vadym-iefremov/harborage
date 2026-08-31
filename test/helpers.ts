@@ -103,6 +103,13 @@ export interface SpawnedProcess {
   /** Resolves with the exit code once the process has actually exited. */
   exited: Promise<number | null>;
   kill: () => void;
+  /**
+   * Everything the process has written to stderr so far, joined. For the
+   * daemon that is its structured log: the real deployment redirects the
+   * same stream into `~/.harborage/daemon.log`, so asserting on this is
+   * asserting on what an operator would actually read afterwards.
+   */
+  stderrText: () => string;
 }
 
 /** Spawns a long-lived, otherwise-inert Node process — a stand-in "client" with a real, controllable PID. */
@@ -112,7 +119,7 @@ export function spawnInertProcess(): SpawnedProcess {
     proc.once('exit', code => resolve(code));
   });
   if (proc.pid === undefined) throw new Error('failed to spawn inert process: no pid');
-  return { proc, pid: proc.pid, exited, kill: () => proc.kill('SIGKILL') };
+  return { proc, pid: proc.pid, exited, kill: () => proc.kill('SIGKILL'), stderrText: () => '' };
 }
 
 /** Spawns the real daemon entrypoint against `config`, with extra env overrides layered on top. */
@@ -121,7 +128,9 @@ export function spawnDaemonProcess(config: Config, extraEnv: Record<string, stri
     process.execPath,
     [daemonEntry],
     {
-      stdio: 'ignore',
+      // stderr is piped, not ignored, so tests can read the daemon's own
+      // structured log the same way an operator reads daemon.log.
+      stdio: ['ignore', 'ignore', 'pipe'],
       env: {
         ...process.env,
         HARBORAGE_HOST: config.host,
@@ -142,11 +151,21 @@ export function spawnDaemonProcess(config: Config, extraEnv: Record<string, stri
       }
     }
   );
+  const stderrChunks: string[] = [];
+  proc.stderr?.setEncoding('utf8');
+  proc.stderr?.on('data', (chunk: string) => stderrChunks.push(chunk));
+
   const exited = new Promise<number | null>(resolve => {
     proc.once('exit', code => resolve(code));
   });
   if (proc.pid === undefined) throw new Error('failed to spawn daemon: no pid');
-  return { proc, pid: proc.pid, exited, kill: () => proc.kill('SIGKILL') };
+  return {
+    proc,
+    pid: proc.pid,
+    exited,
+    kill: () => proc.kill('SIGKILL'),
+    stderrText: () => stderrChunks.join('')
+  };
 }
 
 export async function isDaemonHealthy(config: Config): Promise<boolean> {
