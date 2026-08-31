@@ -175,14 +175,27 @@ test('filters combine, and a filter matching nothing returns an empty list rathe
   assert.ok(none.total > 0, 'an empty result must still say the buffer was not empty');
 });
 
-test('clear: true still drains the whole buffer, not just the filtered slice', async () => {
+test('clear: true removes exactly what the filter returned, and nothing else', async () => {
   const { sessionId: other } = await sessions.createSession();
   await sessions.resolve(other).page.goto(`${base}/`);
   await waitFor(async () => structured(await handlers.list_network_requests({ sessionId: other })).total > 3);
 
-  await handlers.list_network_requests({ sessionId: other, urlIncludes: '/api/save', clear: true });
+  const before = structured(await handlers.list_network_requests({ sessionId: other })).total;
+  const drained = structured(
+    await handlers.list_network_requests({ sessionId: other, urlIncludes: '/api/save', clear: true })
+  );
+
   const left = structured(await handlers.list_network_requests({ sessionId: other }));
-  assert.equal(left.total, 0, 'clear drains the buffer itself, so a filtered read must not leave the rest behind');
+  assert.equal(
+    left.total,
+    before - drained.returned,
+    'clearing a filtered read must remove the matches and leave every entry the caller never saw'
+  );
+  assert.ok(left.total > 0, 'the unmatched traffic is still readable');
+  assert.ok(
+    !left.requests.some(entry => entry.url.includes('/api/save')),
+    'the entries that were returned really are gone'
+  );
 
   await sessions.releaseSession(other);
 });

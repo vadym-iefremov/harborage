@@ -6,6 +6,7 @@ import type { Frame, Locator, Page } from 'playwright';
 import * as z from 'zod/v4';
 
 import { sessionCacheDir } from '../../screenshotCache.js';
+import type { NetworkEntry } from '../../sessions.js';
 import { defineTool, defineTools, text, type ToolResult } from '../types.js';
 import { clear, pageId, sessionId } from './common.js';
 
@@ -845,17 +846,24 @@ export const inspectTools = defineTools({
         .describe('Keep only messages whose text contains this substring, matched case-insensitively.')
     }),
     async handler(ctx, args) {
-      const entries = ctx.sessions.getConsoleMessages(args.sessionId, args.pageId, args.clear ?? false);
       const wanted = args.types !== undefined ? new Set(args.types.map(t => t.toLowerCase())) : undefined;
       const needle = args.textIncludes?.toLowerCase();
 
-      const messages = entries.filter(entry => {
+      const matches = (entry: { type: string; text: string }): boolean => {
         if (wanted !== undefined && !wanted.has(entry.type.toLowerCase())) return false;
         if (needle !== undefined && !entry.text.toLowerCase().includes(needle)) return false;
         return true;
-      });
+      };
 
-      return text({ total: entries.length, returned: messages.length, messages });
+      // The filter is pushed into the store rather than applied to what comes
+      // back, because `clear` is handled in there. Filtering on the way out
+      // would drain the whole buffer while returning only the matches, silently
+      // destroying entries the caller never saw. Total is read first, without
+      // clearing, so the "0 of 200" signal survives.
+      const total = ctx.sessions.getConsoleMessages(args.sessionId, args.pageId, false).length;
+      const messages = ctx.sessions.getConsoleMessages(args.sessionId, args.pageId, args.clear ?? false, matches);
+
+      return text({ total, returned: messages.length, messages });
     }
   }),
 
@@ -923,11 +931,10 @@ export const inspectTools = defineTools({
         }
       }
 
-      const entries = ctx.sessions.getNetworkEntries(args.sessionId, args.pageId, args.clear ?? false);
       const needle = args.urlIncludes?.toLowerCase();
       const method = args.method?.toUpperCase();
 
-      const requests = entries.filter(entry => {
+      const matches = ((entry: NetworkEntry): boolean => {
         if (args.direction !== undefined && entry.direction !== args.direction) return false;
         if (needle !== undefined && !entry.url.toLowerCase().includes(needle)) return false;
         if (pattern !== undefined && !pattern.test(entry.url)) return false;
@@ -938,10 +945,15 @@ export const inspectTools = defineTools({
         return true;
       });
 
+      // Same reasoning as read_console: the predicate goes into the store so
+      // `clear` removes exactly what was returned, never more.
+      const total = ctx.sessions.getNetworkEntries(args.sessionId, args.pageId, false).length;
+      const requests = ctx.sessions.getNetworkEntries(args.sessionId, args.pageId, args.clear ?? false, matches);
+
       // total counts the buffer, returned counts the matches: an agent seeing
       // "0 of 200" knows its filter was wrong, while "0 of 0" says the traffic
       // genuinely was not there, or has already aged out.
-      return text({ total: entries.length, returned: requests.length, requests });
+      return text({ total, returned: requests.length, requests });
     }
   }),
 
