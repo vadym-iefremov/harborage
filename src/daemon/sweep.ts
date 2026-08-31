@@ -1,5 +1,5 @@
 import { errorFields, type Logger } from '../shared/logger.js';
-import { pruneDead, readRegistry, writeRegistry, type RegistryEntry } from '../shared/registry.js';
+import { pruneRegistryFile, type RegistryEntry } from '../shared/registry.js';
 import { cleanScreenshotCache } from './screenshotCache.js';
 import type { SessionStore } from './sessions.js';
 
@@ -27,7 +27,10 @@ export interface SweepOutcome {
   reapedSessions: string[];
   prunedClients: RegistryEntry[];
   remainingClients: number;
-  /** Sessions still live at the moment the shutdown gate was evaluated, after this pass's own reaping. */
+  /**
+   * Sessions still live at the moment the shutdown gate was evaluated, after
+   * this pass's own reaping, plus any `create_session` still in progress.
+   */
   liveSessions: number;
   removedScreenshots: string[];
   triggeredShutdown: boolean;
@@ -61,17 +64,35 @@ export interface SweepOutcome {
  * should not be blocking, and the live count is read immediately before the
  * gate, with no `await` in between, so nothing can slip in between counting
  * and deciding.
+ *
+ * Failure containment matters for the same reason. The screenshot-cache
+ * clean is the one job here whose input is a directory an operator can point
+ * anywhere, and it used to be able to throw the whole pass away with it:
+ * a bad HARBORAGE_SCREENSHOT_CACHE_DIR raises ENOTDIR, the pass aborts before
+ * the registry prune and before the gate, and the result is a daemon that can
+ * never decide to exit again and a registry that grows forever, all because a
+ * PNG could not be deleted. It is caught and logged instead.
  */
 export async function runSweepOnce(deps: SweepDeps): Promise<SweepOutcome> {
   const reapedSessions = await deps.sessions.reapIdle(deps.idleTimeoutMs);
 
-  const removedScreenshots = await cleanScreenshotCache(deps.screenshotCacheDir, deps.screenshotCacheTtlMs);
-
-  const entries = await readRegistry(deps.registryPath);
-  const { kept, dropped } = await pruneDead(entries);
-  if (dropped.length > 0) {
-    await writeRegistry(deps.registryPath, kept);
+  // Contained on purpose. This is the least important of the three jobs and
+  // the only one whose input is a directory an operator can point anywhere:
+  // one bad HARBORAGE_SCREENSHOT_CACHE_DIR raises ENOTDIR here, and letting
+  // that abort the pass would mean the registry is never pruned and the
+  // shutdown gate never evaluated, i.e. a daemon that can no longer ever exit
+  // and a registry that grows forever, for a failure to delete a PNG.
+  let removedScreenshots: string[] = [];
+  try {
+    removedScreenshots = await cleanScreenshotCache(deps.screenshotCacheDir, deps.screenshotCacheTtlMs);
+  } catch (err) {
+    deps.logger.log('sweep.screenshot-cache-error', {
+      dir: deps.screenshotCacheDir,
+      ...errorFields(err)
+    });
   }
+
+  const { kept, dropped } = await pruneRegistryFile(deps.registryPath);
 
   // Only a pass that actually changed something gets a line. A sweep that
   // found nothing to do runs every minute forever, and logging those is how
@@ -89,8 +110,11 @@ export async function runSweepOnce(deps: SweepDeps): Promise<SweepOutcome> {
 
   // Read last, and read synchronously: between this line and the decision
   // below nothing else can run, so the count the gate acts on is the count
-  // that was true at the moment it acted.
-  const liveSessions = deps.sessions.count();
+  // that was true at the moment it acted. `liveOrPendingCount` rather than
+  // `count`, because a create_session that has not returned a sessionId yet
+  // has no record to count, and exiting on top of one destroys a half-built
+  // context and, on a cold daemon, a Chromium still launching.
+  const liveSessions = deps.sessions.liveOrPendingCount();
   const uptime = Date.now() - deps.daemonStartedAt;
 
   // Only an empty registry can shut the daemon down, so that is also the

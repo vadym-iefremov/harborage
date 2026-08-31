@@ -839,7 +839,7 @@ export const interactionTools = defineTools({
 
   resize: defineTool({
     description:
-      'Resize a session\'s tab viewport. This sets the real Playwright viewport, so screenshots taken afterwards are captured at the new size. Resizing through raw CDP (Emulation.setDeviceMetricsOverride) instead changes window.innerWidth but leaves screenshots at the original viewport, which silently makes every responsive screenshot misleading. This tool cannot change deviceScaleFactor: Playwright fixes that per browser context when the context is created, so pass it to create_session instead. Returns the viewport read back from the page.',
+      'Resize a session\'s tab viewport. This sets the real Playwright viewport, so screenshots taken afterwards are captured at the new size. Resizing through raw CDP (Emulation.setDeviceMetricsOverride) instead changes window.innerWidth but leaves screenshots at the original viewport, which silently makes every responsive screenshot misleading. This tool cannot change deviceScaleFactor: Playwright fixes that per browser context when the context is created, so pass it to create_session instead. Always reads the viewport back out of the page afterwards: the result carries innerWidth/innerHeight, "matched", and a "note" when the page disagrees with the size that was set, which is what a CSS zoom on the root element or a leftover device-metrics override looks like.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -854,7 +854,30 @@ export const interactionTools = defineTools({
         innerHeight: window.innerHeight,
         devicePixelRatio: window.devicePixelRatio
       }));
-      return text({ pageId: target.pageId, width: args.width, height: args.height, ...measured });
+      // Read back AND compared, the same way fill, type, select_option,
+      // file_upload and set_storage do. Reporting the measurement without
+      // saying whether it agrees leaves a mismatch for the caller to notice
+      // with no reason to look for one: a CSS zoom or scale on the root
+      // element, or a device-metrics override left in force, moves
+      // innerWidth without moving the viewport a screenshot is captured at.
+      const matched = measured.innerWidth === args.width && measured.innerHeight === args.height;
+      return text({
+        pageId: target.pageId,
+        width: args.width,
+        height: args.height,
+        ...measured,
+        matched,
+        ...(matched
+          ? {}
+          : {
+              note:
+                `The viewport was set to ${args.width}x${args.height}, but the page reports ` +
+                `${measured.innerWidth}x${measured.innerHeight}. The usual causes are a CSS zoom or scale on the ` +
+                'root element, a scrollbar the page reserves, or an Emulation.setDeviceMetricsOverride still in ' +
+                'force. Trust "width"/"height" for the size a screenshot will be captured at, and ' +
+                'innerWidth/innerHeight for what the page\'s own media queries and layout code see.'
+            })
+      });
     }
   }),
 
