@@ -65,12 +65,21 @@ test('a tool call that outlives the idle timeout does not get its own session re
 test('a handler that throws still decrements the in-flight count, so its session stays reapable', async () => {
   const { sessionId } = await sessions.createSession();
 
-  await assert.rejects(
-    handlers.evaluate({ sessionId, expression: 'Promise.reject(new Error("deliberate handler failure"))' }),
-    /deliberate handler failure/
-  );
+  // `navigate` to a port nothing is listening on is the cheapest handler that
+  // genuinely rejects. `evaluate` deliberately does NOT: it catches a page
+  // exception and returns an isError result carrying the numbered source, so
+  // it no longer exercises the throwing path this test exists to cover.
+  const deadPort = await getFreePort();
+  await assert.rejects(handlers.navigate({ sessionId, url: `http://127.0.0.1:${deadPort}/` }));
 
   assert.equal(sessions.inFlightCount(sessionId), 0, 'a thrown handler must not leak an in-flight count');
+
+  // The other failure shape: a handler that fails but resolves with isError
+  // must not leak a count either, since a leaked count makes a session
+  // permanently unreapable, which is worse than the bug this all fixes.
+  const failed = await handlers.evaluate({ sessionId, expression: 'throw new Error("deliberate page failure")' });
+  assert.equal(failed.isError, true, 'evaluate reports a page exception as an error result');
+  assert.equal(sessions.inFlightCount(sessionId), 0, 'an isError result must not leak an in-flight count either');
 
   await sleep(80);
   const reaped = await sessions.reapIdle(40);
