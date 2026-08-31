@@ -112,7 +112,7 @@ export interface SpawnedProcess {
   stderrText: () => string;
 }
 
-/** Spawns a long-lived, otherwise-inert Node process — a stand-in "client" with a real, controllable PID. */
+/** Spawns a long-lived, otherwise-inert Node process: a stand-in "client" with a real, controllable PID. */
 export function spawnInertProcess(): SpawnedProcess {
   const proc = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
   const exited = new Promise<number | null>(resolve => {
@@ -204,4 +204,49 @@ export function fileExists(path: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * The full `HARBORAGE_*` environment one client wrapper needs to run fully
+ * isolated: its own ports, its own state dir, its own registry. Kept here
+ * rather than inline in each test because a forgotten variable silently
+ * points a test at the real machine-wide daemon on port 4599.
+ */
+export function wrapperEnv(config: Config, extra: Record<string, string> = {}): Record<string, string> {
+  return {
+    ...(process.env as Record<string, string>),
+    HARBORAGE_HOST: config.host,
+    HARBORAGE_PORT: String(config.port),
+    HARBORAGE_DEBUG_PORT: String(config.debugPort),
+    HARBORAGE_IDLE_TIMEOUT_MS: String(config.idleTimeoutMs),
+    HARBORAGE_SWEEP_INTERVAL_MS: String(config.sweepIntervalMs),
+    HARBORAGE_SHUTDOWN_GRACE_MS: String(config.shutdownGraceMs),
+    HARBORAGE_STATE_DIR: config.stateDir,
+    HARBORAGE_REGISTRY_PATH: config.registryPath,
+    HARBORAGE_DAEMON_LOG_PATH: config.daemonLogPath,
+    HARBORAGE_SCREENSHOT_CACHE_DIR: config.screenshotCacheDir,
+    HARBORAGE_SCREENSHOT_CACHE_TTL_MS: String(config.screenshotCacheTtlMs),
+    HARBORAGE_DAEMON_READY_TIMEOUT_MS: String(config.daemonReadyTimeoutMs),
+    HARBORAGE_DAEMON_HEALTH_POLL_MS: String(config.daemonHealthPollMs),
+    HARBORAGE_TEST_STARTUP_DELAY_MS: String(config.testStartupDelayMs),
+    ...extra
+  };
+}
+
+/** The daemon's `/health` payload, or null if nothing is listening. */
+export async function daemonHealth(config: Config): Promise<{ pid: number; uptimeMs: number } | null> {
+  try {
+    const res = await fetch(`http://${config.host}:${config.port}/health`, { signal: AbortSignal.timeout(1000) });
+    if (!res.ok) return null;
+    return (await res.json()) as { pid: number; uptimeMs: number };
+  } catch {
+    return null;
+  }
+}
+
+/** PNG width/height, read from the IHDR chunk (big-endian uint32s at byte offsets 16 and 20). */
+export function pngSize(png: Buffer): { width: number; height: number } {
+  const magic = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+  if (!png.subarray(0, 4).equals(magic)) throw new Error('not a PNG: bad magic bytes');
+  return { width: png.readUInt32BE(16), height: png.readUInt32BE(20) };
 }
