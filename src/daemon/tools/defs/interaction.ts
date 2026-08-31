@@ -629,7 +629,9 @@ export const interactionTools = defineTools({
 
   click: defineTool({
     description:
-      'Click an element in a session\'s tab with a real mouse press, at the element\'s centre by default. Pass x and y together to click a specific offset from the element\'s top-left corner, which is how you prove a dead band or an off-by-a-few-pixels hit area inside a control. Note that a right or middle click fires mousedown/mouseup/auxclick/contextmenu, not a click event.',
+      'Click an element in a session\'s tab with a real mouse press, at the element\'s centre by default. Pass x and y together to click a specific offset from the element\'s top-left corner, which is how you prove a dead band or an off-by-a-few-pixels hit area inside a control. Note that a right or middle click fires mousedown/mouseup/auxclick/contextmenu, not a click event. ' +
+      'This does NOT require the selector to be unique: when it matches several elements the FIRST one is clicked, and no error is raised. The result carries "matchedElements" for that reason, with a note whenever it is more than one, because Playwright selectors pierce open shadow roots and a positional path can match far more of the page than it appears to. Read it before concluding the right thing was pressed. ' +
+      'It also does not verify that the click had any effect: Playwright waits for the element to be visible, stable, enabled and actually hit-testable at the point it aims at, and fails loudly when it is not, but a click that lands on a live element and does nothing is reported as a success. Assert the page state yourself afterwards.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -651,6 +653,13 @@ export const interactionTools = defineTools({
       }
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
       const position = args.x !== undefined && args.y !== undefined ? { x: args.x, y: args.y } : undefined;
+      // Counted before the click, because the click can change the page. A
+      // selector matching several elements is the quiet half of the worst
+      // failure this tool can produce: page.click is not strict, so it acts on
+      // the first match and reports the same ok:true either way, and find can
+      // hand over a selector that matches something other than the element it
+      // just described.
+      const matchedElements = await target.page.locator(args.selector).count().catch(() => undefined);
       await target.page.click(args.selector, {
         ...(position ? { position } : {}),
         ...(args.button ? { button: args.button } : {}),
@@ -662,7 +671,17 @@ export const interactionTools = defineTools({
         selector: args.selector,
         button: args.button ?? 'left',
         clickCount: args.clickCount ?? 1,
-        ...(position ? { position } : {})
+        ...(position ? { position } : {}),
+        ...(matchedElements !== undefined ? { matchedElements } : {}),
+        ...(matchedElements !== undefined && matchedElements > 1
+          ? {
+              note:
+                `This selector matched ${matchedElements} elements and the FIRST one was clicked. Playwright's ` +
+                'selectors pierce open shadow roots, so a positional path can match more of the page than it looks ' +
+                'like it does. Narrow the selector, or confirm with find which element you meant, before trusting ' +
+                'that the right thing was pressed.'
+            }
+          : {})
       });
     }
   }),
@@ -694,7 +713,7 @@ export const interactionTools = defineTools({
 
   type: defineTool({
     description:
-      'Type text into a session\'s tab character by character, with real key events, so per-character handlers, debounces, autocomplete and anything firing on a keystroke actually run. fill sets the value in one step and cannot exercise those. Does NOT clear the field first: it inserts at the caret, which is what a user typing does, so calling it twice types twice. Pass clear: true to replace the contents instead. Where the caret sits is the browser\'s call, not this tool\'s: focusing an input puts it after the existing text, focusing a contenteditable puts it before, so click the spot first if the insertion point matters. With no selector the keystrokes go to whatever currently has focus. Always reads the field back afterwards: the result carries "value" (what the field really contains now), "previousValue", "matched", and a "note" when what landed is not the typed text inserted into what was already there.',
+      'Type text into a session\'s tab character by character, with real key events, so per-character handlers, debounces, autocomplete and anything firing on a keystroke actually run. fill sets the value in one step and cannot exercise those. Does NOT clear the field first: it inserts at the caret, which is what a user typing does, so calling it twice types twice. Pass clear: true to replace the contents instead. Where the caret sits is the browser\'s call, not this tool\'s: focusing an input puts it after the existing text, focusing a contenteditable puts it before, so click the spot first if the insertion point matters. With no selector the keystrokes go to whatever currently has focus. Always reads the field back afterwards: the result carries "value" (what the field really contains now), "previousValue" (what it held BEFORE the call, clear included, so a clear cannot throw something away invisibly), "matched", and a "note" when what landed is not the typed text inserted into what was already there. With clear: true and NO selector it refuses outright when nothing has focus, rather than pressing select-all against the whole document, which on a contenteditable page empties it.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -717,16 +736,44 @@ export const interactionTools = defineTools({
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
       const locator = args.selector === undefined ? null : target.page.locator(args.selector);
 
+      // Read BEFORE the clear, so "previousValue" means what its name says.
+      // Read after, it was always the emptied field on a clearing call, which
+      // also made "matched" a comparison against nothing: it could not fail,
+      // whatever the clear had just destroyed.
+      const before = await readFieldValue(target.page, locator);
+
       if (args.clear) {
         if (locator) {
           await setFieldValue(target.page, locator, '');
         } else {
+          // The same guard fill carries, for the same reason. Select-all is
+          // scoped to whatever holds the caret, so pressing it with nothing
+          // focused, or with the caret in the document itself, selects the
+          // whole page and the delete that follows empties it. On a
+          // contenteditable body that silently destroys the document while the
+          // call still reports a match. With no selector there is no target to
+          // verify focus against, so refuse rather than guess.
+          const holder = await target.page.evaluate(() => {
+            const el = document.activeElement;
+            if (!el) return null;
+            return { tag: el.tagName, id: el.id };
+          });
+          if (holder === null || holder.tag === 'BODY' || holder.tag === 'HTML') {
+            throw new Error(
+              'type cannot clear without a selector when nothing has focus: the caret is in the document itself, so ' +
+                'select-all would select the whole page and the delete after it would empty a contenteditable one. ' +
+                'Pass "selector" to name the field, or click into it first. Nothing was typed and nothing was cleared.'
+            );
+          }
           await target.page.keyboard.press(selectAllChord);
           await target.page.keyboard.press('Delete');
         }
       }
 
-      const before = await readFieldValue(target.page, locator);
+      // What the field holds going into the typing: the same as `before` on an
+      // ordinary call, and the emptied field on a clearing one. The insertion
+      // check runs against this, while the caller is shown `before`.
+      const baseline = args.clear ? await readFieldValue(target.page, locator) : before;
       const options = args.delay !== undefined ? { delay: args.delay } : undefined;
       if (locator) {
         await locator.pressSequentially(args.text, options);
@@ -747,8 +794,8 @@ export const interactionTools = defineTools({
           previousValue: before
         },
         actual,
-        isInsertionOf(before, args.text, actual),
-        `Expected ${JSON.stringify(args.text)} inserted into the previous contents ${JSON.stringify(before)}.`
+        isInsertionOf(baseline, args.text, actual),
+        `Expected ${JSON.stringify(args.text)} inserted into ${JSON.stringify(baseline)}.`
       );
     }
   }),
@@ -883,7 +930,7 @@ export const interactionTools = defineTools({
 
   wait_for: defineTool({
     description:
-      'Wait for a condition in a session\'s tab, instead of sleeping for a guessed number of milliseconds. Give EITHER selector (with an optional state: visible, hidden, attached, detached) OR expression, a JavaScript expression polled until it is truthy. Exactly one of the two: passing both, or neither, is an error. Returns how long it actually waited, which is worth reading: a wait that returns in 0ms was already satisfied before you asked. On timeout it throws an error naming what it was waiting for and for how long, not a bare Playwright timeout.',
+      'Wait for a condition in a session\'s tab, instead of sleeping for a guessed number of milliseconds. Give EITHER selector (with an optional state: visible, hidden, attached, detached) OR expression, a JavaScript expression polled until it is truthy. Exactly one of the two: passing both, or neither, is an error. Returns how long it actually waited, which is worth reading: a wait that returns in 0ms was already satisfied before you asked. It also returns "everMatched", which is what makes state "hidden" and "detached" safe to trust: BOTH of those are satisfied by an element that is not in the DOM at all, so a mistyped selector otherwise returns success in milliseconds having proved nothing. everMatched false means the wait was satisfied by absence, and the result says so in a note. On timeout it throws an error naming what it was waiting for and for how long, not a bare Playwright timeout.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -920,6 +967,15 @@ export const interactionTools = defineTools({
         : `expression ${JSON.stringify(args.expression)} to be truthy`;
       const startedAt = Date.now();
 
+      // "hidden" and "detached" are BOTH satisfied by an element that is not in
+      // the DOM at all, so a mistyped selector in "wait for the modal to close"
+      // returns success in a couple of milliseconds having proved nothing. That
+      // is the one shape of wait that can pass while nothing was ever waited
+      // for, so whether the selector ever matched anything is recorded rather
+      // than left to be inferred from waitedMs.
+      const absenceSatisfies = hasSelector && (state === 'hidden' || state === 'detached');
+      let everMatched = absenceSatisfies ? (await target.page.locator(args.selector as string).count()) > 0 : true;
+
       try {
         if (args.selector !== undefined) {
           await target.page.locator(args.selector).waitFor({ state, timeout });
@@ -939,7 +995,29 @@ export const interactionTools = defineTools({
         );
       }
 
-      return text({ pageId: target.pageId, satisfied: true, waitedMs: Date.now() - startedAt, waitedFor });
+      // Re-checked after the wait as well: an element that was there and then
+      // went away really was waited for, and only a selector matching nothing
+      // at either end is the empty case worth warning about.
+      if (absenceSatisfies && !everMatched) {
+        everMatched = (await target.page.locator(args.selector as string).count()) > 0;
+      }
+
+      return text({
+        pageId: target.pageId,
+        satisfied: true,
+        waitedMs: Date.now() - startedAt,
+        waitedFor,
+        everMatched,
+        ...(everMatched
+          ? {}
+          : {
+              note:
+                `The selector ${JSON.stringify(args.selector)} never matched anything, before or after the wait, and ` +
+                `"${state}" is satisfied by an element that is not in the DOM at all. So this wait was satisfied by ` +
+                'ABSENCE rather than by anything happening. That is exactly what a mistyped selector looks like: ' +
+                'check it with snapshot or find before reading this as proof the element went away.'
+            })
+      });
     }
   }),
 
@@ -1008,16 +1086,25 @@ export const interactionTools = defineTools({
       for (const modifier of modifiers) {
         await target.page.keyboard.down(modifier);
       }
+      let pressed = false;
       try {
         await mouse.move(from.x, from.y);
         await mouse.down({ button });
+        pressed = true;
         if (holdMs > 0) await sleep(holdMs);
         await mouse.move(to.x, to.y, { steps });
         if (settleMs > 0) await sleep(settleMs);
         await mouse.up({ button });
+        pressed = false;
       } finally {
-        // A modifier left stuck down would quietly change every later click
-        // and key press in this session, so release even if the drag threw.
+        // The button is released here, not only on the happy path. This tool
+        // is one call rather than a grab and a drop precisely so a button can
+        // never be stranded down between calls, and anything throwing between
+        // the press and the release would have stranded one anyway: every
+        // later click in the session would then be a drag, undetectable from
+        // outside. A modifier left down would do the same to every later key
+        // press, so it gets the same treatment.
+        if (pressed) await mouse.up({ button }).catch(() => {});
         for (const modifier of [...modifiers].reverse()) {
           await target.page.keyboard.up(modifier).catch(() => {});
         }
