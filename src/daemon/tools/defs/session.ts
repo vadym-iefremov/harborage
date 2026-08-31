@@ -1,7 +1,7 @@
 import * as z from 'zod/v4';
 
 import { defineTool, defineTools, text } from '../types.js';
-import { pageId, sessionId } from './common.js';
+import { clear, pageId, sessionId } from './common.js';
 
 /** Tools that create, inspect, hand over and tear down sessions themselves. */
 export const sessionTools = defineTools({
@@ -44,13 +44,54 @@ export const sessionTools = defineTools({
   }),
 
   list_tabs: defineTool({
-    description: 'List the open tabs in a session.',
+    description: 'List the open tabs in a session: pageId, url, title, and which one is active (the tab that calls omitting pageId will target).',
     inputSchema: z.object({
       sessionId
     }),
     async handler(ctx, args) {
       const tabs = await ctx.sessions.listTabs(args.sessionId);
       return text({ tabs });
+    }
+  }),
+
+  new_tab: defineTool({
+    description:
+      'Open a new tab in an existing session, optionally navigating it to a URL. The new tab becomes the session\'s active tab, so later calls that omit pageId target it. Console, network and page-error buffering are wired up before the tab loads anything, exactly as for the session\'s first tab. Returns the new pageId.',
+    inputSchema: z.object({
+      sessionId,
+      url: z
+        .string()
+        .optional()
+        .describe('URL to open the new tab at. Omit to get a blank tab you can navigate separately.')
+    }),
+    async handler(ctx, args) {
+      const opened = await ctx.sessions.newTab(args.sessionId, args.url);
+      return text(opened);
+    }
+  }),
+
+  close_tab: defineTool({
+    description:
+      'Close one tab of a session. If the closed tab was the active one, the most recently opened remaining tab becomes active, which for a popup is the tab it was opened from. Closing the session\'s last tab is refused, because no other tool can work with a session that has no tabs: use release_session to end the session instead. Returns the tab now active.',
+    inputSchema: z.object({
+      sessionId,
+      pageId: z.string().describe('Tab id from list_tabs. Required here: there is no sensible default tab to close.')
+    }),
+    async handler(ctx, args) {
+      const result = await ctx.sessions.closeTab(args.sessionId, args.pageId);
+      return text(result);
+    }
+  }),
+
+  select_tab: defineTool({
+    description:
+      'Make one tab the session\'s active tab, so later calls that omit pageId target it. Use after list_tabs to switch between tabs without passing pageId to every single call.',
+    inputSchema: z.object({
+      sessionId,
+      pageId: z.string().describe('Tab id from list_tabs to make active.')
+    }),
+    async handler(ctx, args) {
+      return text(ctx.sessions.selectTab(args.sessionId, args.pageId));
     }
   }),
 
@@ -121,6 +162,67 @@ export const sessionTools = defineTools({
         devtoolsFrontendUrl: match.devtoolsFrontendUrl,
         url: match.url
       });
+    }
+  }),
+
+  handle_dialog: defineTool({
+    description:
+      'Decide what JavaScript dialogs (alert, confirm, prompt, beforeunload) do in a session, and read back every dialog that has appeared so far. ' +
+      'IMPORTANT, because it changes how you use this: harborage never leaves a dialog open. A dialog blocks its tab until something answers it, so an unanswered one would wedge the tab and every later call on it. ' +
+      'The default is therefore to dismiss every dialog the moment it appears and record it here, which is what the page sees as confirm() returning false and prompt() returning null. ' +
+      'That means you arm this tool BEFORE the click or navigation that raises the dialog, rather than calling it in response to one: by the time you could react, the dialog is already answered and logged. ' +
+      'Call it with no action to just read the log, which is how you find out that a click you thought did nothing actually hit a confirm().',
+    inputSchema: z.object({
+      sessionId,
+      action: z
+        .enum(['accept', 'dismiss'])
+        .optional()
+        .describe(
+          'What upcoming dialogs get. Omit to leave the current behaviour alone and only read the log. "dismiss" is the default behaviour, so arming it with appliesTo "all" is how you undo a standing "accept".'
+        ),
+      promptText: z
+        .string()
+        .optional()
+        .describe('Text to answer a prompt() with when accepting. Ignored by alert and confirm, which take no text.'),
+      appliesTo: z
+        .enum(['next', 'all'])
+        .optional()
+        .describe(
+          '"next" (default): the armed action is used by the first dialog that appears and then forgotten, so one armed accept cannot silently accept a later, different dialog. "all": every dialog until you arm something else.'
+        ),
+      pageId: z
+        .string()
+        .optional()
+        .describe('Filter the returned dialog log to one tab. The armed action always applies to the whole session, whichever tab raises the dialog.'),
+      clear
+    }),
+    async handler(ctx, args) {
+      if (args.action !== undefined) {
+        ctx.sessions.setDialogPolicy(args.sessionId, {
+          action: args.action,
+          promptText: args.promptText,
+          appliesTo: args.appliesTo ?? 'next'
+        });
+      }
+      const dialogs = ctx.sessions.getDialogs(args.sessionId, args.pageId, args.clear ?? false);
+      return text({ armed: ctx.sessions.getDialogPolicy(args.sessionId) ?? null, dialogs });
+    }
+  }),
+
+  read_page_errors: defineTool({
+    description:
+      'Read buffered uncaught exceptions and unhandled promise rejections for a session (optionally filtered to one tab). ' +
+      'This is a different channel from read_console: a script that throws produces no console message, so an error invisible to read_console shows up here. ' +
+      'Buffering starts at create_session and at every tab opening, so this returns history rather than only what happens after you ask. ' +
+      'Each entry carries the message and, where one exists, the stack. A rejection whose value is not an Error has no stack, so it carries valueType (the value\'s constructor, e.g. Event), eventType (an Event\'s own type) and detail (a JSON dump) instead, which is what makes an "[object Event]" rejection traceable.',
+    inputSchema: z.object({
+      sessionId,
+      pageId,
+      clear
+    }),
+    async handler(ctx, args) {
+      const errors = ctx.sessions.getPageErrors(args.sessionId, args.pageId, args.clear ?? false);
+      return text({ errors });
     }
   }),
 

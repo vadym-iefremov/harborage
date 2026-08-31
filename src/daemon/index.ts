@@ -28,8 +28,17 @@ async function main(): Promise<void> {
   const browserManager = new BrowserManager(config.debugPort);
   const sessions = new SessionStore(
     browserManager,
-    { console: config.consoleBufferSize, network: config.networkBufferSize },
-    logger
+    {
+      console: config.consoleBufferSize,
+      network: config.networkBufferSize,
+      dialog: config.dialogBufferSize,
+      pageError: config.pageErrorBufferSize
+    },
+    logger,
+    {
+      escalatedIdleTimeoutMs: config.escalatedIdleTimeoutMs,
+      maxInFlightAgeMs: config.maxInFlightAgeMs
+    }
   );
 
   /**

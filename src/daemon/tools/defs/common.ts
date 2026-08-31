@@ -16,4 +16,7 @@ export const pageId = z
 export const clear = z
   .boolean()
   .optional()
-  .describe('If true, clears the returned entries from the buffer after reading them (default false: peek without clearing).');
+  .describe(
+    'If true, removes the entries this call returned from the buffer after reading them (default false: peek without clearing). '  +
+      'Only what the filters actually matched is removed, so narrowing a read by tab or by content never silently discards entries you did not see.'
+  );
