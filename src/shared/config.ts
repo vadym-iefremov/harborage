@@ -45,6 +45,14 @@ export interface Config {
    * same sweep that already reaps idle sessions and prunes the client
    * registry (see §4.2 of the design spec for why this rides the one
    * existing timer instead of a second scheduled job).
+   *
+   * Four hours, raised from the original thirty minutes. Thirty was set
+   * with a single agent taking a screenshot and looking at it in mind. In a
+   * real parallel QA run the evidence has to outlive the whole fan-out plus
+   * however long it takes a person to read the reports, and half an hour
+   * did not: agents had screenshots expire before anyone opened them, and
+   * one had to copy its PNGs out by hand. The cost of the longer window is
+   * a few more megabytes sitting in a temp directory.
    */
   screenshotCacheTtlMs: number;
   /** Max buffered `console` messages kept per session tab (oldest dropped first). */
@@ -98,7 +106,7 @@ export function loadConfig(): Config {
     registryPath: str('HARBORAGE_REGISTRY_PATH', join(stateDir, 'registry.json')),
     daemonLogPath: str('HARBORAGE_DAEMON_LOG_PATH', join(stateDir, 'daemon.log')),
     screenshotCacheDir: str('HARBORAGE_SCREENSHOT_CACHE_DIR', join(stateDir, 'screenshots')),
-    screenshotCacheTtlMs: num('HARBORAGE_SCREENSHOT_CACHE_TTL_MS', 30 * 60 * 1000),
+    screenshotCacheTtlMs: num('HARBORAGE_SCREENSHOT_CACHE_TTL_MS', 4 * 60 * 60 * 1000),
     consoleBufferSize: num('HARBORAGE_CONSOLE_BUFFER_SIZE', 200),
     networkBufferSize: num('HARBORAGE_NETWORK_BUFFER_SIZE', 200),
     daemonReadyTimeoutMs: num('HARBORAGE_DAEMON_READY_TIMEOUT_MS', 60 * 1000),
