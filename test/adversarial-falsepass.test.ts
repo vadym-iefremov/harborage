@@ -496,47 +496,56 @@ test('emulate_media reports whether the browser agreed, rather than leaving two 
 // 12. Concurrency: two tool calls on one session share one mouse
 // ---------------------------------------------------------------------------
 
-test(
-  'a drag and a concurrent click on the same session corrupt one another and both report success',
-  {
-    todo:
-      'UNFIXED. A per-page input lock is a design change that reaches into the session store and would ' +
-      'serialize calls that today run in parallel, so it is reported rather than applied. See the review.'
-  },
-  async () => {
-    const sessionId = await sessionOn('/drag');
-    const startLeft = await evaluate<number>(sessionId, 'window.__nodeLeft()');
+test('a drag and a concurrent click on the same session queue instead of corrupting each other', async () => {
+  const sessionId = await sessionOn('/drag');
+  const startLeft = await evaluate<number>(sessionId, 'window.__nodeLeft()');
 
-    // holdMs keeps the button down while a second tool call arrives, which is
-    // exactly what an MCP client issuing parallel tool calls produces. The
-    // click's own mouseup releases the drag's button, so the drag's moves land
-    // with nothing held and the canvas never sees a drag at all.
-    const dragging = handlers.drag({
-      sessionId,
-      source: { selector: '#node' },
-      target: { selector: '#canvas', x: 500, y: 70 },
-      holdMs: 800
-    });
-    await new Promise(resolve => setTimeout(resolve, 300));
-    const click = payload(await handlers.click({ sessionId, selector: '#canvas', x: 5, y: 5 }));
-    const drag = payload(await dragging);
+  // holdMs keeps the button down while a second tool call arrives, which is
+  // exactly what an MCP client issuing parallel tool calls produces. Both
+  // tools drive the one virtual mouse a session has, so they are serialized:
+  // the click waits for the drag to put the button down and lift it again,
+  // rather than its own mouseup ending the drag early at the wrong point.
+  const dragging = handlers.drag({
+    sessionId,
+    source: { selector: '#node' },
+    target: { selector: '#canvas', x: 500, y: 70 },
+    holdMs: 800
+  });
+  await new Promise(resolve => setTimeout(resolve, 300));
+  const click = payload(await handlers.click({ sessionId, selector: '#canvas', x: 5, y: 5 }));
+  const drag = payload(await dragging);
 
-    const endLeft = await evaluate<number>(sessionId, 'window.__nodeLeft()');
+  const endLeft = await evaluate<number>(sessionId, 'window.__nodeLeft()');
 
-    assert.equal(click.ok, true, 'the click reports success');
-    assert.equal(drag.target.x, 500, 'and the drag reports the target it was asked for');
+  assert.equal(click.ok, true, 'the click still succeeds, it just waits its turn');
+  assert.equal(drag.target.x, 500, 'the drag reports the target it was asked for');
+  assert.ok(
+    Math.abs(endLeft - (startLeft + (500 - 90))) < 20,
+    `the node must actually follow the drag to about x=${startLeft + 410}, it is at ${endLeft}`
+  );
 
-    // The click's own mouseup ends the drag early, at the click's coordinates,
-    // so the node lands nowhere near where the drag says it took it. Neither
-    // result mentions the other call having taken the mouse out from under it.
-    assert.ok(
-      Math.abs(endLeft - (startLeft + (500 - 90))) < 20,
-      `the node should have followed the drag to about x=${startLeft + 410}, it is at ${endLeft}`
-    );
+  await sessions.releaseSession(sessionId);
+});
 
-    await sessions.releaseSession(sessionId);
-  }
-);
+test('a tool that does not touch the mouse is not serialized behind one that does', async () => {
+  const sessionId = await sessionOn('/drag');
+
+  // evaluate carries no input, so it must not queue behind a slow drag. If the
+  // lock were taken for every tool rather than the input ones, this would wait
+  // out the full hold and the ordering below would flip.
+  const order: string[] = [];
+  const dragging = handlers
+    .drag({ sessionId, source: { selector: '#node' }, target: { selector: '#canvas', x: 400, y: 70 }, holdMs: 600 })
+    .then(() => order.push('drag'));
+  await new Promise(resolve => setTimeout(resolve, 100));
+  await handlers.evaluate({ sessionId, expression: '1 + 1' });
+  order.push('evaluate');
+  await dragging;
+
+  assert.deepEqual(order, ['evaluate', 'drag'], 'evaluate must not wait for the drag to finish');
+
+  await sessions.releaseSession(sessionId);
+});
 
 // ---------------------------------------------------------------------------
 // 13. Registry-level consistency

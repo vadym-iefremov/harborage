@@ -46,6 +46,15 @@ export interface ToolDef<S extends z.ZodObject<any> = z.ZodObject<any>> {
   description: string;
   inputSchema: S;
   handler: (ctx: ToolContext, args: z.infer<S>) => Promise<ToolResult>;
+  /**
+   * True for tools that drive the virtual mouse or keyboard. Those share one
+   * input device per session, so two of them running at once interleave their
+   * presses and moves: a drag holding its button and a concurrent click end up
+   * corrupting each other while both report success. Marked tools are
+   * serialized per session by `invokeTool`. Everything else, including reads
+   * and `evaluate`, still runs fully in parallel.
+   */
+  serializesInput?: boolean;
 }
 
 /**

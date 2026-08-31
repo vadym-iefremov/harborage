@@ -46,7 +46,18 @@ export async function invokeTool(
   if (sessionId === undefined || callId === null) return def.handler(ctx, args);
 
   try {
-    return await def.handler(ctx, args);
+    // Tools that drive the shared virtual mouse or keyboard queue behind each
+    // other, per session. The lock is taken inside the in-flight bookkeeping
+    // so a call waiting its turn still counts as alive and cannot be reaped
+    // while it queues.
+    if (def.serializesInput !== true) return await def.handler(ctx, args);
+
+    const releaseInput = await ctx.sessions.acquireInputLock(sessionId);
+    try {
+      return await def.handler(ctx, args);
+    } finally {
+      releaseInput();
+    }
   } finally {
     ctx.sessions.endCall(sessionId, callId);
   }

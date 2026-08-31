@@ -452,27 +452,23 @@ test('resize reports whether the page agrees with the viewport it was given', as
 });
 
 // ---------------------------------------------------------------------------
-// 7. Escalation versus the stuck-call cap: documented, not fixed
+// 7. Escalation wins the stuck-call cap, with a bound
 // ---------------------------------------------------------------------------
 
 /**
- * NOT a fix, a record of a judgment call that needs the owner's decision.
+ * `reapIdle` used to check the in-flight branch before the escalated branch,
+ * so the ten-minute stuck-call cap overrode the hour-long escalated timeout. A
+ * person working through a CAPTCHA lost their session ten minutes in if any
+ * unrelated call happened to be wedged against it, which is the exact failure
+ * escalate_session exists to prevent. That answer was never chosen: it fell
+ * out of the order of two `if`s.
  *
- * `reapIdle` checks the in-flight branch BEFORE the escalated branch, so the
- * stuck-call cap (ten minutes by default) overrides the escalated idle timeout
- * (an hour). A human working through a CAPTCHA over CDP therefore loses their
- * session ten minutes in if any tool call happens to be wedged against it,
- * even though escalation exists precisely to stop a session disappearing under
- * a person.
- *
- * The tradeoff cuts both ways, which is why this is not changed here: giving
- * an escalated session the escalated rope for a wedged call too means one
- * wedged `evaluate` can pin a session, and through it the shared machine-wide
- * daemon, for a full hour rather than ten minutes. Both are defensible; the
- * point is that the current answer was never chosen, it fell out of the order
- * of two `if`s.
+ * An escalated session now gets the escalated budget for a wedged call too.
+ * The cost is bounded and deliberate: a wedged call in an escalated session
+ * can pin the shared daemon for an hour rather than ten minutes, which is
+ * still a bound, and a person's live work is worth more than the difference.
  */
-test('CURRENT BEHAVIOUR: the stuck-call cap overrides an escalated session\'s longer rope', async () => {
+test('an escalated session keeps its longer rope even with a call wedged against it', async () => {
   const { sessionId } = await sessions.createSession();
   sessions.markEscalated(sessionId);
 
@@ -480,10 +476,19 @@ test('CURRENT BEHAVIOUR: the stuck-call cap overrides an escalated session\'s lo
   await sleep(maxInFlightAgeMs + 200);
 
   const reaped = await sessions.reapIdle(60_000);
-  assert.deepEqual(
-    reaped,
-    [sessionId],
-    'if this ever stops holding, the decision above was deliberately revisited and this test should say so'
-  );
+  assert.deepEqual(reaped, [], 'a human is driving this session, the ordinary stuck-call cap must not take it away');
+
+  await sessions.releaseSession(sessionId);
+  await wedged;
+});
+
+test('a wedged call in a NON-escalated session is still reaped at the ordinary cap', async () => {
+  const { sessionId } = await sessions.createSession();
+
+  const wedged = handlers.evaluate({ sessionId, expression: 'new Promise(() => {})' }).catch(() => undefined);
+  await sleep(maxInFlightAgeMs + 200);
+
+  const reaped = await sessions.reapIdle(60_000);
+  assert.deepEqual(reaped, [sessionId], 'the bound still exists for everything that is not escalated');
   await wedged;
 });

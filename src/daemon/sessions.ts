@@ -225,6 +225,8 @@ export interface SessionSummary {
  */
 export class SessionStore {
   private readonly sessions = new Map<string, SessionRecord>();
+  /** Per-session queue for the tools that drive the shared virtual mouse and keyboard. */
+  private readonly inputLocks = new Map<string, Promise<void>>();
   private readonly bufferLimits: BufferLimits;
   private readonly timeouts: Required<SessionTimeouts>;
   /** Hands out the token that pairs one `beginCall` with its own `endCall`. */
@@ -780,7 +782,46 @@ export class SessionStore {
     return this.sessions.get(sessionId)?.dialogPolicy;
   }
 
+  /**
+   * Serializes the tools that drive the virtual mouse and keyboard.
+   *
+   * Playwright gives a page one mouse and one keyboard, so two input-dispatching
+   * calls on the same session interleave at the device: a `drag` holding its
+   * button and a `click` arriving mid-drag makes the click's own mouseup end
+   * the drag early, at the wrong coordinates, with both calls reporting the
+   * success they were asked for. That is a silent corruption, so input calls
+   * queue instead.
+   *
+   * Deliberately keyed per session rather than per tab. It over-serializes
+   * slightly across a session's tabs, which costs nothing real, and it avoids
+   * having to resolve a possibly-absent pageId to a tab before taking the lock,
+   * which would leave a call naming a tab explicitly and one relying on the
+   * active tab holding two different locks on the same mouse.
+   */
+  async acquireInputLock(sessionId: string): Promise<() => void> {
+    const previous = this.inputLocks.get(sessionId);
+    let release!: () => void;
+    const held = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    const chained = (previous ?? Promise.resolve()).then(() => held);
+    this.inputLocks.set(sessionId, chained);
+
+    if (previous) await previous.catch(() => {});
+
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      release();
+      // Drop the chain once nothing is queued behind this holder, so a
+      // long-lived session does not accumulate one entry per session forever.
+      if (this.inputLocks.get(sessionId) === chained) this.inputLocks.delete(sessionId);
+    };
+  }
+
   async releaseSession(sessionId: string): Promise<void> {
+    this.inputLocks.delete(sessionId);
     const record = this.sessions.get(sessionId);
     if (!record) throw new SessionNotFoundError(sessionId);
     this.sessions.delete(sessionId);
@@ -904,12 +945,22 @@ export class SessionStore {
         // that is never coming back from a session that is merely busy.
         const oldestStartedAt = Math.min(...record.inFlightCalls.values());
         const inFlightAgeMs = now - oldestStartedAt;
-        if (inFlightAgeMs <= this.timeouts.maxInFlightAgeMs) continue;
+
+        // An escalated session gets the escalated budget here too, not the
+        // ordinary stuck-call one. A person is working in that browser, and
+        // taking it away from them because some unrelated call wedged is the
+        // exact failure escalate_session exists to prevent. It is still a
+        // bound, just a longer one, so a wedged call in an escalated session
+        // cannot pin the shared daemon indefinitely either.
+        const stuckBudgetMs =
+          record.escalatedAt === undefined ? this.timeouts.maxInFlightAgeMs : this.timeouts.escalatedIdleTimeoutMs;
+        if (inFlightAgeMs <= stuckBudgetMs) continue;
         this.logger.log('session.reap-stuck', {
           sessionId: id,
           inFlight: record.inFlightCalls.size,
           inFlightAgeMs,
-          maxInFlightAgeMs: this.timeouts.maxInFlightAgeMs,
+          budgetMs: stuckBudgetMs,
+          escalated: record.escalatedAt === undefined ? undefined : true,
           reason: 'call-never-returned'
         });
         this.sessions.delete(id);

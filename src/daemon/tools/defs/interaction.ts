@@ -628,6 +628,7 @@ export const interactionTools = defineTools({
   }),
 
   click: defineTool({
+    serializesInput: true,
     description:
       'Click an element in a session\'s tab with a real mouse press, at the element\'s centre by default. Pass x and y together to click a specific offset from the element\'s top-left corner, which is how you prove a dead band or an off-by-a-few-pixels hit area inside a control. Note that a right or middle click fires mousedown/mouseup/auxclick/contextmenu, not a click event. ' +
       'This does NOT require the selector to be unique: when it matches several elements the FIRST one is clicked, and no error is raised. The result carries "matchedElements" for that reason, with a note whenever it is more than one, because Playwright selectors pierce open shadow roots and a positional path can match far more of the page than it appears to. Read it before concluding the right thing was pressed. ' +
@@ -687,6 +688,7 @@ export const interactionTools = defineTools({
   }),
 
   fill: defineTool({
+    serializesInput: true,
     description:
       'Set a field\'s contents in a session\'s tab, REPLACING whatever was there. Use type instead to append, or to fire per-character events. For an input, textarea or select this is Playwright\'s atomic fill. For a contenteditable, including rich editors like CodeMirror and Monaco, it focuses the element and replaces through real keyboard events (select-all, delete, insert), because those editors keep their own document model and treat a plain insertion as an insert at their cursor, appending onto the existing value instead of replacing it. Always reads the field back afterwards: the result carries "value" (what the field really contains now), "matched", and a "note" explaining the difference when they disagree.',
     inputSchema: z.object({
@@ -712,6 +714,7 @@ export const interactionTools = defineTools({
   }),
 
   type: defineTool({
+    serializesInput: true,
     description:
       'Type text into a session\'s tab character by character, with real key events, so per-character handlers, debounces, autocomplete and anything firing on a keystroke actually run. fill sets the value in one step and cannot exercise those. Does NOT clear the field first: it inserts at the caret, which is what a user typing does, so calling it twice types twice. Pass clear: true to replace the contents instead. Where the caret sits is the browser\'s call, not this tool\'s: focusing an input puts it after the existing text, focusing a contenteditable puts it before, so click the spot first if the insertion point matters. With no selector the keystrokes go to whatever currently has focus. Always reads the field back afterwards: the result carries "value" (what the field really contains now), "previousValue" (what it held BEFORE the call, clear included, so a clear cannot throw something away invisibly), "matched", and a "note" when what landed is not the typed text inserted into what was already there. With clear: true and NO selector it refuses outright when nothing has focus, rather than pressing select-all against the whole document, which on a contenteditable page empties it.',
     inputSchema: z.object({
@@ -801,6 +804,7 @@ export const interactionTools = defineTools({
   }),
 
   press_key: defineTool({
+    serializesInput: true,
     description:
       'Press a key in a session\'s tab, dispatching a real trusted key event. This is the only way to establish keyboard modality, which matters for accessibility checks: Chrome will not set :focus-visible on a button a script focused with .focus(), so a focus ring measured after a programmatic focus reports absent even when it is perfectly fine for a real user pressing Tab. Key syntax is Playwright\'s: Tab, Enter, Escape, ArrowDown, Backspace, a, Control+A, Shift+Tab. With no selector the key goes to whatever currently has focus. Returns where focus ended up and whether that element matches :focus-visible.',
     inputSchema: z.object({
@@ -854,6 +858,7 @@ export const interactionTools = defineTools({
   }),
 
   hover: defineTool({
+    serializesInput: true,
     description:
       'Hover the mouse over an element in a session\'s tab, moving the real pointer to it. Synthetic pointerover/mouseover events dispatched from a script only exercise the page\'s own listeners: they cannot satisfy a CSS-only :hover rule, and they cannot open a tooltip that depends on real pointer geometry. This can. Pass x and y together to hover a specific offset from the element\'s top-left corner. Returns whether the element matches :hover afterwards.',
     inputSchema: z.object({
@@ -1022,6 +1027,7 @@ export const interactionTools = defineTools({
   }),
 
   drag: defineTool({
+    serializesInput: true,
     description:
       'Drag from one point to another in a session\'s tab with a real mouse: press, several intermediate moves, release. One atomic gesture, not a separate grab and drop, because a half-finished drag leaves the page in a state nothing else here can recover. Covers BOTH kinds of dragging: pointer-event canvases (React Flow, dnd-kit, d3-drag, anything moving an element from pointermove) and native HTML5 drag-and-drop (draggable="true" with dragstart/dragover/drop). The same mouse sequence drives both, so there is no mode to choose. Source and target each take a selector (the element\'s centre), a raw x/y viewport point (for a region of a canvas that is not a DOM element), or a selector plus x/y (an offset inside it, e.g. a node\'s drag handle). IF THE DRAG APPEARS TO DO NOTHING, in this order: raise "steps", because most drag libraries spend the first move activating the drag and only start following on later ones, so too few moves fires every event and moves nothing; set "holdMs" if the app uses a long-press or delay-activated drag, which cancels outright when the pointer moves too soon; set "settleMs" if the drop lands but the app has not finished reacting; check the coordinates in the result, which are where the mouse really went. Returns the resolved source and target points, plus \'nativeDrag\': true when the browser ran the gesture as a native HTML5 drag rather than as pointer events, which tells a canvas drag that did nothing exactly why. Clears any existing text selection before pressing, deliberately: a press landing inside a selection left over from an earlier drag makes the browser drag that selection instead, and the page then sees no pointermove at all. Does NOT wait for either element to appear: call wait_for first. Does NOT verify that anything moved, so assert the page state yourself afterwards.',
     inputSchema: z.object({
@@ -1132,6 +1138,7 @@ export const interactionTools = defineTools({
   }),
 
   select_option: defineTool({
+    serializesInput: true,
     description:
       'Choose one or more options in a native <select> in a session\'s tab. This is the only way to drive a native select: click cannot open its popup, because the popup is drawn by the operating system and is not in the page at all, and fill throws on a select outright. Pick by exactly one of values (the option\'s value attribute), labels (its visible text) or indexes (its position, counting from 0). Pass several to a multi-select; pass an empty list to deselect everything. Fires a real change event, so anything listening for one runs. Always reads the selection back afterwards: the result carries "selected" (value, label and index of every option really selected now), "multiple", "matched", and a "note" explaining the difference when the page settled on something other than what was asked for. Does NOT work on a custom dropdown built from divs: those are ordinary elements, so use click.',
     inputSchema: z.object({
@@ -1201,6 +1208,7 @@ export const interactionTools = defineTools({
   }),
 
   file_upload: defineTool({
+    serializesInput: true,
     description:
       'Attach files to an <input type="file"> in a session\'s tab, and fire the change event the page listens for. Works on a hidden or styled-over input, which is how nearly every real uploader is built: point the selector at the input itself, not at the visible button in front of it, because the input never needs to be clickable for this. Paths are read by the daemon process, so they must be absolute paths to files on the machine the daemon runs on, and each one is checked for existence first: a missing file is reported by name rather than as a Playwright failure. Pass an empty list to clear the current selection. Always reads back the input\'s own FileList afterwards: the result carries "files" (name, size and MIME type of what is really attached now), "matched", and a "note" when the two disagree. Does NOT respond to an operating-system file chooser that some earlier click already opened: there is no such dialog to answer here, targeting the underlying input is what replaces it.',
     inputSchema: z.object({
@@ -1274,6 +1282,7 @@ export const interactionTools = defineTools({
   }),
 
   wheel: defineTool({
+    serializesInput: true,
     description:
       'Turn the mouse wheel in a session\'s tab, which is how a canvas is zoomed and how anything with its own scroll container is scrolled. WHERE the wheel lands matters and is not incidental: a canvas zooms toward the pointer, so "point" takes the same shape as drag\'s endpoints (a selector, a raw x/y viewport point, or a selector plus an offset inside it). Omitting it aims at the centre of the viewport, deliberately, rather than at wherever some earlier click or hover happened to leave the pointer. deltaY is positive to scroll down and negative to scroll up, deltaX positive to scroll right, matching a real wheel. MODIFIERS ARE THE PINCH: a browser delivers a trackpad pinch as a wheel event with ctrlKey set, and canvas libraries branch on exactly that, so modifiers: ["Control"] is the only way to test the zoom path in an app whose plain wheel pans. They are held for the whole gesture and released afterwards. Use "repeat" when one large delta and several small ones are not the same thing, which is common: libraries that accumulate deltas, debounce, or clamp per event behave differently, and "delay" spaces the events out for one that debounces. Always reads back what really moved: the result carries the point used, the total deltas dispatched, the scroll offsets before and after (for the page and for whichever container the browser would actually scroll at that point), and "moved". Note that "moved": false is CORRECT for a canvas zoom, because a zoom is a CSS transform rather than a scroll and nothing here can observe it generically: assert the app\'s own state for that. It is a real failure if you expected a scroll. Does NOT dispatch a pinch gesture, a touch event, or a smooth scroll animation of its own.',
     inputSchema: z.object({
