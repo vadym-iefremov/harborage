@@ -828,7 +828,8 @@ async function readSettledScrollState(page: Page, x: number, y: number): Promise
 export const interactionTools = defineTools({
   navigate: defineTool({
     description:
-      'Navigate a session\'s tab to a URL. A URL differing from the current one only in its hash is a SAME-DOCUMENT navigation: the browser changes the address but does not reload, so the JS context, in-page state (React state, timers, subscriptions) and the console buffer all survive. This tool does not quietly force a reload in that case, because navigating to a hash is a legitimate thing to test. It reports it instead: every result carries a "sameDocument" boolean, present in both the true and the false case, plus a note when it is true. Use reload when you need a real page load.',
+      'Navigate a session\'s tab to a URL. A URL differing from the current one only in its hash is a SAME-DOCUMENT navigation: the browser changes the address but does not reload, so the JS context, in-page state (React state, timers, subscriptions) and the console buffer all survive. This tool does not quietly force a reload in that case, because navigating to a hash is a legitimate thing to test. It reports it instead: every result carries a "sameDocument" boolean, present in both the true and the false case, plus a note when it is true. Use reload when you need a real page load. ' +
+      'This is the most-called tool in the whole surface, and it reports the real HTTP outcome rather than treating a rendered page as success: every result carries "status" (the HTTP status code) and "ok" (whether it was in the 200 to 299 range), exactly as reload does, so navigating to a URL that answers 404 or 500 does not read as an ordinary success just because something rendered, which matters most for an SPA shell that paints its own error state under a failing response. "status" and "ok" are both null when there genuinely is no HTTP response to report a status FOR, which is not a failure: a same-document navigation, about:blank, or a non-HTTP scheme such as data: or javascript:. A note explains which of those it was, so a null status is never mistaken for a navigation that silently failed.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -848,24 +849,47 @@ export const interactionTools = defineTools({
       // missed one costs a false pass.
       const sameDocument = response === null && (before === null || after === null || before === after);
 
+      // navigate is the most-called tool here, and until now it discarded
+      // `response` the moment sameDocument was settled: a URL that answered
+      // 404 or 500 came back looking like an ordinary success, and for an SPA
+      // shell that renders its own error state under a failing response even
+      // "title" gave nothing away. Reported the same way reload already
+      // reports it, so the two tools agree on what a caller should read.
+      const status = response?.status() ?? null;
+      const ok = response?.ok() ?? null;
+
+      const notes: string[] = [];
+      if (sameDocument) {
+        notes.push(
+          'Same-document navigation: the URL changed but the document was NOT reloaded. The JS context, in-page state and the console buffer all survive untouched, and nothing was re-fetched, so there is no HTTP response to report a status for either: "status" and "ok" are null for that reason, not because anything failed. Call reload if you need a real page load.'
+        );
+      } else if (response === null) {
+        // about:blank lands here: sameDocument is false for it (a fresh
+        // document really was created), but goto() still resolves to a null
+        // response, since nothing was fetched over HTTP. Same for a
+        // non-HTTP scheme such as data: or javascript:. Without this, both
+        // came back with "status": null and no explanation, indistinguishable
+        // from a request that failed before a response ever arrived.
+        notes.push(
+          'This navigation produced no HTTP response, so "status" and "ok" are null: that is what about:blank and a non-HTTP scheme (for instance data: or javascript:) look like, not a failure. The document did change, a fresh one was created, just not through anything this tool can report an HTTP status for.'
+        );
+      }
+
       return text({
         pageId: target.pageId,
         url: target.page.url(),
         title: await target.page.title().catch(() => ''),
         sameDocument,
-        ...(sameDocument
-          ? {
-              note:
-                'Same-document navigation: the URL changed but the document was NOT reloaded. The JS context, in-page state and the console buffer all survive untouched, and nothing was re-fetched. Call reload if you need a real page load.'
-            }
-          : {})
+        status,
+        ok,
+        ...(notes.length ? { note: notes.join(' ') } : {})
       });
     }
   }),
 
   reload: defineTool({
     description:
-      'Reload a session\'s tab: a real page load that discards the JS context, in-page state and everything the page had built up, and re-fetches the document. This is what navigate deliberately does not do when only the URL hash changes. The current URL, hash included, is kept.',
+      'Reload a session\'s tab: a real page load that discards the JS context, in-page state and everything the page had built up, and re-fetches the document. This is what navigate deliberately does not do when only the URL hash changes. The current URL, hash included, is kept. The result carries "status" (the HTTP status code of the reload) and "ok" (whether it was in the 200 to 299 range), exactly as navigate does, both null on the rare reload with no HTTP response to report, such as one landing on about:blank.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -878,7 +902,8 @@ export const interactionTools = defineTools({
         pageId: target.pageId,
         url: target.page.url(),
         title: await target.page.title().catch(() => ''),
-        status: response?.status()
+        status: response?.status() ?? null,
+        ok: response?.ok() ?? null
       });
     }
   }),
