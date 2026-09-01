@@ -7,6 +7,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { cliEntry, cleanupTempDirs, daemonHealth, makeTestConfig, waitFor, wrapperEnv } from './helpers.js';
 import type { Config } from '../src/shared/config.js';
 import { toolDefs } from '../src/daemon/tools/schemas.js';
+import { minRequestTimeoutMs, requestTimeoutFor, requestTimeoutMarginMs } from '../src/client/wrapper.js';
 import { toJSONSchema } from 'zod/v4';
 
 /**
@@ -131,4 +132,118 @@ test('a real wrapper rejects the misnamed key over the actual stdio transport, f
   // never leaves the wrapper process.
   const health = await daemonHealth(config);
   assert.equal(health, null, 'a schema-rejected call must not spawn the daemon');
+});
+
+// ---------------------------------------------------------------------------
+// Defect 2: a fixed 60-second ceiling no caller can raise
+// ---------------------------------------------------------------------------
+
+test('requestTimeoutFor: no timeoutMs gets the unchanged 60s floor', () => {
+  assert.equal(requestTimeoutFor({}, 10 * 60 * 1000), minRequestTimeoutMs);
+});
+
+test('requestTimeoutFor: a small timeoutMs still gets at least the 60s floor', () => {
+  assert.equal(requestTimeoutFor({ timeoutMs: 1500 }, 10 * 60 * 1000), minRequestTimeoutMs);
+});
+
+test('requestTimeoutFor: a timeoutMs past 60s is no longer clamped down to 60s', () => {
+  // This is the exact shape of the bug: timeoutMs: 150000 used to become a
+  // transport timeout of 60000 regardless. It must now be timeoutMs plus
+  // margin, comfortably clear of the old fixed 60000.
+  const result = requestTimeoutFor({ timeoutMs: 150_000 }, 10 * 60 * 1000);
+  assert.equal(result, 150_000 + requestTimeoutMarginMs);
+  assert.ok(result > minRequestTimeoutMs, 'must not regress to the old fixed 60s cutoff');
+});
+
+test('requestTimeoutFor: timeoutMs 0 (evaluate\'s "wait forever") maps to the ceiling, not to Infinity', () => {
+  assert.equal(requestTimeoutFor({ timeoutMs: 0 }, 10 * 60 * 1000), 10 * 60 * 1000);
+});
+
+test('requestTimeoutFor: a huge timeoutMs is capped at the ceiling, not left unbounded', () => {
+  assert.equal(requestTimeoutFor({ timeoutMs: 999_999_999 }, 10 * 60 * 1000), 10 * 60 * 1000);
+});
+
+test('a real wrapper actually passes the derived timeout to the transport: the ceiling is enforced end to end', async () => {
+  // A small configured ceiling, so this proves real enforcement without the
+  // suite waiting out the production 10-minute default.
+  const config = await testConfig({ requestTimeoutCeilingMs: 1500 });
+  const client = await connectWrapper(config, 'round2-ceiling-test');
+
+  const created = await client.callTool({ name: 'create_session', arguments: {} });
+  assert.ok(!created.isError, `expected create_session to succeed: ${JSON.stringify(created)}`);
+  const { sessionId } = created.structuredContent as { sessionId: string };
+
+  const startedAt = Date.now();
+  // wait_for's own timeout (5000ms) would resolve this around 5008ms if
+  // nothing cut it off first; the 1500ms ceiling must win.
+  const result = await client.callTool(
+    { name: 'wait_for', arguments: { sessionId, selector: '#never-appears', timeoutMs: 5000 } },
+    // This call's own hop (test -> wrapper) is a separate connection with
+    // its own 60s SDK default; it is given generous headroom here purely so
+    // IT does not fire first and mask what is under test: the wrapper's
+    // OWN outgoing call to the daemon, which is what the 1500ms ceiling
+    // bounds.
+    { timeout: 30_000 }
+  );
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.ok(result.isError, `expected the ceiling to cut the call off as an error, got: ${JSON.stringify(result)}`);
+  const text = resultText(result);
+  assert.match(text, /timed out/i, `expected a timeout-shaped error, got: ${text}`);
+  assert.ok(elapsedMs < 4000, `expected the 1500ms ceiling to cut this off well short of wait_for's own 5008ms, took ${elapsedMs}ms`);
+  assert.ok(elapsedMs >= 1200, `expected the call to run for roughly the ceiling, took only ${elapsedMs}ms`);
+});
+
+test('a real wrapper gives evaluate\'s timeoutMs: 0 the "as long as the ceiling allows" treatment, not a hang', async () => {
+  const config = await testConfig({ requestTimeoutCeilingMs: 1500 });
+  const client = await connectWrapper(config, 'round2-forever-test');
+
+  const created = await client.callTool({ name: 'create_session', arguments: {} });
+  const { sessionId } = created.structuredContent as { sessionId: string };
+
+  const startedAt = Date.now();
+  // A promise that never settles is exactly what evaluate's own doc string
+  // uses to describe why "0 waits forever" needs a wrapper-side ceiling at all.
+  const result = await client.callTool(
+    { name: 'evaluate', arguments: { sessionId, expression: 'new Promise(() => {})', timeoutMs: 0 } },
+    { timeout: 30_000 }
+  );
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.ok(result.isError, `expected the ceiling to cut this off, got: ${JSON.stringify(result)}`);
+  assert.ok(elapsedMs < 4000, `expected the ceiling to bound "forever", took ${elapsedMs}ms`);
+  assert.ok(elapsedMs >= 1200, `expected the call to run for roughly the ceiling, took only ${elapsedMs}ms`);
+});
+
+test('a call whose timeoutMs exceeds 60s is no longer cut off at 60s by the wrapper (the slow one)', async () => {
+  // The one test in this file allowed to actually run past a minute: proving
+  // the OLD fixed 60000ms transport cutoff is gone requires living past it
+  // for real. Kept to exactly one, and to as little over 60s as leaves a
+  // safe margin: wait_for's own overhead was measured at single-digit
+  // milliseconds (70000ms -> 70006ms), so one second of margin is generous,
+  // not padding for its own sake.
+  const config = await testConfig();
+  const client = await connectWrapper(config, 'round2-past-60s-test');
+
+  const created = await client.callTool({ name: 'create_session', arguments: {} });
+  const { sessionId } = created.structuredContent as { sessionId: string };
+
+  const startedAt = Date.now();
+  const result = await client.callTool(
+    { name: 'wait_for', arguments: { sessionId, selector: '#never-appears', timeoutMs: 61_000 } },
+    // Generous on the outer (test -> wrapper) hop for the same reason as the
+    // ceiling test above: only the wrapper -> daemon leg is under test here.
+    { timeout: 120_000 }
+  );
+  const elapsedMs = Date.now() - startedAt;
+
+  // Before this fix: an SdkError REQUEST_TIMEOUT at ~60002ms, carrying none
+  // of wait_for's own context. Now: wait_for's own real failure, because the
+  // wrapper's transport timeout (61000 + 10000 margin) outlasts it.
+  assert.ok(result.isError, `expected wait_for's own timeout error, got: ${JSON.stringify(result)}`);
+  const text = resultText(result);
+  assert.match(text, /wait_for gave up after/, `expected wait_for's own message, got: ${text}`);
+  assert.doesNotMatch(text, /request timed out/i, `must not be the bare transport timeout, got: ${text}`);
+  assert.ok(elapsedMs > 60_000, `expected this to genuinely outlast the old 60s cutoff, took ${elapsedMs}ms`);
+  assert.ok(elapsedMs < 65_000, `expected wait_for's own ~61000ms timeout to fire, not something later, took ${elapsedMs}ms`);
 });
