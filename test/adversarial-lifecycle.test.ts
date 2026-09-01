@@ -243,6 +243,7 @@ async function sweepOnce(overrides: Partial<SweepDeps> & { registryPath: string 
         reapedSessions: [],
         prunedClients: [],
         remainingClients: -1,
+        unresolvedClients: -1,
         liveSessions: -1,
         removedScreenshots: [],
         triggeredShutdown: false

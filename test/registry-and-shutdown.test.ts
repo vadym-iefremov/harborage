@@ -99,3 +99,50 @@ test('a live, correctly-registered client keeps the daemon alive; removing it le
     message: 'daemon should shut down once its only registered client has died'
   });
 });
+
+test('a daemon that cannot run ps keeps its clients rather than shutting down on top of them', async () => {
+  const config = await makeTestConfig({ sweepIntervalMs: 150, shutdownGraceMs: 100 });
+
+  const client = spawnInertProcess();
+  const startedAt = await getProcessStartTime(client.pid);
+  assert.ok(startedAt);
+  await registerSelf(config.registryPath, client.pid, startedAt!);
+
+  // PATH points at the state directory, which contains no `ps`, so every
+  // liveness probe this daemon makes fails at spawn with ENOENT. That is the
+  // deterministic stand-in for the real trigger, `EAGAIN` on a machine at its
+  // process limit: identical from the daemon's side, and summonable without
+  // actually driving the machine into fork starvation.
+  //
+  // The bug this covers: a probe failure used to be indistinguishable from
+  // "this process is gone", so a fork-starved daemon pruned every live client
+  // at once, found the registry empty, and shut itself down on top of the
+  // agents that were using it. Under fan-out that is exactly when the fork
+  // fails and exactly when there is most to lose.
+  const daemon = track(spawnDaemonProcess(config, { PATH: config.stateDir }));
+  await waitFor(() => isDaemonHealthy(config), { timeoutMs: 20_000, message: 'daemon never became healthy' });
+
+  // Several sweeps pass, every one of them unable to probe the client.
+  await new Promise(resolve => setTimeout(resolve, 800));
+
+  assert.equal(
+    await isDaemonHealthy(config),
+    true,
+    'a daemon that cannot establish whether its clients are alive must keep them, not exit'
+  );
+
+  const log = daemon.stderrText();
+  assert.match(
+    log,
+    /\[harborage] sweep\.client-unresolved clients=1 pids=\d+ reasons=ENOENT action=kept/,
+    `the daemon must say out loud that it kept a client it could not probe:\n${log}`
+  );
+  assert.doesNotMatch(log, /sweep\.shutdown\b/, `the daemon must not have decided to exit:\n${log}`);
+
+  // The registry file still holds the client: a probe it could not make must
+  // not have been persisted as a removal either.
+  assert.deepEqual((await readRegistry(config.registryPath)).map(e => e.pid), [client.pid]);
+
+  client.kill();
+  await client.exited;
+});

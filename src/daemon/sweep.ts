@@ -28,6 +28,11 @@ export interface SweepOutcome {
   prunedClients: RegistryEntry[];
   remainingClients: number;
   /**
+   * How many of `remainingClients` are counted only because their liveness
+   * could not be established. Zero on any healthy machine.
+   */
+  unresolvedClients: number;
+  /**
    * Sessions still live at the moment the shutdown gate was evaluated, after
    * this pass's own reaping, plus any `create_session` still in progress.
    */
@@ -92,7 +97,22 @@ export async function runSweepOnce(deps: SweepDeps): Promise<SweepOutcome> {
     });
   }
 
-  const { kept, dropped } = await pruneRegistryFile(deps.registryPath);
+  const { kept, dropped, unresolved } = await pruneRegistryFile(deps.registryPath);
+
+  // Said out loud, because it is the daemon deciding in a client's favour on
+  // no evidence, and because the condition that causes it is worth catching
+  // early. `ps` failing to run is almost always fork starvation (`EAGAIN`) on
+  // a machine already at its process limit, which is the same overload that
+  // makes everything else here flaky. Keeping these clients is the safe
+  // choice, not a confident one.
+  if (unresolved.length > 0) {
+    deps.logger.log('sweep.client-unresolved', {
+      clients: unresolved.length,
+      pids: unresolved.map(u => u.entry.pid).join(','),
+      reasons: [...new Set(unresolved.map(u => u.reason))].join(','),
+      action: 'kept'
+    });
+  }
 
   // Only a pass that actually changed something gets a line. A sweep that
   // found nothing to do runs every minute forever, and logging those is how
@@ -138,6 +158,7 @@ export async function runSweepOnce(deps: SweepDeps): Promise<SweepOutcome> {
     reapedSessions,
     prunedClients: dropped,
     remainingClients: kept.length,
+    unresolvedClients: unresolved.length,
     liveSessions,
     removedScreenshots,
     triggeredShutdown
