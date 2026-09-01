@@ -29,6 +29,11 @@ interface PageElement {
   files?: ArrayLike<PageFile> | null;
   control?: PageElement | null;
   parentElement?: PageElement | null;
+  // A real, readable property in Chromium, not merely an HTML attribute: an
+  // editor built on the EditContext API attaches one to keep its authoritative
+  // text there instead of in the DOM, which is exactly why its presence is
+  // what readFieldValue's readback honesty check looks for.
+  editContext?: unknown;
   scrollLeft?: number;
   scrollTop?: number;
   scrollWidth?: number;
@@ -126,6 +131,100 @@ function readFieldValue(page: Page, locator: Locator | null): Promise<string> {
 }
 
 /**
+ * Class and attribute markers a real Monaco 0.45.0 and CodeMirror 6.0.1
+ * instance were both found to carry, probed directly rather than guessed at:
+ * `.monaco-editor` wraps the whole widget and `[data-mode-id]` is Monaco's
+ * own language marker, while CodeMirror carries both `.cm-editor` (the outer
+ * view) and `.cm-content` (the actual editable node, which is what a
+ * selector usually targets). Kept to markers that were actually verified so
+ * an ordinary contenteditable that merely LOOKS rich, a role="textbox" widget
+ * with no virtualization behind it, does not get flagged for a problem it
+ * does not have.
+ */
+const richEditorMarkers = '.monaco-editor, [data-mode-id], .cm-editor, .cm-content';
+
+/**
+ * Why textContent cannot be trusted for a Monaco or CodeMirror instance.
+ * Both were probed with a 500-line, ~25000 character document: Monaco's
+ * textContent came back around 600 characters, CodeMirror's around 3200,
+ * both truncated and with no newline between lines, because the rendered
+ * view is a flat run of positioned line elements, not a document tree, and
+ * only the lines currently on screen exist in the DOM at all.
+ */
+const virtualizedEditorWarning =
+  'This looks like a Monaco or CodeMirror instance. Both virtualize their lines, so textContent only covers ' +
+  'what is currently rendered on screen: a long document reads back truncated, and with no newline between ' +
+  'lines, since the rendered view is a flat run of positioned line elements rather than a document tree. ' +
+  '"value" below is what the DOM happens to show, not what the editor actually holds. Read the real content ' +
+  'through the editor\'s own API instead, with evaluate: monaco.editor.getModels()[0].getValue() for Monaco, or ' +
+  'a CodeMirror view\'s state.doc.toString().';
+
+/**
+ * Why textContent cannot be trusted for an element with an attached
+ * EditContext. Confirmed directly: attaching a real EditContext to a
+ * contenteditable element in Chromium left its textContent empty even though
+ * the EditContext itself held real text throughout, because the EditContext
+ * is the editor's authoritative text store, not the DOM.
+ */
+const editContextWarning =
+  'This element has an EditContext attached. Per the EditContext API, the EditContext itself, not the DOM, is ' +
+  'the editor\'s authoritative text store, so textContent can sit empty or stale even right after a write really ' +
+  'landed. "value" below is not to be trusted here. Read the real content back through the editor\'s own API ' +
+  'instead, with evaluate.';
+
+/**
+ * Whether `el`'s textContent can be trusted as a readback, and why not when
+ * it cannot. Self-contained on purpose: it runs inside the page through
+ * `locator.evaluate`, which serializes only this function's own source, so it
+ * takes every message it might return as an argument rather than closing
+ * over the module-level constants above.
+ */
+function richEditorWarning(
+  el: PageElement,
+  messages: { markers: string; virtualized: string; editContext: string }
+): string | null {
+  let node: PageElement | null = el;
+  for (let hops = 0; node && hops < 8; hops += 1) {
+    if (node.matches(messages.markers)) return messages.virtualized;
+    node = node.parentElement ?? null;
+  }
+  return el.editContext ? messages.editContext : null;
+}
+
+/**
+ * The same check as `richEditorWarning`, for the no-selector case: there is
+ * no locator to evaluate against, only whatever currently has focus, so this
+ * reads `document.activeElement` itself before walking up from it. Kept as
+ * its own top-level function rather than sharing a call to
+ * `richEditorWarning` for the same serialization reason: `page.evaluate` only
+ * sends the one function it is given, not whatever it happens to call.
+ */
+function richEditorWarningForFocused(messages: {
+  markers: string;
+  virtualized: string;
+  editContext: string;
+}): string | null {
+  const el = document.activeElement;
+  if (!el) return null;
+  let node: PageElement | null = el;
+  for (let hops = 0; node && hops < 8; hops += 1) {
+    if (node.matches(messages.markers)) return messages.virtualized;
+    node = node.parentElement ?? null;
+  }
+  return el.editContext ? messages.editContext : null;
+}
+
+/** Arguments `richEditorWarning`/`richEditorWarningForFocused` are called with, bundled once. */
+const richEditorWarningMessages = { markers: richEditorMarkers, virtualized: virtualizedEditorWarning, editContext: editContextWarning };
+
+/** What the field really holds, plus whether that readback is one a rich editor can defeat. */
+function readReadbackReliability(page: Page, locator: Locator | null): Promise<string | null> {
+  return locator
+    ? locator.evaluate(richEditorWarning, richEditorWarningMessages)
+    : page.evaluate(richEditorWarningForFocused, richEditorWarningMessages);
+}
+
+/**
  * Replaces a field's contents for real.
  *
  * A contenteditable goes through actual keyboard events (focus, select-all,
@@ -178,14 +277,29 @@ async function setFieldValue(page: Page, locator: Locator, value: string): Promi
  * it never set, so a mismatch is stated in the payload rather than left for
  * the caller to discover by reading the field back themselves.
  */
-function writeResult(base: Record<string, unknown>, actual: string, matched: boolean, expectation: string): ToolResult {
+function writeResult(
+  base: Record<string, unknown>,
+  actual: string,
+  matched: boolean,
+  expectation: string,
+  readbackWarning?: string | null
+): ToolResult {
+  // A rich editor's own textContent readback cannot be trusted, so "matched"
+  // is not computed at all here: reporting true would be the false pass this
+  // whole file exists to avoid, and reporting false would look like a real
+  // write failure when the write may well have landed exactly as asked.
+  // Neither claim is honest, so neither is made.
+  if (readbackWarning) {
+    return text({ ...base, value: actual, readbackReliable: false, note: readbackWarning });
+  }
   if (matched) {
-    return text({ ...base, value: actual, matched: true });
+    return text({ ...base, value: actual, matched: true, readbackReliable: true });
   }
   return text({
     ...base,
     value: actual,
     matched: false,
+    readbackReliable: true,
     note:
       `The field does not contain what was expected. ${expectation} It now contains ${JSON.stringify(actual)}. ` +
       'The page may have rewritten, truncated or reformatted the input, or the write may have landed somewhere other than the intended element. Trust "value", not the request.'
@@ -690,7 +804,7 @@ export const interactionTools = defineTools({
   fill: defineTool({
     serializesInput: true,
     description:
-      'Set a field\'s contents in a session\'s tab, REPLACING whatever was there. Use type instead to append, or to fire per-character events. For an input, textarea or select this is Playwright\'s atomic fill. For a contenteditable, including rich editors like CodeMirror and Monaco, it focuses the element and replaces through real keyboard events (select-all, delete, insert), because those editors keep their own document model and treat a plain insertion as an insert at their cursor, appending onto the existing value instead of replacing it. Always reads the field back afterwards: the result carries "value" (what the field really contains now), "matched", and a "note" explaining the difference when they disagree.',
+      'Set a field\'s contents in a session\'s tab, REPLACING whatever was there. Use type instead to append, or to fire per-character events. For an input, textarea or select this is Playwright\'s atomic fill. For a contenteditable, including rich editors like CodeMirror and Monaco, it focuses the element and replaces through real keyboard events (select-all, delete, insert), because those editors keep their own document model and treat a plain insertion as an insert at their cursor, appending onto the existing value instead of replacing it. Reads the field back afterwards, but that readback is DOM textContent, and for a real Monaco or CodeMirror instance textContent is not the whole story: both virtualize their lines, so it only covers what is currently rendered and reads back truncated for anything long, and an element with an EditContext attached keeps its real text there rather than in the DOM at all. When the target looks like one of these the result says so plainly: "readbackReliable" is false, "matched" is not claimed either way, and "note" names the editor\'s own API to read the value through instead (e.g. monaco.editor.getModels()[0].getValue()). For an ordinary field the result carries "value" (what the field really contains now), "matched", "readbackReliable": true, and a "note" explaining the difference when value and the request disagree.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -704,11 +818,13 @@ export const interactionTools = defineTools({
       const locator = target.page.locator(args.selector);
       await setFieldValue(target.page, locator, args.value);
       const actual = await readFieldValue(target.page, locator);
+      const readbackWarning = await readReadbackReliability(target.page, locator);
       return writeResult(
         { pageId: target.pageId, selector: args.selector, requested: args.value },
         actual,
         actual === args.value,
-        `Expected exactly ${JSON.stringify(args.value)}.`
+        `Expected exactly ${JSON.stringify(args.value)}.`,
+        readbackWarning
       );
     }
   }),
@@ -716,7 +832,7 @@ export const interactionTools = defineTools({
   type: defineTool({
     serializesInput: true,
     description:
-      'Type text into a session\'s tab character by character, with real key events, so per-character handlers, debounces, autocomplete and anything firing on a keystroke actually run. fill sets the value in one step and cannot exercise those. Does NOT clear the field first: it inserts at the caret, which is what a user typing does, so calling it twice types twice. Pass clear: true to replace the contents instead. Where the caret sits is the browser\'s call, not this tool\'s: focusing an input puts it after the existing text, focusing a contenteditable puts it before, so click the spot first if the insertion point matters. With no selector the keystrokes go to whatever currently has focus. Always reads the field back afterwards: the result carries "value" (what the field really contains now), "previousValue" (what it held BEFORE the call, clear included, so a clear cannot throw something away invisibly), "matched", and a "note" when what landed is not the typed text inserted into what was already there. With clear: true and NO selector it refuses outright when nothing has focus, rather than pressing select-all against the whole document, which on a contenteditable page empties it.',
+      'Type text into a session\'s tab character by character, with real key events, so per-character handlers, debounces, autocomplete and anything firing on a keystroke actually run. fill sets the value in one step and cannot exercise those. Does NOT clear the field first: it inserts at the caret, which is what a user typing does, so calling it twice types twice. Pass clear: true to replace the contents instead. Where the caret sits is the browser\'s call, not this tool\'s: focusing an input puts it after the existing text, focusing a contenteditable puts it before, so click the spot first if the insertion point matters. With no selector the keystrokes go to whatever currently has focus, and if NOTHING has focus this refuses outright rather than guessing: with no field to type into or read back, the only thing "no selector" could act on is the document itself, which on a contenteditable page means select-all-and-delete on clear would empty the page, and even without clear, reading the caret holder back would return document.activeElement, which is <body>, so the result would carry the entire page\'s text as "value" instead of any one field\'s. Reads the field back afterwards, but that readback is DOM textContent, and for a real Monaco or CodeMirror instance textContent is not the whole story: both virtualize their lines, so it only covers what is currently rendered and reads back truncated for anything long, and an element with an EditContext attached keeps its real text there rather than in the DOM at all. When the target looks like one of these the result says so plainly: "readbackReliable" is false, "matched" is not claimed either way, and "note" names the editor\'s own API to read the value through instead. For an ordinary field the result carries "value" (what the field really contains now), "previousValue" (what it held BEFORE the call, clear included, so a clear cannot throw something away invisibly), "matched", "readbackReliable": true, and a "note" when what landed is not the typed text inserted into what was already there.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -739,6 +855,37 @@ export const interactionTools = defineTools({
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
       const locator = args.selector === undefined ? null : target.page.locator(args.selector);
 
+      // Runs before ANYTHING else, including the very first readback below.
+      // With no selector, "nothing has focus" is not just a clear-time danger
+      // (select-all against the whole document): reading the field back is
+      // document.activeElement too, and an unfocused page's activeElement is
+      // <body>, so its textContent is the entire page rather than any field's.
+      // That produced a result with a multi-thousand-character page dump
+      // masquerading as a field's value, twice over (previousValue and value
+      // both), for a call that never told the caller anything about a field
+      // at all. Refusing outright is the same call fill's own focus guard
+      // makes, just made before the read that clear alone used to gate.
+      if (locator === null) {
+        const holder = await target.page.evaluate(() => {
+          const el = document.activeElement;
+          if (!el) return null;
+          return { tag: el.tagName, id: el.id };
+        });
+        if (holder === null || holder.tag === 'BODY' || holder.tag === 'HTML') {
+          throw new Error(
+            'type has no selector and nothing has focus, so there is no field to act on: the caret is in the ' +
+              'document itself. Reading it back would return document.activeElement, which on an unfocused page is ' +
+              '<body>, so "value" would be the whole page\'s text rather than any one field\'s' +
+              (args.clear
+                ? ', and clearing would press select-all against the whole document too, with the delete after it ' +
+                  'emptying a contenteditable page'
+                : '') +
+              '. Pass "selector" to name the field, or click into it first. Nothing was typed' +
+              (args.clear ? ' and nothing was cleared.' : '.')
+          );
+        }
+      }
+
       // Read BEFORE the clear, so "previousValue" means what its name says.
       // Read after, it was always the emptied field on a clearing call, which
       // also made "matched" a comparison against nothing: it could not fail,
@@ -749,25 +896,10 @@ export const interactionTools = defineTools({
         if (locator) {
           await setFieldValue(target.page, locator, '');
         } else {
-          // The same guard fill carries, for the same reason. Select-all is
-          // scoped to whatever holds the caret, so pressing it with nothing
-          // focused, or with the caret in the document itself, selects the
-          // whole page and the delete that follows empties it. On a
-          // contenteditable body that silently destroys the document while the
-          // call still reports a match. With no selector there is no target to
-          // verify focus against, so refuse rather than guess.
-          const holder = await target.page.evaluate(() => {
-            const el = document.activeElement;
-            if (!el) return null;
-            return { tag: el.tagName, id: el.id };
-          });
-          if (holder === null || holder.tag === 'BODY' || holder.tag === 'HTML') {
-            throw new Error(
-              'type cannot clear without a selector when nothing has focus: the caret is in the document itself, so ' +
-                'select-all would select the whole page and the delete after it would empty a contenteditable one. ' +
-                'Pass "selector" to name the field, or click into it first. Nothing was typed and nothing was cleared.'
-            );
-          }
+          // Focus was already confirmed real above, so this is exactly the
+          // select-all-and-delete fill's own contenteditable path performs,
+          // just against whatever currently holds the caret rather than a
+          // locator, because there is no selector to build one from.
           await target.page.keyboard.press(selectAllChord);
           await target.page.keyboard.press('Delete');
         }
@@ -784,6 +916,7 @@ export const interactionTools = defineTools({
         await target.page.keyboard.type(args.text, options);
       }
       const actual = await readFieldValue(target.page, locator);
+      const readbackWarning = await readReadbackReliability(target.page, locator);
 
       // Typing inserts rather than replaces, so what to expect afterwards is
       // the previous contents with the typed text somewhere inside them, not
@@ -798,7 +931,8 @@ export const interactionTools = defineTools({
         },
         actual,
         isInsertionOf(baseline, args.text, actual),
-        `Expected ${JSON.stringify(args.text)} inserted into ${JSON.stringify(baseline)}.`
+        `Expected ${JSON.stringify(args.text)} inserted into ${JSON.stringify(baseline)}.`,
+        readbackWarning
       );
     }
   }),
