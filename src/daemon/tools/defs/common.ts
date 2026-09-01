@@ -11,7 +11,12 @@ export const sessionId = z.string().min(1).describe('Session id returned by crea
 export const pageId = z
   .string()
   .optional()
-  .describe('Tab id from list_tabs. Defaults to the session\'s most recently active tab.');
+  .describe(
+    'Tab id from list_tabs. Defaults to the session\'s active tab (call select_tab to change which one that is). ' +
+      'Passing pageId targets this one call only: it does not make that tab the new default for later calls that ' +
+      'omit pageId, so a one-off screenshot or read of a background tab never silently redirects everything after ' +
+      'it. Use select_tab when you actually want to switch.'
+  );
 
 export const clear = z
   .boolean()

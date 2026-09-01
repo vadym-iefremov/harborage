@@ -254,6 +254,18 @@ interface ProbeElement {
   // test tsconfig does pull in lib.dom, so anything narrower stops these
   // callbacks type-checking under it.
   contains(other: any): boolean;
+  // True once the node is connected all the way to a document, following
+  // shadow trees the way the spec requires. Used to tell a chain that
+  // stopped at the real document root from one that stopped because the
+  // element is detached (mid-mutation, or removed).
+  isConnected: boolean;
+  // Real signature returns Node, which is not this interface, but callers
+  // here only ever read .host off the result, and both a Document and a
+  // ShadowRoot structurally satisfy "optionally has a host".
+  getRootNode(): { host?: ProbeElement };
+  // Present (possibly null, for a closed root) on any element that is
+  // itself a shadow host. Absent entirely on one that is not.
+  shadowRoot?: { elementFromPoint?(x: number, y: number): ProbeElement | null } | null;
 }
 
 declare const document: {
@@ -1071,6 +1083,13 @@ export const inspectTools = defineTools({
       'an overlay paints on top (element_box\'s topmostAtCentre is what catches that last one). It composites ' +
       'background-color and opacity only, up to the document root of the frame the element is in, onto the canvas the ' +
       'browser really paints behind the page, and it reports colours it could not parse rather than guessing. ' +
+      'The ancestor walk crosses shadow boundaries: an element inside an open or closed shadow root has its chain ' +
+      'continued through the shadow host, not stopped at the shadow root, because that host is what genuinely ' +
+      'paints behind it. Measured against real Chromium: text at rgb(30, 30, 30) inside a shadow root on a page ' +
+      'painted rgb(10, 10, 10), a real ratio of about 1.1:1 and unreadable, used to stop at the shadow root and ' +
+      'report a confident 16.67:1 AA pass composited onto an assumed white canvas. On the rare occasion the chain ' +
+      'still cannot reach the document (a detached element being measured mid-mutation), effective.layerChainIncomplete ' +
+      'is true and the ratio should be read as unreliable rather than final. ' +
       'Colour syntaxes understood: rgb()/rgba() and hsl()/hsla() in both the legacy comma form and the modern ' +
       'space form with a slash alpha, hwb(), lab(), lch(), oklab(), oklch(), color() in the predefined spaces ' +
       'srgb, srgb-linear, display-p3, a98-rgb, prophoto-rgb, rec2020, xyz, xyz-d50 and xyz-d65, and the keyword ' +
@@ -1088,8 +1107,10 @@ export const inspectTools = defineTools({
       'dark-mode page that paints no background of its own composites onto rgb(18, 18, 18) the way it looks on ' +
       'screen; effective.canvasColor reports which one was used. Reading it appends a zero-sized node to the ' +
       'document for the length of one getComputedStyle call and removes it again, the same kind of temporary ' +
-      'mutation the states option makes. When any of the unmodelled features above are in play the ratio is a ' +
-      'strong hint, not a verdict: look at a screenshot too.',
+      'mutation the states option makes. If that read itself fails, canvasReadFailed is true on the top-level ' +
+      'result and the assumed-white fallback is used, so a dark-mode page whose canvas could not be read is not ' +
+      'mistaken for one that was genuinely measured white. When any of the unmodelled features above are in play ' +
+      'the ratio is a strong hint, not a verdict: look at a screenshot too.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -1163,6 +1184,10 @@ export const inspectTools = defineTools({
         color: string;
         fontSizePx: number;
         fontWeight: number;
+        // False when the ancestor walk below could not reach the document,
+        // most often a detached element mid-mutation. See where this is
+        // consumed for what that means for the reported ratio.
+        reachedRoot: boolean;
       }
 
       const read = (): Promise<StyleProbe[]> =>
@@ -1185,7 +1210,24 @@ export const inspectTools = defineTools({
                   backgroundColor: style.getPropertyValue('background-color'),
                   opacity: style.getPropertyValue('opacity')
                 });
-                node = node.parentElement;
+                const parent: ProbeElement | null = node.parentElement;
+                if (parent) {
+                  node = parent;
+                  continue;
+                }
+                // parentElement stops dead at a shadow boundary: the top node
+                // inside an open OR closed shadow root has parentElement null
+                // even though it is visually painted directly on top of its
+                // host. Measured against real Chromium: a <span> at
+                // rgb(30, 30, 30) inside a shadow root, on a page painted
+                // rgb(10, 10, 10) (a real ratio of about 1.1:1, unreadable),
+                // used to stop the walk right there and composite onto an
+                // assumed white canvas, reporting a confident 16.6712:1 AA
+                // pass. getRootNode().host steps across the boundary onto the
+                // host element, which is what actually paints behind the
+                // shadow tree, and the loop continues climbing from there.
+                const rootNode = node.getRootNode();
+                node = rootNode.host ?? null;
               }
               layers.reverse();
               if (arg.pseudoElement) {
@@ -1207,7 +1249,14 @@ export const inspectTools = defineTools({
                 layers,
                 color: own.getPropertyValue('color'),
                 fontSizePx: parseFloat(own.getPropertyValue('font-size')),
-                fontWeight: parseFloat(own.getPropertyValue('font-weight'))
+                fontWeight: parseFloat(own.getPropertyValue('font-weight')),
+                // isConnected follows shadow trees the way the spec requires,
+                // so it is true for an element inside a shadow root whose
+                // host is itself in the document. Checked on the element
+                // itself rather than at each step of the walk above: if the
+                // element is connected, the walk is guaranteed to reach the
+                // document by climbing parentElement and shadow hosts alone.
+                reachedRoot: element.isConnected
               });
             }
             return out;
@@ -1222,7 +1271,17 @@ export const inspectTools = defineTools({
 
       // Asked of the frame the elements are in, not of the page: a same-origin
       // iframe can carry its own color-scheme.
-      const rawCanvas = await root.evaluate<string>(CANVAS_COLOR_PROBE).catch(() => 'rgb(255, 255, 255)');
+      let canvasReadFailed = false;
+      const rawCanvas = await root.evaluate<string>(CANVAS_COLOR_PROBE).catch(() => {
+        // A previous round (748d000) replaced an assumed-white canvas with a
+        // real read specifically because dark-mode pages were being reported
+        // as passing AA on text nobody could read. If the read itself throws
+        // (a detached frame, a mid-navigation race), falling back to the same
+        // white silently reintroduces exactly that bug with no trace of it in
+        // the payload. canvasReadFailed makes the fallback visible instead.
+        canvasReadFailed = true;
+        return 'rgb(255, 255, 255)';
+      });
       const parsedCanvas = parseCssColor(rawCanvas);
       const canvasColor: Rgba = parsedCanvas ?? { ...opaqueWhite };
 
@@ -1282,6 +1341,15 @@ export const inspectTools = defineTools({
                     'Chromium paints on an sRGB screen. The ratio is right for that rendering. On a wide-gamut ' +
                     'display the colour shown is not exactly this one.'
                 }
+              : {}),
+            ...(probe.reachedRoot === false
+              ? {
+                  layerChainIncomplete: true,
+                  layerChainWarning:
+                    'The ancestor walk used to build this stack did not reach the document, most likely because ' +
+                    'the element is detached from the page (removed, or measured mid-mutation). There is no real ' +
+                    'canvas behind it to composite onto, so the ratio below is not reliable.'
+                }
               : {})
           },
           contrast: {
@@ -1305,6 +1373,15 @@ export const inspectTools = defineTools({
         matched,
         returned: elements.length,
         properties,
+        ...(canvasReadFailed
+          ? {
+              canvasReadFailed: true,
+              canvasWarning:
+                'The page\'s Canvas system colour could not be read, so every element below falls back to an ' +
+                'assumed rgb(255, 255, 255) background. On a dark-mode page that fallback is wrong, and every ' +
+                'ratio composited against it is unreliable.'
+            }
+          : {}),
         elements
       });
     }
@@ -1326,8 +1403,12 @@ export const inspectTools = defineTools({
       'not a paint test: false means something else would receive a click there, and occludedBy names it, which is ' +
       'how a fully transparent overlay that swallows clicks gets caught. The mirror case is the one to watch: an ' +
       'opaque overlay with pointer-events: none completely hides an element on screen while this still reports ' +
-      'topmostAtCentre true and occludedBy null, correctly, because the click does reach through it. For "is it ' +
-      'actually visible to a human", take a screenshot. ' +
+      'topmostAtCentre true and occludedBy null, correctly, because the click does reach through it. The hit test ' +
+      'accounts for shadow DOM: an element inside an open or closed shadow root that is genuinely unoccluded ' +
+      'reports topmostAtCentre true and occludedBy null, not the shadow host, because the point is re-tested ' +
+      'against the shadow root itself rather than trusted at the host it retargets to first. An actual overlay ' +
+      'sitting on top of that element inside the same shadow root is still caught, at whatever nesting depth of ' +
+      'shadow roots it is at. For "is it actually visible to a human", take a screenshot. ' +
       'The point tested comes back as hitTestPoint, with hitTestPointIsCentre alongside it, because an element ' +
       'whose centre falls outside the viewport is tested at the nearest point inside it instead: without that, ' +
       'occludedBy could name something sitting nowhere near the middle of the element. ' +
@@ -1444,9 +1525,31 @@ export const inspectTools = defineTools({
                     const centreY = Math.min(Math.max(trueY, 0), window.innerHeight - 1);
                     hitTestPoint = { x: Math.round(centreX * 100) / 100, y: Math.round(centreY * 100) / 100 };
                     hitTestPointIsCentre = centreX === trueX && centreY === trueY;
-                    const hit = document.elementFromPoint(centreX, centreY);
+                    // document.elementFromPoint retargets into the shadow host for
+                    // ANYTHING inside a shadow tree, open or closed. Measured
+                    // against real Chromium: a plain unoccluded <button> inside an
+                    // open shadow root, nothing on top of it, still came back with
+                    // hit equal to its own host <div id="host">, topmostAtCentre
+                    // false and occludedBy naming the host, a fabricated overlay
+                    // on every web component on the page. hit.contains(element)
+                    // alone would fix that, but it would ALSO wave through a real
+                    // overlay sitting on top of the element inside the SAME shadow
+                    // root, because that overlay retargets to the identical host
+                    // too. ShadowRoot.elementFromPoint, unlike Document's, does not
+                    // retarget, so re-querying the same point against
+                    // hit.shadowRoot recovers what is actually topmost inside the
+                    // shadow tree, and repeating it handles shadow roots nested in
+                    // shadow roots.
+                    let hit = document.elementFromPoint(centreX, centreY);
+                    let shadowDrillDepth = 0;
+                    while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function' && shadowDrillDepth < 20) {
+                      const deeper = hit.shadowRoot.elementFromPoint(centreX, centreY);
+                      if (!deeper || deeper === hit) break;
+                      hit = deeper;
+                      shadowDrillDepth += 1;
+                    }
                     if (hit) {
-                      topmostAtCentre = hit === element || element.contains(hit);
+                      topmostAtCentre = hit === element || element.contains(hit) || hit.contains(element);
                       if (!topmostAtCentre) {
                         occludedBy = {
                           tagName: String(hit.tagName).toLowerCase(),
@@ -1559,7 +1662,10 @@ export const inspectTools = defineTools({
       'resolvesToTarget (whether one of them is the element described here) and unique (both, exactly once). ' +
       'READ resolvesToTarget BEFORE USING A SELECTOR: false means it points somewhere else, or nowhere. That ' +
       'happens for an element inside a shadow root, which Playwright finds but a CSS path cannot reach, and the ' +
-      'result carries a note whenever it does. Search by ' +
+      'result carries a note whenever it does. When frame is set and the owning iframe element itself could not ' +
+      'be read (for instance because the iframe sits inside a shadow root), no working selector can be composed ' +
+      'at all: every result comes back with selector null and a top-level frameSelectorUnavailable explaining why, ' +
+      'rather than a selector that looks fine but actually runs in the wrong document. Search by ' +
       'visible text, by ARIA role and accessible name, by test id, or by a raw selector, and combine a raw ' +
       'selector with the others to scope the search to part of the page. ' +
       'Each result also carries the element\'s tag, trimmed text, key attributes, box, and whether it is visible ' +
@@ -1629,7 +1735,25 @@ export const inspectTools = defineTools({
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
       const frame = resolveFrame(target.page, args.frame);
       const root: Page | Frame = frame ?? target.page;
-      const prefix = frame ? ((await frameSelectorPrefix(target.page, frame)) ?? '') : '';
+      // frameSelectorPrefix returns undefined when the owning iframe element
+      // could not be addressed (list_frames hits the same case, and reports
+      // it as selectorPrefixUnavailable rather than guessing). The most
+      // common cause is an iframe living inside a shadow root: the segment
+      // builder indexes it with document.getElementsByTagName, which does
+      // not pierce shadow roots. Falling back to '' here used to be silent:
+      // a selector meant to enter a frame would come back with no prefix at
+      // all, and click would then run it against the MAIN document instead.
+      // Probed with a shadow-hosted iframe holding "Confirm payment" and the
+      // main page holding "Delete account": find returned a bare
+      // "html > body > button" with resolvesToTarget true (that flag was
+      // only ever checked inside the frame's own document), and clicking it
+      // pressed Delete account. resolvesToTarget must never certify a
+      // selector that was verified in a different document from the one it
+      // will actually run in, so when the prefix is unavailable no usable
+      // selector is emitted at all: see frameSelectorUnavailable below.
+      const framePrefix = frame ? await frameSelectorPrefix(target.page, frame) : '';
+      const frameSelectorUnavailable = frame !== undefined && framePrefix === undefined;
+      const prefix = framePrefix ?? '';
       const limit = args.limit ?? defaultMatchLimit;
       const exact = args.exact ?? false;
 
@@ -1786,6 +1910,27 @@ export const inspectTools = defineTools({
                 'data-testid'
               ]
             });
+
+      // The prefix is unavailable, so no result below can carry a working
+      // selector: composing one with an empty prefix would silently resolve
+      // in the wrong document (see the comment where framePrefix is
+      // computed). Every selector comes back null rather than guessing.
+      if (frameSelectorUnavailable) {
+        return text({
+          pageId: target.pageId,
+          ...(args.frame !== undefined ? { frame: args.frame } : {}),
+          matched,
+          returned: elements.length,
+          frameSelectorUnavailable:
+            'the owning iframe element for this frame could not be read (often because it sits inside a shadow ' +
+            'root), so no selector can be built that reaches into it from outside. Every selector below is null ' +
+            'for that reason: do not substitute a bare or empty prefix, since that would resolve in the main ' +
+            'document instead of this frame and click would press whatever it happens to hit there. Use evaluate, ' +
+            'snapshot, computed_style or element_box with frame set to this id instead, which take a frame id ' +
+            'directly and need no prefix.',
+          elements: elements.map(element => ({ ...element, selector: null, resolvesToTarget: false }))
+        });
+      }
 
       const unusable = elements.filter(element => !element.resolvesToTarget);
       return text({
