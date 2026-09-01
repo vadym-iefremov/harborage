@@ -530,9 +530,14 @@ test('hover on a selector matching nothing explains itself instead of throwing a
 
   assert.notEqual(message, null);
   assert.doesNotMatch(String(message), /^TimeoutError/, 'a raw Playwright timeout is what this replaces');
-  assert.match(String(message), /matched no elements/i);
+  assert.match(String(message), /matches no elements now/i);
   assert.match(String(message), /find|wait_for/, 'the message has to name what to do next');
   assert.match(String(message), /pointer was not moved/i);
+  // The message used to assert that the selector "matched no elements when the
+  // call started" on the strength of a count taken only after the failure. It
+  // says what it measured and when now, and the start count really was zero
+  // here, so it may say so.
+  assert.match(String(message), /matched 0 element\(s\) when the call started/);
 
   await sessions.releaseSession(sessionId);
 });
@@ -717,14 +722,15 @@ test('fill and type explain a zero-match selector instead of throwing a bare tim
   sessions.resolve(sessionId).page.setDefaultTimeout(1200);
 
   const filled = await rejection(() => handlers.fill({ sessionId, selector: '#not-a-thing', value: 'x' }));
-  assert.match(String(filled), /^fill found nothing to act on/);
-  assert.match(String(filled), /matched no elements/i);
+  assert.match(String(filled), /^fill could not finish on/);
+  assert.match(String(filled), /matches no elements now/i);
+  assert.match(String(filled), /matched 0 element\(s\) when the call started/, 'and it may only say what it measured');
   assert.match(String(filled), /find|wait_for/);
   assert.match(String(filled), /nothing was written/i);
   assert.doesNotMatch(String(filled), /^TimeoutError/);
 
   const typed = await rejection(() => handlers.type({ sessionId, selector: '#not-a-thing', text: 'x' }));
-  assert.match(String(typed), /^type found nothing to act on/);
+  assert.match(String(typed), /^type could not finish on/);
   assert.match(String(typed), /nothing was typed/i);
 
   await sessions.releaseSession(sessionId);
