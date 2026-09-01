@@ -106,7 +106,7 @@ async function evaluate<T>(sessionId: string, expression: string): Promise<T> {
 /** A fresh session already sitting on the fixture page. */
 async function freshSession(): Promise<string> {
   const { sessionId } = await sessions.createSession();
-  await handlers.navigate({ sessionId, url: baseUrl });
+  await handlers.navigate({ sessionId, url: baseUrl, settleMs: 0 });
   return sessionId;
 }
 
@@ -201,7 +201,7 @@ test('emulate_media survives a real page load and does not leak into another ses
   const other = await freshSession();
 
   await handlers.emulate_media({ sessionId, colorScheme: 'dark' });
-  await handlers.reload({ sessionId });
+  await handlers.reload({ sessionId, settleMs: 0 });
   assert.equal((await styleProbe(sessionId)).background, 'rgb(0, 0, 0)', 'the override must outlive a document swap');
 
   assert.equal((await styleProbe(other)).background, 'rgb(255, 255, 255)', 'one session must not colour another');
@@ -224,7 +224,7 @@ test('set_user_agent changes navigator.userAgent AND the outgoing header, and su
   assert.equal(await evaluate<string>(sessionId, 'navigator.userAgent'), 'HarborageQA/1.0');
 
   // The wire, not just the JS object: the fixture echoes what the server saw.
-  await handlers.navigate({ sessionId, url: `${baseUrl}?again` });
+  await handlers.navigate({ sessionId, url: `${baseUrl}?again`, settleMs: 0 });
   const headers = await evaluate<{ userAgent: string; acceptLanguage: string }>(sessionId, 'window.__requestHeaders');
   assert.equal(headers.userAgent, 'HarborageQA/1.0', 'the override must reach the outgoing User-Agent header');
   assert.match(headers.acceptLanguage, /fr-FR/, 'acceptLanguage must reach the outgoing Accept-Language header');
@@ -276,7 +276,7 @@ test('set_timezone really moves the page clock offset, survives navigation, and 
   assert.equal(probe.tz, 'Asia/Tokyo');
   assert.equal(probe.offset, -540, 'the override must move real date arithmetic, not just the reported name');
 
-  await handlers.navigate({ sessionId, url: `${baseUrl}?tz` });
+  await handlers.navigate({ sessionId, url: `${baseUrl}?tz`, settleMs: 0 });
   assert.equal(
     await evaluate<string>(sessionId, 'Intl.DateTimeFormat().resolvedOptions().timeZone'),
     'Asia/Tokyo',
@@ -401,7 +401,7 @@ test('emulate_clock fast_forward fires a timer scheduled a minute out, with no r
   const installed = payload(await handlers.emulate_clock({ sessionId, action: 'install', time: '2024-03-01T10:00:00.000Z' }));
   assert.equal(installed.installed, true);
 
-  await handlers.navigate({ sessionId, url: baseUrl });
+  await handlers.navigate({ sessionId, url: baseUrl, settleMs: 0 });
   assert.match(
     await evaluate<string>(sessionId, 'new Date().toISOString()'),
     /^2024-03-01T10:00:00/,
@@ -455,7 +455,7 @@ test('emulate_clock set_fixed_time freezes Date, and a clock stays inside its ow
   const other = await freshSession();
 
   await handlers.emulate_clock({ sessionId, action: 'install', time: '2024-03-01T10:00:00.000Z' });
-  await handlers.navigate({ sessionId, url: baseUrl });
+  await handlers.navigate({ sessionId, url: baseUrl, settleMs: 0 });
 
   const body = payload(await handlers.emulate_clock({ sessionId, action: 'set_fixed_time', time: '2030-01-01T00:00:00.000Z' }));
   assert.match(String(body.pageTime), /^2030-01-01T00:00:00/);
@@ -507,7 +507,7 @@ test('send_cdp_command does not knock out a live user agent or timezone override
 test('a user agent override is scoped to its own tab, while a clock is scoped to the whole session', async () => {
   const { sessionId } = await sessions.createSession();
   await handlers.emulate_clock({ sessionId, action: 'install', time: '2024-03-01T10:00:00.000Z' });
-  await handlers.navigate({ sessionId, url: baseUrl });
+  await handlers.navigate({ sessionId, url: baseUrl, settleMs: 0 });
   await handlers.set_user_agent({ sessionId, userAgent: 'HarborageQA/4.0' });
 
   await evaluate(sessionId, `window.open(${JSON.stringify(baseUrl)}, '_blank')`);

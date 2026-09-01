@@ -74,7 +74,7 @@ test('a filtered read with clear removes only the entries it returned', async ()
 test('clearing one tab leaves another tab\'s buffer intact', async () => {
   const created = await handlers.create_session({});
   const { sessionId, pageId: first } = created.structuredContent as { sessionId: string; pageId: string };
-  const second = ((await handlers.new_tab({ sessionId })).structuredContent as { pageId: string }).pageId;
+  const second = ((await handlers.new_tab({ sessionId, settleMs: 0 })).structuredContent as { pageId: string }).pageId;
 
   await logInto(sessionId, first, 'first tab message');
   await logInto(sessionId, second, 'second tab message');
@@ -94,7 +94,7 @@ test('the same guarantee holds for network, dialog and page-error buffers', asyn
   const { sessionId } = created.structuredContent as { sessionId: string };
 
   // A real origin: `data:` URLs raise no network events at all.
-  await handlers.navigate({ sessionId, url: `${base}/start` });
+  await handlers.navigate({ sessionId, url: `${base}/start`, settleMs: 0 });
   await handlers.evaluate({
     sessionId,
     expression: `fetch("${base}/one").catch(() => {}), fetch("${base}/two").catch(() => {}), "ok"`

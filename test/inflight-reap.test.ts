@@ -70,7 +70,7 @@ test('a handler that throws still decrements the in-flight count, so its session
   // exception and returns an isError result carrying the numbered source, so
   // it no longer exercises the throwing path this test exists to cover.
   const deadPort = await getFreePort();
-  await assert.rejects(handlers.navigate({ sessionId, url: `http://127.0.0.1:${deadPort}/` }));
+  await assert.rejects(handlers.navigate({ sessionId, url: `http://127.0.0.1:${deadPort}/`, settleMs: 0 }));
 
   assert.equal(sessions.inFlightCount(sessionId), 0, 'a thrown handler must not leak an in-flight count');
 
@@ -103,11 +103,11 @@ test('in-flight tracking is per session: a busy session survives the sweep that 
     // The surviving session is a genuinely intact, still-isolated context:
     // what it writes stays inside it, and a session created afterwards sees
     // none of it.
-    await handlers.navigate({ sessionId: busy.sessionId, url: page.url });
+    await handlers.navigate({ sessionId: busy.sessionId, url: page.url, settleMs: 0 });
     await handlers.evaluate({ sessionId: busy.sessionId, expression: 'localStorage.setItem("survivor", "busy"), "ok"' });
 
     const other = await sessions.createSession();
-    await handlers.navigate({ sessionId: other.sessionId, url: page.url });
+    await handlers.navigate({ sessionId: other.sessionId, url: page.url, settleMs: 0 });
     const leaked = await handlers.evaluate({
       sessionId: other.sessionId,
       expression: 'localStorage.getItem("survivor")'

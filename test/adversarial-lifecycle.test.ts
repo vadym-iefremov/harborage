@@ -82,7 +82,7 @@ async function targetInfoOf(sessionId: string): Promise<{ targetId: string; brow
 
 test('send_cdp_command cannot enumerate the tabs of other sessions', async () => {
   const victim = await sessions.createSession();
-  await handlers.navigate({ sessionId: victim.sessionId, url: page.url });
+  await handlers.navigate({ sessionId: victim.sessionId, url: page.url, settleMs: 0 });
   const attacker = await sessions.createSession();
 
   const seen = await rawCdp(attacker.sessionId, 'Target.getTargets');
@@ -98,7 +98,7 @@ test('send_cdp_command cannot enumerate the tabs of other sessions', async () =>
 
 test('send_cdp_command cannot close a tab belonging to another session', async () => {
   const victim = await sessions.createSession();
-  await handlers.navigate({ sessionId: victim.sessionId, url: page.url });
+  await handlers.navigate({ sessionId: victim.sessionId, url: page.url, settleMs: 0 });
   const attacker = await sessions.createSession();
 
   const { targetId } = await targetInfoOf(victim.sessionId);
@@ -116,7 +116,7 @@ test('send_cdp_command cannot close a tab belonging to another session', async (
 
 test('send_cdp_command cannot inject a tab into another session', async () => {
   const victim = await sessions.createSession();
-  await handlers.navigate({ sessionId: victim.sessionId, url: page.url });
+  await handlers.navigate({ sessionId: victim.sessionId, url: page.url, settleMs: 0 });
   const attacker = await sessions.createSession();
 
   const { browserContextId } = await targetInfoOf(victim.sessionId);
@@ -431,7 +431,7 @@ test('resize reports whether the page agrees with the viewport it was given', as
     'data:text/html,<body style="height:5000px">tall enough to scroll</body>',
     'data:text/html,<html style="zoom:2"><body><h1>zoomed</h1></body></html>'
   ]) {
-    await handlers.navigate({ sessionId, url });
+    await handlers.navigate({ sessionId, url, settleMs: 0 });
     const payload = (await handlers.resize({ sessionId, width: 900, height: 700 })).structuredContent as {
       matched?: boolean;
       innerWidth: number;

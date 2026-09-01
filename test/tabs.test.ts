@@ -75,7 +75,7 @@ test('new_tab opens a tab, returns its pageId, navigates it, and makes it the ac
   const created = await handlers.create_session({});
   const { sessionId, pageId: firstPageId } = created.structuredContent as { sessionId: string; pageId: string };
 
-  const opened = await handlers.new_tab({ sessionId, url: `${base}?name=second` });
+  const opened = await handlers.new_tab({ sessionId, url: `${base}?name=second`, settleMs: 0 });
   const { pageId: secondPageId } = opened.structuredContent as { pageId: string };
 
   assert.notEqual(secondPageId, firstPageId, 'a new tab must get its own pageId');
@@ -95,7 +95,7 @@ test('a tab opened through new_tab has console and network buffering from the mo
   const created = await handlers.create_session({});
   const { sessionId } = created.structuredContent as { sessionId: string };
 
-  const opened = await handlers.new_tab({ sessionId, url: `${base}?name=buffered` });
+  const opened = await handlers.new_tab({ sessionId, url: `${base}?name=buffered`, settleMs: 0 });
   const { pageId } = opened.structuredContent as { pageId: string };
 
   // Nothing subscribed to this tab after the fact: the page logged and
@@ -120,7 +120,7 @@ test('a tab opened through new_tab has console and network buffering from the mo
 test('select_tab changes which tab a call that omits pageId targets', async () => {
   const created = await handlers.create_session({});
   const { sessionId, pageId: first } = created.structuredContent as { sessionId: string; pageId: string };
-  const opened = await handlers.new_tab({ sessionId });
+  const opened = await handlers.new_tab({ sessionId, settleMs: 0 });
   const { pageId: second } = opened.structuredContent as { pageId: string };
 
   assert.equal(await activePageId(sessionId), second);
@@ -139,9 +139,9 @@ test('close_tab closes one tab and leaves the session on a well-defined remainin
   const created = await handlers.create_session({});
   const { sessionId, pageId: first } = created.structuredContent as { sessionId: string; pageId: string };
   const second = (
-    (await handlers.new_tab({ sessionId })).structuredContent as { pageId: string }
+    (await handlers.new_tab({ sessionId, settleMs: 0 })).structuredContent as { pageId: string }
   ).pageId;
-  const third = ((await handlers.new_tab({ sessionId })).structuredContent as { pageId: string }).pageId;
+  const third = ((await handlers.new_tab({ sessionId, settleMs: 0 })).structuredContent as { pageId: string }).pageId;
 
   await handlers.close_tab({ sessionId, pageId: third });
 
@@ -178,7 +178,7 @@ test('close_tab refuses to close the last tab, naming what to do instead', async
 test('a tab the page opens itself still gets exactly one pageId, with its own buffers', async () => {
   const created = await handlers.create_session({});
   const { sessionId } = created.structuredContent as { sessionId: string };
-  await handlers.navigate({ sessionId, url: `${base}?name=opener` });
+  await handlers.navigate({ sessionId, url: `${base}?name=opener`, settleMs: 0 });
 
   await handlers.click({ sessionId, selector: '#pop' });
   // Both waits below are deliberately generous. Measured on an idle machine,

@@ -74,12 +74,18 @@ const LOOP_HTML = `<!doctype html>
 <script>location.replace('/loop');</script>
 </body></html>`;
 
-/** Refuses to leave. */
+/**
+ * Refuses to leave, but only once armed. Armed on demand because a page that
+ * always refuses cannot be navigated PAST, so the forward-direction case
+ * could not be set up at all against an unconditional one.
+ */
 const BEFOREUNLOAD_HTML = `<!doctype html>
 <html><head><title>Sticky</title></head><body>
 <div id="marker">sticky</div>
 <script>
+  window.__armed = false;
   window.addEventListener('beforeunload', function (e) {
+    if (!window.__armed) return;
     e.preventDefault();
     e.returnValue = 'stay';
     return 'stay';
@@ -186,7 +192,9 @@ function payload(result: unknown): Record<string, any> {
 
 async function sessionOn(path: string): Promise<string> {
   const { sessionId } = await sessions.createSession();
-  await handlers.navigate({ sessionId, url: `${baseUrl}${path}` });
+  // Setup, not the thing under test: no settle window needed to put a
+  // session on a page. Tests that exercise the settle pass the real one.
+  await handlers.navigate({ sessionId, url: `${baseUrl}${path}`, settleMs: 0 });
   return sessionId;
 }
 
@@ -219,7 +227,9 @@ for (const delay of [20, 50, 150, 300, 450]) {
     const sessionId = await sessionOn('/plain');
     const body = payload(await handlers.navigate({ sessionId, url: `${baseUrl}/late?ms=${delay}&to=/broken` }));
 
-    const truth = await settledTruth(sessionId, 900);
+    // Long enough past the fixture's own delay to prove the redirect really
+    // happened, without padding every case out to the slowest one.
+    const truth = await settledTruth(sessionId, delay + 350);
     assert.equal(truth.url, `${baseUrl}/broken`, 'the fixture must really have redirected');
     assert.equal(truth.title, 'Server error');
     assert.equal(served.filter(e => e.path === '/broken').at(-1)?.status, 500);
@@ -248,7 +258,7 @@ test('navigate discloses a pending meta refresh it could not wait out, rather th
   assert.equal(body.pendingNavigation.url, `${baseUrl}/broken`);
   assert.match(String(body.note), /meta refresh/i);
 
-  const truth = await settledTruth(sessionId, 1500);
+  const truth = await settledTruth(sessionId, 1300);
   assert.equal(truth.url, `${baseUrl}/broken`, 'the fixture really does move on, which is why the warning matters');
 
   await sessions.releaseSession(sessionId);
@@ -351,13 +361,69 @@ test('navigate_back into a page that tidies its own URL with replaceState is NOT
   await sessions.releaseSession(sessionId);
 });
 
+test('navigate_forward whose popstate handler calls location.replace is caught the same way the back case is', async () => {
+  // The third instance of the pattern that has bitten this project twice: a
+  // mechanism tested in one direction and assumed symmetric in the other.
+  // The entry-swap attack (location.replace, which moves the index exactly
+  // one the RIGHT way while swapping the destination underneath it) was only
+  // ever tested going back. This is the forward half, and it is written
+  // because assuming symmetry is precisely what let a go(-2) back step slip
+  // through the forward test written for it a round ago.
+  const sessionId = await sessionOn('/spa');
+  await evaluate(sessionId, "history.pushState({}, '', '/spa#list')");
+  await evaluate(sessionId, "history.pushState({}, '', '/spa#detail')");
+
+  const back = payload(await handlers.navigate_back({ sessionId }));
+  assert.equal(back.navigated, true, 'the setup back step must itself be clean');
+  assert.equal(back.url, `${baseUrl}/spa#list`);
+
+  await evaluate(sessionId, "window.__mode = 'replace'");
+  const before = await realHistory(sessionId);
+  const body = payload(await handlers.navigate_forward({ sessionId }));
+
+  const truth = await settledTruth(sessionId, 400);
+  const history = await realHistory(sessionId);
+  assert.equal(truth.title, 'LOGIN PAGE', 'the guard must really have loaded a whole new document');
+  assert.equal(
+    history.index,
+    before.index + 1,
+    'the index still moves exactly one FORWARD, which is why a direction check alone cannot see this'
+  );
+
+  assert.equal(body.navigated, false, 'the caller did not get the entry they asked for');
+  assert.equal(body.url, truth.url);
+  assert.equal(body.title, truth.title);
+  assert.equal(body.sameDocument, false);
+  assert.match(String(body.note), /aimed|guard|intercept|blocked|instead/i);
+
+  await sessions.releaseSession(sessionId);
+});
+
+test('navigate_forward blocked by a beforeunload handler reports a blocked step too', async () => {
+  const sessionId = await sessionOn('/a');
+  await handlers.navigate({ sessionId, url: `${baseUrl}/sticky`, settleMs: 0 });
+  await handlers.navigate({ sessionId, url: `${baseUrl}/plain`, settleMs: 0 });
+  // Back to /sticky first, while it is still unarmed, so there is a real
+  // forward entry to be refused.
+  await handlers.navigate_back({ sessionId, settleMs: 0 });
+  await evaluate(sessionId, 'window.__armed = true');
+
+  const started = Date.now();
+  const body = payload(await handlers.navigate_forward({ sessionId, timeoutMs: 1500 }));
+  assert.ok(Date.now() - started < 15000, 'the call must not hang for the full Playwright default');
+  assert.equal(body.navigated, false);
+  assert.match(String(body.note), /beforeunload|refus|block|did not finish/i);
+
+  await sessions.releaseSession(sessionId);
+});
+
 // ---------------------------------------------------------------------------
 // 3. Direction is not enough: magnitude and destination matter.
 // ---------------------------------------------------------------------------
 
 test('navigate_back whose guard overshoots two extra entries is not a clean single back step', async () => {
   const sessionId = await sessionOn('/a');
-  await handlers.navigate({ sessionId, url: `${baseUrl}/spa` });
+  await handlers.navigate({ sessionId, url: `${baseUrl}/spa`, settleMs: 0 });
   await evaluate(sessionId, "history.pushState({}, '', '/spa#one')");
   await evaluate(sessionId, "history.pushState({}, '', '/spa#two')");
   await evaluate(sessionId, "window.__mode = 'overshoot'");
@@ -418,7 +484,7 @@ for (const [route, label] of [['/router', 'replaceState'], ['/pushrouter', 'push
 test('navigate to a page that redirects to itself forever reports what it found instead of throwing a raw timeout', async () => {
   const sessionId = await sessionOn('/plain');
   const started = Date.now();
-  const body = payload(await handlers.navigate({ sessionId, url: `${baseUrl}/loop`, timeoutMs: 2000 }));
+  const body = payload(await handlers.navigate({ sessionId, url: `${baseUrl}/loop`, timeoutMs: 1200 }));
   const elapsed = Date.now() - started;
 
   assert.ok(elapsed < 15000, `the call must not hang: took ${elapsed}ms`);
@@ -435,15 +501,38 @@ test('navigate to a page that redirects to itself forever reports what it found 
 
 test('navigate_back blocked by a beforeunload handler reports a blocked step, not a raw Playwright timeout', async () => {
   const sessionId = await sessionOn('/a');
-  await handlers.navigate({ sessionId, url: `${baseUrl}/sticky` });
+  await handlers.navigate({ sessionId, url: `${baseUrl}/sticky`, settleMs: 0 });
+  await evaluate(sessionId, 'window.__armed = true');
 
   const started = Date.now();
-  const body = payload(await handlers.navigate_back({ sessionId, timeoutMs: 3000 }));
+  const body = payload(await handlers.navigate_back({ sessionId, timeoutMs: 1500 }));
   const elapsed = Date.now() - started;
 
   assert.ok(elapsed < 15000, `the call must not hang for the full Playwright default: took ${elapsed}ms`);
   assert.equal(body.navigated, false, 'a step the page refused is a blocked step');
   assert.match(String(body.note), /beforeunload|refus|block|did not finish/i);
+
+  await sessions.releaseSession(sessionId);
+});
+
+test('navigate away from a page that refuses to leave reports a blocked navigation, not a raw ERR_ABORTED', async () => {
+  // Found while writing the forward-direction beforeunload test above: the
+  // setup for it could not even be built, because navigating AWAY from an
+  // armed beforeunload page rejected with "page.goto: net::ERR_ABORTED".
+  // Same situation as the history-step case, a different tool, and a raw
+  // Playwright error either way.
+  const sessionId = await sessionOn('/a');
+  await handlers.navigate({ sessionId, url: `${baseUrl}/sticky`, settleMs: 0 });
+  await evaluate(sessionId, 'window.__armed = true');
+
+  const body = payload(await handlers.navigate({ sessionId, url: `${baseUrl}/plain`, settleMs: 0 }));
+
+  const live = await evaluate<string>(sessionId, 'location.href');
+  assert.equal(live, `${baseUrl}/sticky`, 'the page really did refuse to leave');
+  assert.equal(body.blocked, true, 'a refusal is a fact about the page and belongs in the payload');
+  assert.equal(body.url, live, 'the payload must describe where the tab really is');
+  assert.match(String(body.note), /beforeunload|abandoned|did not move/i);
+  assert.equal(body.status, null, 'nothing was fetched, so there is no status to report');
 
   await sessions.releaseSession(sessionId);
 });
@@ -454,8 +543,8 @@ test('navigate_back blocked by a beforeunload handler reports a blocked step, no
 
 test('two navigate_back calls issued at once queue instead of tearing each other down', async () => {
   const sessionId = await sessionOn('/a');
-  await handlers.navigate({ sessionId, url: `${baseUrl}/plain` });
-  await handlers.navigate({ sessionId, url: `${baseUrl}/spa` });
+  await handlers.navigate({ sessionId, url: `${baseUrl}/plain`, settleMs: 0 });
+  await handlers.navigate({ sessionId, url: `${baseUrl}/spa`, settleMs: 0 });
 
   const before = await realHistory(sessionId);
   const results = await Promise.allSettled([
@@ -499,6 +588,48 @@ test('two navigate calls and two reloads issued at once queue instead of abortin
     ['fulfilled', 'fulfilled'],
     `neither reload may reject: ${reloadResults.map(r => (r.status === 'rejected' ? String(r.reason) : 'ok')).join(' | ')}`
   );
+
+  await sessions.releaseSession(sessionId);
+});
+
+// ---------------------------------------------------------------------------
+// The third instance of the missed-sibling pattern, found by hunting for it
+// rather than being told: new_tab navigates too, and reported page.url() read
+// immediately after its goto.
+// ---------------------------------------------------------------------------
+
+test('new_tab opened on a shell that redirects late reports the document it really landed on', async () => {
+  const { sessionId } = await sessions.createSession();
+  const opened = payload(await handlers.new_tab({ sessionId, url: `${baseUrl}/late?ms=150&to=/broken` }));
+
+  const truth = {
+    url: await evaluate<string>(sessionId, 'location.href'),
+    title: await evaluate<string>(sessionId, 'document.title')
+  };
+  assert.equal(truth.url, `${baseUrl}/broken`, 'the fixture must really have redirected');
+  assert.equal(served.filter(e => e.path === '/broken').at(-1)?.status, 500);
+
+  assert.equal(opened.url, truth.url, 'new_tab must report where the tab really ended up, not where it was pointed');
+  assert.equal(opened.title, truth.title);
+  assert.equal(opened.status, 500, 'opening a tab on a bouncing shell must not look like an ordinary success');
+  assert.equal(opened.ok, false);
+  assert.ok(opened.documentChanged);
+  assert.equal(typeof opened.pageId, 'string');
+
+  await sessions.releaseSession(sessionId);
+});
+
+test('new_tab opened on a 404 reports the 404, and a blank new_tab reports no status at all', async () => {
+  const { sessionId } = await sessions.createSession();
+  const missing = payload(await handlers.new_tab({ sessionId, url: `${baseUrl}/broken` }));
+  assert.equal(missing.status, 500);
+  assert.equal(missing.ok, false);
+  assert.equal(missing.documentChanged, undefined);
+
+  const blank = payload(await handlers.new_tab({ sessionId }));
+  assert.equal(typeof blank.pageId, 'string');
+  assert.equal(blank.status, undefined, 'nothing was fetched, so there is no status to report');
+  assert.equal(blank.documentChanged, undefined);
 
   await sessions.releaseSession(sessionId);
 });

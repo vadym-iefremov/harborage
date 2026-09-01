@@ -147,7 +147,7 @@ after(async () => {
 
 async function freshSession(): Promise<string> {
   const { sessionId } = await sessions.createSession();
-  await handlers.navigate({ sessionId, url: baseUrl });
+  await handlers.navigate({ sessionId, url: baseUrl, settleMs: 0 });
   return sessionId;
 }
 
@@ -397,7 +397,7 @@ test('wheel reports a clean pass and a real scroll for an unoccluded scrollable 
 test('a call with an explicit pageId does not change what a later call omitting pageId targets', async () => {
   const created = await handlers.create_session({});
   const { sessionId, pageId: first } = payload(created) as { sessionId: string; pageId: string };
-  const opened = payload(await handlers.new_tab({ sessionId }));
+  const opened = payload(await handlers.new_tab({ sessionId, settleMs: 0 }));
   const second = opened.pageId as string;
 
   // new_tab makes the new tab active, matching what select_tab documents.
