@@ -1094,7 +1094,10 @@ export const inspectTools = defineTools({
   read_console: defineTool({
     description:
       'Read buffered browser console messages for a session (optionally filtered to one tab). Buffering starts at ' +
-      'create_session, so this returns history, not just future messages. The buffer is bounded ' +
+      'create_session and covers every tab the session ever has, including one a page opened itself, from that ' +
+      'tab\'s first line of script, so this returns history and not just future messages. The one thing it does ' +
+      'not carry is console output from a service worker, which belongs to no tab and so has no pageId to be read ' +
+      'back under. The buffer is bounded ' +
       '(HARBORAGE_CONSOLE_BUFFER_SIZE, 200 by default) and drops the oldest messages once full. Every result ' +
       'reports total (messages currently in the buffer), returned (messages this call\'s filters matched) and ' +
       'dropped (messages the buffer has evicted since it was last fully cleared). total: 200, returned: 0, ' +
@@ -1169,7 +1172,10 @@ export const inspectTools = defineTools({
   list_network_requests: defineTool({
     description:
       'List buffered network requests and responses for a session (optionally filtered to one tab). Buffering ' +
-      'starts at create_session, and the buffer is bounded (HARBORAGE_NETWORK_BUFFER_SIZE, 400 by default): once ' +
+      'starts at create_session and covers every tab the session ever has, including one a page opened itself, ' +
+      'from that tab\'s own first request for its own document. Traffic a service worker generated on nobody\'s ' +
+      'behalf is not listed, because it belongs to no tab and so has no pageId to be read back under. ' +
+      'The buffer is bounded (HARBORAGE_NETWORK_BUFFER_SIZE, 400 by default): once ' +
       'it is full the oldest entries are dropped. Every result reports total (entries currently in the buffer), ' +
       'returned (entries this call\'s filters matched) and dropped (entries evicted from the buffer since it was ' +
       'last fully cleared). total: 400, returned: 0, dropped: 0 means the filter genuinely matched nothing that is ' +
