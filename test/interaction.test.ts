@@ -536,12 +536,22 @@ test('type into a rich editor inserts at the caret, and fill is the way to repla
   await sessions.releaseSession(sessionId);
 });
 
-test('fill refuses to select-all when the target never took focus', async () => {
+test('fill refuses to select-all against a plain div that cannot hold text', async () => {
   const sessionId = await freshSession();
 
-  // A plain div cannot take focus, so a select-all pressed against it would
+  // A plain div holds no typed text, so a select-all pressed against it would
   // scope to the whole document and the following delete would empty the page.
-  await assert.rejects(() => handlers.fill({ sessionId, selector: '#outside', value: 'nope' }), /focus/i);
+  //
+  // The assertion used to match /focus/i, because refusing was the job of a
+  // guard that ran AFTER locator.focus() and asked whether focus had landed on
+  // or inside the target. That guard is gone: "inside" was the hole that let a
+  // fill aimed at a wrapper write into its focused child. The refusal now
+  // happens earlier and for the stronger reason, so the message names what the
+  // element is rather than where focus went, and this matches that instead.
+  await assert.rejects(
+    () => handlers.fill({ sessionId, selector: '#outside', value: 'nope' }),
+    /cannot receive text/i
+  );
 
   assert.equal(
     await evaluate(sessionId, "document.getElementById('outside').textContent"),
