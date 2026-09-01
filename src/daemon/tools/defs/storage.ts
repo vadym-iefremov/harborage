@@ -731,8 +731,8 @@ export const storageTools = defineTools({
             'cookie it refuses instead of replacing what is there, so a refused overwrite leaves the previous value ' +
             'live.' +
             (unchanged.length > 0
-              ? ` ${unchanged.join(', ')} still hold exactly what the jar held before this call, so treat this ` +
-                'session as carrying the old cookie.'
+              ? ` ${unchanged.join(', ')} ${unchanged.length === 1 ? 'still holds' : 'still hold'} exactly what the ` +
+                'jar held before this call, so treat this session as carrying the old cookie.'
               : '') +
             ' Note that expires is not part of this comparison: Chromium rounds it and caps it at 400 days, so an ' +
             'accepted cookie routinely stores an expiry different from the one requested.'
