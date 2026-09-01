@@ -80,12 +80,31 @@ function levenshtein(a: string, b: string): number {
   return distances[a.length][b.length];
 }
 
-/** How close a misspelled key has to be to a real one before it is worth guessing at, rather than left unexplained. */
+/** The most a suggestion may ever differ from the key it is guessing at, however long both are. */
 const maxSuggestionDistance = 3;
 
+/**
+ * Picks the real parameter a misspelled key probably meant, or nothing when
+ * no candidate is close enough to be worth saying out loud.
+ *
+ * The budget scales with the shorter of the two names, and this matters far
+ * more at depth than it did at the top level. A flat distance of 3 is a
+ * reasonable guess against names like "timeoutMs", where three edits still
+ * leaves most of the word intact, and nonsense against the short names
+ * nested shapes are full of: with a flat budget, `{ ttl: 60 }` in a cookie
+ * confidently suggested "url" and `{ top: 0 }` in a clip region suggested
+ * "x", neither of which shares so much as a first letter. Measured across
+ * nested keys, most suggestions were that bad. A confidently wrong
+ * suggestion is worse than no suggestion: it sends a caller to rename a
+ * field rather than to look up which field they actually wanted.
+ *
+ * Half the shorter name, capped at 3. "timeout" to "timeoutMs" is 2 edits
+ * against a budget of 3 and still suggested; "ttl" to "url" is 2 against a
+ * budget of 1 and is not.
+ */
 function closestValidKey(key: string, validKeys: string[]): string | undefined {
   let best: string | undefined;
-  let bestDistance = maxSuggestionDistance + 1;
+  let bestDistance = Number.POSITIVE_INFINITY;
   for (const candidate of validKeys) {
     const distance = levenshtein(key, candidate);
     if (distance < bestDistance) {
@@ -93,7 +112,9 @@ function closestValidKey(key: string, validKeys: string[]): string | undefined {
       bestDistance = distance;
     }
   }
-  return bestDistance <= maxSuggestionDistance ? best : undefined;
+  if (best === undefined) return undefined;
+  const budget = Math.min(maxSuggestionDistance, Math.floor(Math.min(key.length, best.length) / 2));
+  return bestDistance <= budget ? best : undefined;
 }
 
 /** How a nested path is written back to a caller: `cookies[0].maxAge` rather than `cookies,0,maxAge`. */
