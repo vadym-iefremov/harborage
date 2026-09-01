@@ -167,19 +167,29 @@ test('drag treats a hit on a descendant of the named element as a clean pass', a
   await sessions.releaseSession(sessionId);
 });
 
-test('drag treats a hit on an ancestor of the named element as a clean pass', async () => {
+test('drag reports a hit that landed on an ancestor of the named element as a miss, and says it was an ancestor', async () => {
   const sessionId = await freshSession();
 
-  // #ancestorChild has pointer-events:none, so the browser's own hit test skips it and
-  // hands the point straight to #ancestorParent. The selector still names a real, sensible
-  // thing to press: a node nested inside the element that actually receives the gesture.
+  // This test used to assert the opposite, and it was wrong. #ancestorChild has
+  // pointer-events: none, so the browser's own hit test skips it and hands the point to
+  // #ancestorParent: a real pointerdown here never runs a single listener on #ancestorChild,
+  // which is exactly what the caller asked about. Round 2 accepted it because the predicate
+  // also allowed hit.contains(el), and that clause is what made <body>, <html> and every
+  // container on the page count as a clean hit on anything inside them. round3-pointer.test.ts
+  // proves the corrected answer against a real pointerdown listener on the element itself.
   const body = payload(
     await handlers.drag({ sessionId, source: { selector: '#ancestorChild' }, target: { x: 300, y: 300 }, steps: 5 })
   );
 
-  assert.equal(body.sourceHit.matchesTarget, true, 'a hit on an ancestor of the target is still a hit on the target');
-  assert.equal(body.sourceHit.elementAtPoint, null);
-  assert.equal(body.matched, true);
+  assert.equal(body.sourceHit.matchesTarget, false, 'the press provably goes to the parent, so this is not a hit on the child');
+  assert.equal(body.sourceHit.elementAtPoint.id, 'ancestorParent', 'what really received the press has to be named');
+  assert.equal(
+    body.sourceHit.elementAtPoint.containsTarget,
+    true,
+    'an ancestor taking the press is a different diagnosis from an overlay taking it, and the caller cannot tell from a tag name'
+  );
+  assert.equal(body.matched, false);
+  assert.match(String(body.note), /ANCESTOR/, 'the note has to give the remedy for this shape, not the z-index advice for an overlay');
 
   await sessions.releaseSession(sessionId);
 });

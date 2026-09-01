@@ -266,6 +266,29 @@ interface ProbeElement {
   // Present (possibly null, for a closed root) on any element that is
   // itself a shadow host. Absent entirely on one that is not.
   shadowRoot?: { elementFromPoint?(x: number, y: number): ProbeElement | null } | null;
+  // The three members topmostAtCentre's flattened-tree walk climbs by.
+  // assignedSlot is what makes slotted content work: a light-DOM node
+  // distributed into a <slot> is painted inside the shadow tree, so its
+  // flattened parent is that slot, while its DOM parentNode stays the host.
+  // See the matching members on ShadowDrillElement in interaction.ts.
+  assignedSlot?: FlatNode | null;
+  parentNode?: FlatNode | null;
+  nodeType?: number;
+}
+
+/**
+ * One step of the flattened tree: an element, a ShadowRoot, or the Document.
+ *
+ * Not an element type, because the walk genuinely passes through nodes that
+ * are not elements. A ShadowRoot reports nodeType 11 and carries a host to
+ * step out through; a Document reports 9 and carries neither, which is where
+ * the walk stops. The twin of FlatNode in interaction.ts.
+ */
+interface FlatNode {
+  nodeType?: number;
+  host?: FlatNode | null;
+  assignedSlot?: FlatNode | null;
+  parentNode?: FlatNode | null;
 }
 
 declare const document: {
@@ -1400,18 +1423,35 @@ export const inspectTools = defineTools({
       'the coordinates are relative to that frame\'s own viewport, not the page\'s. ' +
       'visible is Chromium\'s own checkVisibility (so an ancestor being display:none counts) plus a non-zero box, ' +
       'and hiddenReasons says which test failed rather than leaving you to guess. topmostAtCentre is a HIT TEST, ' +
-      'not a paint test: false means something else would receive a click there, and occludedBy names it, which is ' +
-      'how a fully transparent overlay that swallows clicks gets caught. The mirror case is the one to watch: an ' +
+      'not a paint test: it asks whether a real click at the point would reach this element, by checking it ' +
+      'against the COMPOSED PATH of whatever is really topmost there, which is the path a click event actually ' +
+      'propagates along. false means something else would receive the click, and occludedBy names it, which is how ' +
+      'a fully transparent overlay that swallows clicks gets caught. The mirror case is the one to watch: an ' +
       'opaque overlay with pointer-events: none completely hides an element on screen while this still reports ' +
-      'topmostAtCentre true and occludedBy null, correctly, because the click does reach through it. The hit test ' +
-      'accounts for shadow DOM: an element inside an open or closed shadow root that is genuinely unoccluded ' +
-      'reports topmostAtCentre true and occludedBy null, not the shadow host, because the point is re-tested ' +
-      'against the shadow root itself rather than trusted at the host it retargets to first. An actual overlay ' +
-      'sitting on top of that element inside the same shadow root is still caught, at whatever nesting depth of ' +
-      'shadow roots it is at. For "is it actually visible to a human", take a screenshot. ' +
+      'topmostAtCentre true and occludedBy null, correctly, because the click does reach through it. For "is it ' +
+      'actually visible to a human", take a screenshot. ' +
+      'Read the asymmetry carefully: an ANCESTOR of the element that takes the click is on the composed path and ' +
+      'counts as a clean hit (a <button> whose centre is painted by its own inline label), while a DESCENDANT of ' +
+      'it is not. So an element inside a container that takes the click is NOT topmost, even though the container ' +
+      'contains it. occludedBy says which of the two it is with "containsTarget": true means the thing taking the ' +
+      'click is your element\'s own ancestor, so the point is inside your element\'s box but outside anything it ' +
+      'hit-tests. That is what pointer-events: none, visibility: hidden, a ::before or ::after scrim painted by a ' +
+      'wrapper, a clip-path or border-radius cut-out, and a wrapped inline whose box centre falls between its line ' +
+      'boxes all look like, and none of them are fixed by moving an overlay or changing a z-index. ' +
+      'The hit test accounts for shadow DOM in both directions: an element inside an open or closed shadow root ' +
+      'that is genuinely unoccluded reports topmostAtCentre true and occludedBy null rather than naming its own ' +
+      'host; a shadow HOST reports true when the click lands on its own shadow content, because the host is on ' +
+      'that content\'s composed path; a shadow-tree wrapper reports true when the click lands on light-DOM ' +
+      'children slotted into it, which no amount of DOM containment could ever see. An actual overlay sitting on ' +
+      'top of an element inside the same shadow root is still caught, at whatever nesting depth of shadow roots ' +
+      'it is at. ' +
       'The point tested comes back as hitTestPoint, with hitTestPointIsCentre alongside it, because an element ' +
-      'whose centre falls outside the viewport is tested at the nearest point inside it instead: without that, ' +
-      'occludedBy could name something sitting nowhere near the middle of the element. ' +
+      'whose centre falls outside the viewport is tested at the nearest point inside it instead. When that point ' +
+      'misses, nothing follows from it: topmostAtCentre is null, occludedBy stays null, and ' +
+      'topmostUnknownReason says why and what to do (scroll it into view, then ask again). Reporting whatever ' +
+      'unrelated element happens to sit at the clamped point as an occluder would be a fabricated diagnosis with ' +
+      'a remedy that cannot work. topmostUnknownReason is also filled in when no hit test ran at all, because the ' +
+      'element is not visible or is entirely outside the viewport. ' +
       'What it does NOT do: it never waits. A selector whose element has not rendered yet comes back as ' +
       'matched: 0, not as a timeout, so settle the page first. It hit-tests one point, so an element covered only ' +
       'at its edges still reports topmostAtCentre true. It does not tell you what an element looks like: use ' +
@@ -1508,54 +1548,42 @@ export const inspectTools = defineTools({
                   const inViewport = coverage > 0;
 
                   let topmostAtCentre: boolean | null = null;
-                  let occludedBy: { tagName: string; id: string; classes: string | null } | null = null;
+                  let occludedBy: { tagName: string; id: string; classes: string | null; containsTarget: boolean } | null = null;
                   let hitTestPoint: { x: number; y: number } | null = null;
                   let hitTestPointIsCentre: boolean | null = null;
-                  if (inViewport && visible) {
+                  let topmostUnknownReason: string | null = null;
+                  if (!inViewport || !visible) {
+                    topmostUnknownReason =
+                      'No hit test was run: the element is ' +
+                      (!visible ? 'not visible' : 'entirely outside the viewport') +
+                      ', so there is no point on screen where a click could reach it. Fix that first, then ask again.';
+                  } else {
                     // Clamped into the viewport, because elementFromPoint answers
                     // null outside it. That means the point tested is NOT the
-                    // centre whenever the centre is off screen, and an unrelated
-                    // element sitting at the clamped point would otherwise be
-                    // reported as occluding this one under a field called
-                    // topmostAtCentre. Both the point and the fact that it moved
-                    // are reported for that reason.
+                    // centre whenever the centre is off screen, which is why both
+                    // the point and the fact that it moved are reported, and why a
+                    // FAILED hit test at a clamped point is not reported as
+                    // occlusion at all: whatever sits at the nearest on-screen
+                    // point is very likely nowhere near the element and has no
+                    // bearing on whether the element is clickable. See below.
                     const trueX = rect.left + rect.width / 2;
                     const trueY = rect.top + rect.height / 2;
                     const centreX = Math.min(Math.max(trueX, 0), window.innerWidth - 1);
                     const centreY = Math.min(Math.max(trueY, 0), window.innerHeight - 1);
                     hitTestPoint = { x: Math.round(centreX * 100) / 100, y: Math.round(centreY * 100) / 100 };
                     hitTestPointIsCentre = centreX === trueX && centreY === trueY;
-                    // document.elementFromPoint retargets into the shadow host for
-                    // ANYTHING inside a shadow tree, open or closed, and
-                    // Node.contains() does not cross that boundary the other way:
-                    // confirmed directly against real Chromium, a shadow host does
-                    // not contain() its own shadow content, because a node's parent
-                    // inside a shadow tree is the shadow root, not the host. So a
-                    // plain unoccluded <button> inside an open shadow root, nothing
-                    // on top of it, came back with hit equal to its own host
-                    // <div id="host">, topmostAtCentre false and occludedBy naming
-                    // the host, a fabricated overlay on every web component on the
-                    // page. Loosening the check to also accept hit.contains(element)
-                    // would not have rescued that case either, for the same reason:
-                    // it still needs hit to actually BE (an ancestor of) element,
-                    // and the host never is. What actually fixes it is recovering
-                    // the real topmost node so the comparison has something true to
-                    // find, which is also what keeps a real overlay honest: an
-                    // overlay sitting on top of the element inside the SAME shadow
-                    // root drills down to become `hit` itself, a SIBLING of
-                    // element, not an ancestor, so it still fails every comparison
-                    // and is reported as the occluder. ShadowRoot.elementFromPoint,
-                    // unlike Document's, does not retarget, so re-querying the same
-                    // point against
-                    // hit.shadowRoot recovers what is actually topmost inside the
-                    // shadow tree, and repeating it handles shadow roots nested in
-                    // shadow roots. hitTestPointerPoint in interaction.ts (drag and
-                    // wheel's hit test) runs the identical drill for the identical
-                    // reason; kept as a second copy rather than a shared helper
-                    // because both run as in-page snippets under a tsconfig with no
-                    // dom lib, each with its own minimal element shim, so sharing
-                    // would cost more than it saves. If one changes, change the
-                    // other.
+
+                    // Step one: the true topmost node at the point.
+                    // document.elementFromPoint retargets to the shadow HOST for
+                    // anything inside a shadow tree, open or closed, so on its own
+                    // it never names what is really there: a plain unoccluded
+                    // <button> inside an open shadow root came back as its own
+                    // host. ShadowRoot.elementFromPoint does not retarget, so
+                    // re-querying the same point against hit.shadowRoot recovers
+                    // the real node, and repeating it handles shadow roots nested
+                    // in shadow roots. A closed root reports shadowRoot null, so
+                    // the drill stops at the host, which is the honest answer:
+                    // nothing outside can see into a closed root.
                     let hit = document.elementFromPoint(centreX, centreY);
                     let shadowDrillDepth = 0;
                     while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function' && shadowDrillDepth < 20) {
@@ -1564,13 +1592,90 @@ export const inspectTools = defineTools({
                       hit = deeper;
                       shadowDrillDepth += 1;
                     }
-                    if (hit) {
-                      topmostAtCentre = hit === element || element.contains(hit) || hit.contains(element);
-                      if (!topmostAtCentre) {
+
+                    if (!hit) {
+                      topmostUnknownReason =
+                        'elementFromPoint found nothing at the point tested, which normally means the page has no ' +
+                        'document element laid out there at all. Nothing can be concluded about occlusion from that.';
+                    } else {
+                      // Step two: climb the flattened tree from that node, which is
+                      // the path a real pointerdown propagates along, and look for
+                      // this element on it. That is the browser's own answer to
+                      // "would a click here reach this element", rather than an
+                      // approximation of it.
+                      //
+                      // The predicate this replaced asked hit === element ||
+                      // element.contains(hit) || hit.contains(element), and the
+                      // last of those three is backwards. An ANCESTOR of the hit
+                      // node is on the composed path and does match; a DESCENDANT
+                      // of it is not and must not. hit.contains(element) accepted
+                      // descendants, so <body> and <html> matched every element on
+                      // the page, and any container an element sits inside counted
+                      // as a clean hit on the element: a button under its own
+                      // wrapper's ::after scrim, a visibility: hidden element, a
+                      // pointer-events: none element, a clip-path cut-out and a
+                      // wrapped inline all reported topmostAtCentre true while a
+                      // real click provably went to the ancestor instead.
+                      //
+                      // The walk also fixes both shadow directions. Targeting a
+                      // shadow HOST used to fail, because the drill descends past
+                      // it into its own shadow content, which contains() cannot
+                      // reach from outside; the host is on the composed path of its
+                      // shadow content, so it matches now, with no "stop the drill
+                      // at the element" special case. Slotted content is the same
+                      // bug mirrored: a shadow-tree wrapper painting around light
+                      // DOM it slots in IS on the composed path of a press on that
+                      // content, but the slotted node's parentNode is the host, not
+                      // the wrapper. assignedSlot is tried FIRST for exactly that
+                      // reason, and the order matters: checking parentNode first
+                      // walks straight out to the host and skips every shadow-tree
+                      // element that paints around the slotted node. The nodeType
+                      // 11 step is the shadow root itself, which is not an element
+                      // and has no parent of its own; hopping to its host carries
+                      // the walk back out into the light DOM.
+                      //
+                      // hitTestPointerPoint in interaction.ts (drag and wheel's hit
+                      // test) runs the identical two steps for the identical
+                      // reason; kept as a second copy rather than a shared helper
+                      // because both run as in-page snippets under a tsconfig with
+                      // no dom lib, each with its own minimal element shim, so
+                      // sharing would cost more than it saves. If one changes,
+                      // change the other.
+                      let onComposedPath = false;
+                      let node: FlatNode | null = hit as FlatNode;
+                      let steps = 0;
+                      while (node && steps < 200) {
+                        if ((node as unknown) === (element as unknown)) {
+                          onComposedPath = true;
+                          break;
+                        }
+                        node = node.assignedSlot ?? (node.nodeType === 11 ? (node.host ?? null) : (node.parentNode ?? null));
+                        steps += 1;
+                      }
+
+                      if (onComposedPath) {
+                        topmostAtCentre = true;
+                      } else if (hitTestPointIsCentre === false) {
+                        // The point tested is NOT the element's centre, so a miss
+                        // here says nothing about the element. Reporting it as
+                        // occlusion, and naming whatever unrelated thing happens to
+                        // sit at the clamped point as the occluder, was a fabricated
+                        // diagnosis with a remedy that could not possibly work.
+                        topmostUnknownReason =
+                          'The element\'s centre is outside the viewport, so the hit test ran at the nearest point ' +
+                          'inside it instead (see hitTestPoint), and that point missed the element. Nothing follows ' +
+                          'from that about whether anything is covering it: the point is somewhere else. Scroll the ' +
+                          'element into view first, then ask again for an answer that means something.';
+                      } else {
+                        topmostAtCentre = false;
                         occludedBy = {
                           tagName: String(hit.tagName).toLowerCase(),
                           id: hit.id || '',
-                          classes: hit.getAttribute('class')
+                          classes: hit.getAttribute('class'),
+                          // An ancestor of this element taking the click is a
+                          // different diagnosis from an overlay taking it, and the
+                          // caller cannot tell them apart from a tag name.
+                          containsTarget: hit.contains(element)
                         };
                       }
                     }
@@ -1604,6 +1709,7 @@ export const inspectTools = defineTools({
                     hiddenReasons,
                     topmostAtCentre,
                     occludedBy,
+                    topmostUnknownReason,
                     hitTestPoint,
                     hitTestPointIsCentre,
                     position: style.getPropertyValue('position'),

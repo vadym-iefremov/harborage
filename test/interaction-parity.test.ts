@@ -317,7 +317,11 @@ test('drag moves a pointer-driven canvas node to a raw viewport point', async ()
   assert.equal(drops.length, 1, 'the gesture must end with a real pointerup, or nothing is ever committed');
   assert.ok(drops[0]!.moves > 1, 'a canvas drag needs more than one intermediate move');
 
-  assert.deepEqual(body.source, { selector: '#node', x: 80, y: 60 }, 'drag should report where it really pressed');
+  assert.deepEqual(
+    body.source,
+    { selector: '#node', x: 80, y: 60, matchedElements: 1 },
+    'drag should report where it really pressed, and how many elements the selector matched: a unique selector says 1 rather than saying nothing'
+  );
   assert.deepEqual(body.target, { x: 300, y: 200 }, 'drag should report where it really released');
   assert.equal(body.nativeDrag, false, 'a pointer-driven canvas must not be run as a native HTML5 drag');
 
@@ -351,8 +355,8 @@ test('drag takes a selector plus an offset for the source and a selector for the
     })
   );
 
-  assert.deepEqual(body.source, { selector: '#node', x: 45, y: 45 });
-  assert.deepEqual(body.target, { selector: '#slot', x: 450, y: 280 });
+  assert.deepEqual(body.source, { selector: '#node', x: 45, y: 45, matchedElements: 1 });
+  assert.deepEqual(body.target, { selector: '#slot', x: 450, y: 280, matchedElements: 1 });
 
   assert.equal(await evaluate(sessionId, "document.getElementById('node').offsetLeft"), 445);
   assert.equal(await evaluate(sessionId, "document.getElementById('node').offsetTop"), 275);
@@ -742,7 +746,7 @@ test('wheel scrolls the container under the point and reports the scroll it caus
   const after = body.scroll as { after: { target?: { id: string; y: number } } };
   assert.equal(after.after.target?.id, 'box', 'the readback must name what actually scrolled');
   assert.equal(after.after.target?.y, scrollTop, 'the reported offset must be the real one');
-  assert.deepEqual(body.point, { selector: '#box', x: 120, y: 95 });
+  assert.deepEqual(body.point, { selector: '#box', x: 120, y: 95, matchedElements: 1 });
   assert.equal(body.totalDeltaY, 200);
 
   await sessions.releaseSession(sessionId);
