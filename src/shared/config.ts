@@ -101,8 +101,31 @@ export interface Config {
   sweepIntervalMs: number;
   /**
    * Minimum daemon uptime before an empty client registry is allowed to
-   * trigger self-shutdown. Guards against a race where the very first sweep
-   * fires before the client that just spawned the daemon has registered.
+   * trigger self-shutdown, measured from the moment the daemon finished
+   * starting.
+   *
+   * The arithmetic that makes this real, and that the old default got wrong:
+   * the gate is only ever evaluated by a sweep, and the first sweep runs at
+   * an uptime of `sweepIntervalMs`. So any grace at or below
+   * `sweepIntervalMs` can never decline anything, because by the time
+   * anything asks, the grace has already elapsed. The previous default paired
+   * a 10s grace with a 60s sweep, which meant it was unreachable in every
+   * shipped configuration: a knob documenting a protection it did not
+   * provide. It therefore defaults to `sweepIntervalMs` plus 30s, deriving
+   * from the interval rather than restating a constant, so the two cannot
+   * drift apart again if either is tuned. `daemon.start` logs both values
+   * side by side, which is where to check the relationship for a given
+   * deployment.
+   *
+   * What it guards is narrower than it used to be. It was written for a race
+   * where the client that spawned the daemon had not registered by the first
+   * sweep, and that race is now closed at its source: the client wrapper
+   * writes its registry entry BEFORE it asks whether a daemon is running or
+   * spawns one (see `registerInDaemonRegistry` in `src/client/wrapper.ts`),
+   * so the wrapper is never invisible to a sweep. What remains is a plain
+   * floor on the lifetime of a daemon nothing has claimed, which still
+   * matters for a daemon started by anything other than the wrapper, by hand
+   * for debugging most of all.
    */
   shutdownGraceMs: number;
   /** Directory holding the registry file and daemon log. `~/.harborage` by default. */
@@ -187,6 +210,10 @@ function str(name: string, fallback: string): string {
  */
 export function loadConfig(): Config {
   const stateDir = str('HARBORAGE_STATE_DIR', join(homedir(), '.harborage'));
+  // Read first because the shutdown grace's default is derived from it: a
+  // grace at or below one sweep interval can never decline a sweep. See
+  // `shutdownGraceMs` above.
+  const sweepIntervalMs = num('HARBORAGE_SWEEP_INTERVAL_MS', 60 * 1000);
   return {
     host: str('HARBORAGE_HOST', '127.0.0.1'),
     port: num('HARBORAGE_PORT', 4599),
@@ -196,8 +223,8 @@ export function loadConfig(): Config {
     maxInFlightAgeMs: num('HARBORAGE_MAX_IN_FLIGHT_AGE_MS', 10 * 60 * 1000),
     requestTimeoutCeilingMs: num('HARBORAGE_REQUEST_TIMEOUT_CEILING_MS', 10 * 60 * 1000),
     requestTimeoutFloorMs: num('HARBORAGE_REQUEST_TIMEOUT_FLOOR_MS', 60 * 1000),
-    sweepIntervalMs: num('HARBORAGE_SWEEP_INTERVAL_MS', 60 * 1000),
-    shutdownGraceMs: num('HARBORAGE_SHUTDOWN_GRACE_MS', 10 * 1000),
+    sweepIntervalMs,
+    shutdownGraceMs: num('HARBORAGE_SHUTDOWN_GRACE_MS', sweepIntervalMs + 30 * 1000),
     stateDir,
     registryPath: str('HARBORAGE_REGISTRY_PATH', join(stateDir, 'registry.json')),
     daemonLogPath: str('HARBORAGE_DAEMON_LOG_PATH', join(stateDir, 'daemon.log')),
