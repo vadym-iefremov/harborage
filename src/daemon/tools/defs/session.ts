@@ -126,7 +126,8 @@ export const sessionTools = defineTools({
 
   new_tab: defineTool({
     description:
-      'Open a new tab in an existing session, optionally navigating it to a URL. The new tab becomes the session\'s active tab, so later calls that omit pageId target it. Console, network and page-error buffering are wired up before the tab loads anything, exactly as for the session\'s first tab. Returns the new pageId.',
+      'Open a new tab in an existing session, optionally navigating it to a URL. The new tab becomes the session\'s active tab, so later calls that omit pageId target it. Console, network and page-error buffering are wired up before the tab loads anything, exactly as for the session\'s first tab. Returns the new pageId. ' +
+      'If the URL cannot be reached, this is an error AND the session\'s active tab is left exactly as it was, so later calls that omit pageId are unaffected. It used to leave the active tab pointing at the blank tab it had just opened, which silently redirected everything after it to about:blank. The blank tab is left open rather than closed, since a navigation that timed out may still have loaded something worth looking at, and the error names its pageId so you can navigate it or close it.',
     inputSchema: z.object({
       sessionId,
       url: z

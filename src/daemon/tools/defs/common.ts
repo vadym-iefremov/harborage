@@ -15,7 +15,11 @@ export const pageId = z
     'Tab id from list_tabs. Defaults to the session\'s active tab (call select_tab to change which one that is). ' +
       'Passing pageId targets this one call only: it does not make that tab the new default for later calls that ' +
       'omit pageId, so a one-off screenshot or read of a background tab never silently redirects everything after ' +
-      'it. Use select_tab when you actually want to switch.'
+      'it. Use select_tab when you actually want to switch. ' +
+      'A pageId this session has never issued is an ERROR, not an empty result: a mistyped tab id used to come ' +
+      'back from the buffered reads as total 0, dropped 0, which reads exactly like a tab that was simply quiet. ' +
+      'A tab that has since been CLOSED is still a valid id for those reads, though, since its buffered console ' +
+      'and network output outlives it and reading a popup after it has gone is the whole point of buffering.'
   );
 
 export const clear = z

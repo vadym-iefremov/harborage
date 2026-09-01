@@ -1018,17 +1018,27 @@ export const inspectTools = defineTools({
       'tab\'s losses, and droppedInSession / filteredAtCaptureInSession come back alongside them with the ' +
       'session-wide totals. The ring is shared by every tab in the session, so a per-tab read reporting the ' +
       'session-wide number was reporting mostly other tabs\' traffic. ' +
-      'A request entry carrying "responseFilteredOut": true was ANSWERED, and its response was excluded by the ' +
+      'A request entry carrying "responseFilteredOut": true was ANSWERED, and its own response was excluded by the ' +
       'capture filter (either the filter was replaced mid-flight, or it excludes responses wholesale, e.g. ' +
       'direction "request" or a method filter). Without that flag, a request entry with no matching response entry ' +
-      'is a request the server never answered, which is the opposite conclusion. ' +
+      'is a request the server never answered, which is the opposite conclusion. The flag is placed on the exact ' +
+      'exchange the excluded response belongs to, not on whichever buffered entry happens to share its URL, so ' +
+      'repeated calls to one URL are flagged individually and correctly however the server interleaves its ' +
+      'answers. When a filter excludes BOTH halves of an exchange (a status filter excludes every request entry ' +
+      'too, since requests carry no status) nothing is flagged at all, because the request was never buffered: ' +
+      'read filteredAtCapture for those, not the entries. ' +
       'WebSockets are NOT in requests: a socket is not a request/response pair and none of the filters above apply ' +
       'to one. They come back in their own "websockets" array instead, one entry per connection, with url, ' +
       'openedAt, closedAt (absent while still open) and frame COUNTS in each direction, never frame contents (a ' +
       'realtime app can push thousands a minute and buffering them would evict the HTTP traffic this ring is for). ' +
       'Counts are enough to tell "the socket is open and carrying traffic" from "the socket connected and nothing ' +
       'has flowed", which is the question an empty request list used to answer wrongly by omission. The capture ' +
-      'filter does not apply to them, and neither does clear. ' +
+      'filter does not apply to them, and neither does clear. At most 50 sockets per session are tracked, and when ' +
+      'that fills, CLOSED sockets are discarded before open ones, so a long-lived connection is not evicted by a ' +
+      'reconnect loop churning through short-lived ones. websocketsDropped counts what was discarded, scoped to ' +
+      'the tab asked about; websocketsDroppedWhileOpen, present only when non-zero, counts the ones still open ' +
+      'when discarded, which is the only case where this list is missing a LIVE connection rather than closed ' +
+      'history. ' +
       'Server-Sent Events are a different case and DO appear in requests, verified against a real EventSource: the ' +
       'connection is one ordinary HTTP request, so it shows up as a request entry with resourceType "eventsource" ' +
       'and a response entry with its status. The events streamed over it afterwards do not, so an SSE stream ' +
@@ -1125,7 +1135,27 @@ export const inspectTools = defineTools({
         // request list read as "nothing is happening" on a page whose whole
         // conversation was over a socket.
         websockets: websockets.sockets,
-        ...(websockets.dropped > 0 ? { websocketsDropped: websockets.dropped } : {})
+        // Scoped the same way dropped is, and for the same reason: this used
+        // to be the session-wide number even on a per-tab read, so a tab that
+        // lost one socket was told it had lost eleven.
+        ...(websockets.droppedInScope > 0 ? { websocketsDropped: websockets.droppedInScope } : {}),
+        ...(args.pageId !== undefined && websockets.droppedInSession > 0
+          ? { websocketsDroppedInSession: websockets.droppedInSession }
+          : {}),
+        // Only ever non-zero when a session held more simultaneously OPEN
+        // sockets than the buffer bounds, since closed ones are evicted
+        // first. Said out loud because it is the one case where this report
+        // is missing a connection that is still live.
+        ...(websockets.droppedOpenInScope > 0
+          ? {
+              websocketsDroppedWhileOpen: websockets.droppedOpenInScope,
+              websocketsNote:
+                `${websockets.droppedOpenInScope} socket(s) were still OPEN when this session ran out of room to ` +
+                'track them, so this list is missing live connections, not just closed history. That takes more ' +
+                'than 50 simultaneously open sockets in one session, which usually means a reconnect loop that is ' +
+                'never closing its old sockets.'
+            }
+          : {})
       });
     }
   }),

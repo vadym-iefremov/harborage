@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { BrowserContext, BrowserContextOptions, Dialog, Page } from 'playwright';
+import type { BrowserContext, BrowserContextOptions, Dialog, Page, Request as PlaywrightRequest } from 'playwright';
 
 import { noopLogger, type Logger } from '../shared/logger.js';
 import type { BrowserManager } from './browserManager.js';
@@ -38,7 +38,7 @@ export interface NetworkEntry {
   statusText?: string;
   timestamp: number;
   /**
-   * Set on a REQUEST entry whose response the capture filter turned away.
+   * Set on a REQUEST entry whose own response the capture filter turned away.
    *
    * Without it, two opposite outcomes are byte-identical: a request the
    * server never answered, and a request that was answered while the
@@ -49,6 +49,19 @@ export interface NetworkEntry {
    * is the caller's own filter working as asked. A request entry sitting
    * with no matching response entry and no flag here really was never
    * answered.
+   *
+   * "Its own" is load-bearing and was not true at first. The flag used to be
+   * placed on the oldest buffered request with a matching URL, which is not
+   * the same thing: with two calls to one URL it marked the wrong one, and
+   * the failure needed no concurrency at all to produce. Fetching /dup once
+   * with both halves captured, then narrowing the filter and fetching /dup
+   * again, left the FIRST request flagged as unanswered-but-filtered while
+   * its own 200 response sat directly beneath it in the ring, and the
+   * exchange that was really filtered had no entry at all. Answered out of
+   * order, the flags came out exactly inverted, which tells a caller the
+   * reverse of the truth. It is now placed via Playwright's own Request
+   * object, which identifies the exchange rather than resembling it, so a
+   * response whose request was never buffered marks nothing at all.
    */
   responseFilteredOut?: boolean;
 }
@@ -233,9 +246,32 @@ export interface BufferRead<T> {
   droppedInSession: number;
 }
 
+/**
+ * What one WebSocket read hands back: the sockets in scope, and the same two
+ * drop counts every other buffer read carries, plus how many of those losses
+ * were connections still OPEN at the time. The last pair exists because
+ * losing an open socket is not the same kind of loss as losing a closed one,
+ * and a caller that is missing a live connection should be told, not left to
+ * infer it from an absence.
+ */
+export interface WebSocketRead {
+  sockets: WebSocketEntry[];
+  droppedInScope: number;
+  droppedInSession: number;
+  droppedOpenInScope: number;
+  droppedOpenInSession: number;
+}
+
 /** Adds one to a per-tab tally, creating the entry on first use. */
 function bumpByPage(counts: Map<string, number>, pageId: string): void {
   counts.set(pageId, (counts.get(pageId) ?? 0) + 1);
+}
+
+/** Session-wide total of a per-tab tally. */
+function totalOf(counts: Map<string, number>): number {
+  let total = 0;
+  for (const count of counts.values()) total += count;
+  return total;
 }
 
 interface SessionRecord {
@@ -298,8 +334,32 @@ interface SessionRecord {
   networkFilteredOut: number;
   /** The same exclusions attributed per tab, for the same reason `droppedByPage` exists. */
   networkFilteredOutByPage: Map<string, number>;
+  /**
+   * The buffered request entry each Playwright `Request` produced, for the
+   * requests that actually made it into the ring.
+   *
+   * This is the handle that identifies one exchange. A URL does not: two
+   * calls to the same URL are indistinguishable by it, and pairing on it
+   * marked the wrong request (see `NetworkEntry.responseFilteredOut`). A
+   * WeakMap rather than a Map because Playwright's Request objects outlive
+   * nothing here: once Playwright drops one, the entry it pointed at is
+   * either still in the ring and already flagged or long evicted, and either
+   * way there is nothing left to pair.
+   */
+  networkEntryByRequest: WeakMap<PlaywrightRequest, NetworkEntry>;
   /** WebSocket connections this session's tabs have opened, oldest first. */
   websockets: BoundedBuffer<WebSocketEntry>;
+  /**
+   * Sockets evicted from that buffer while they were STILL OPEN, per tab.
+   *
+   * Kept apart from the ordinary drop count because it is a different and
+   * worse loss: an evicted closed socket is history a caller can no longer
+   * read, an evicted open one is a live connection the session is still
+   * carrying and can no longer see. `pushWebSocket` evicts closed sockets
+   * first precisely so this stays at zero in every case but a session
+   * holding more simultaneously open sockets than the buffer can bound.
+   */
+  websocketsDroppedOpenByPage: Map<string, number>;
 }
 
 /**
@@ -430,6 +490,10 @@ export class SessionStore {
         return;
       }
       pushBounded(record.networkBuffer, entry, this.bufferLimits.network);
+      // Only for entries that really reached the ring. A request the filter
+      // turned away has no entry to flag later, and remembering it would be
+      // how a filtered response ends up marking something that is not there.
+      record.networkEntryByRequest.set(req, entry);
     });
     // Registering ANY dialog listener switches Playwright's own auto-dismiss
     // off, which makes this handler the only thing that can ever unblock a
@@ -502,22 +566,8 @@ export class SessionStore {
         // The request half may still be sitting in the ring, and if it is, it
         // now looks exactly like a request nobody ever answered. Those mean
         // opposite things to a caller (a hung endpoint versus their own
-        // filter doing its job), so the surviving request entry is marked
-        // rather than left ambiguous. Oldest unmarked match wins, which is
-        // the right pairing for repeated calls to the same URL as long as the
-        // server answers them in order, and is at worst off by one exchange
-        // between two identical URLs when it does not.
-        for (const buffered of record.networkBuffer.entries) {
-          if (
-            buffered.direction === 'request' &&
-            buffered.pageId === pageId &&
-            buffered.url === entry.url &&
-            buffered.responseFilteredOut !== true
-          ) {
-            buffered.responseFilteredOut = true;
-            break;
-          }
-        }
+        // filter doing its job), so THAT EXACT request entry is marked.
+        this.markResponseFiltered(record, res.request());
         return;
       }
       pushBounded(record.networkBuffer, entry, this.bufferLimits.network);
@@ -535,7 +585,7 @@ export class SessionStore {
         framesSent: 0,
         framesReceived: 0
       };
-      pushBounded(record.websockets, entry, maxWebSocketsPerSession);
+      this.pushWebSocket(record, entry);
       ws.on('framesent', () => {
         entry.framesSent += 1;
       });
@@ -549,6 +599,60 @@ export class SessionStore {
         entry.closedAt = Date.now();
       });
     });
+  }
+
+  /**
+   * Flags the buffered request entry belonging to one filtered-out response,
+   * if that request was buffered at all.
+   *
+   * Keyed on Playwright's own `Request` object, which is the same instance
+   * `page.on('request')` was handed and `response.request()` gives back, so
+   * it names one exchange exactly. Two consequences worth stating, because
+   * the URL-matching version this replaced got both wrong: repeated calls to
+   * one URL are flagged individually and in the right order however the
+   * server interleaves its answers, and a response whose request the filter
+   * ALSO excluded flags nothing, rather than borrowing an unrelated entry
+   * that has its own response sitting in the ring.
+   *
+   * Marking an entry that has since been evicted or cleared is harmless and
+   * deliberately not guarded against: it is unreachable, so nothing reads it.
+   */
+  private markResponseFiltered(record: SessionRecord, request: PlaywrightRequest): void {
+    const entry = record.networkEntryByRequest.get(request);
+    if (entry === undefined) return;
+    entry.responseFilteredOut = true;
+  }
+
+  /**
+   * Records one WebSocket, evicting a CLOSED socket before an open one when
+   * the buffer is full.
+   *
+   * Plain FIFO is wrong here in a way it is not wrong for the other four
+   * buffers. Those hold events, which are all equally past; this holds
+   * connections, and an open one is not history, it is the session's current
+   * state. Measured on the old FIFO: a tab holding one live socket had it
+   * evicted by another tab's sixty short-lived ones, and then reported no
+   * sockets at all while the connection was still carrying traffic, which is
+   * the exact "nothing is happening" answer the WebSocket reporting exists to
+   * stop. Closed-first eviction means that only happens when a session
+   * genuinely holds more simultaneously OPEN sockets than the bound allows,
+   * and that case is counted separately so it can be said out loud.
+   */
+  private pushWebSocket(record: SessionRecord, entry: WebSocketEntry): void {
+    const buffer = record.websockets;
+    buffer.entries.push(entry);
+    while (buffer.entries.length > maxWebSocketsPerSession) {
+      let index = buffer.entries.findIndex(candidate => candidate.closedAt !== undefined);
+      if (index === -1) {
+        // Everything held is still open, so something live has to go. The
+        // oldest, and loudly.
+        index = 0;
+        bumpByPage(record.websocketsDroppedOpenByPage, buffer.entries[0]!.pageId);
+      }
+      const [lost] = buffer.entries.splice(index, 1);
+      buffer.dropped += 1;
+      bumpByPage(buffer.droppedByPage, lost!.pageId);
+    }
   }
 
   /**
@@ -764,7 +868,9 @@ export class SessionStore {
       networkCaptureFilter,
       networkFilteredOut: 0,
       networkFilteredOutByPage: new Map(),
-      websockets: newBoundedBuffer()
+      networkEntryByRequest: new WeakMap(),
+      websockets: newBoundedBuffer(),
+      websocketsDroppedOpenByPage: new Map()
     };
 
     // A tab opened by the page itself (window.open, a target="_blank" link,
@@ -806,6 +912,29 @@ export class SessionStore {
     if (!record) throw new SessionNotFoundError(sessionId);
     record.lastActivity = Date.now();
     return record;
+  }
+
+  /**
+   * Rejects a pageId this session has never issued, for the buffered reads.
+   *
+   * They used to accept anything and hand back `total: 0, dropped: 0`, which
+   * is a false pass of exactly the shape this round has been removing: a
+   * mistyped tab id read as "that tab is quiet" rather than "there is no such
+   * tab", while `screenshot` rejected the very same id. Same mistake, same
+   * error, whichever tool it is made in.
+   *
+   * A CLOSED tab is deliberately still readable. Its entries stay in the ring
+   * after `record.pages` forgets it, and reading a popup's console after it
+   * has gone is a real and useful thing to do, so requiring a live tab here
+   * would have broken it. Ids are handed out as a running sequence, so
+   * anything below the next one to be issued is a tab this session really
+   * had. An id that is not a plain integer can only be matched against the
+   * live tabs, which is correct for every id `adoptPage` currently mints.
+   */
+  private assertKnownPage(record: SessionRecord, pageId: string | undefined): void {
+    if (pageId === undefined || record.pages.has(pageId)) return;
+    if (/^\d+$/.test(pageId) && Number(pageId) < record.nextPageSeq) return;
+    throw new PageNotFoundError(record.id, pageId);
   }
 
   /**
@@ -854,10 +983,31 @@ export class SessionStore {
    */
   async newTab(sessionId: string, url?: string): Promise<{ pageId: string; url: string }> {
     const record = this.getRecord(sessionId);
+    const previousActive = record.activePageId;
     const page = await record.context.newPage();
     const pageId = this.adoptPage(record, page);
     record.activePageId = pageId;
-    if (url !== undefined) await page.goto(url);
+    if (url !== undefined) {
+      try {
+        await page.goto(url);
+      } catch (err) {
+        // A new_tab that could not reach its URL must not silently re-point
+        // the session at the blank tab it left behind. It did exactly that:
+        // every later call omitting pageId landed on about:blank and found
+        // nothing, which is the same silent retargeting the resolve() rule
+        // was written to stop, arriving through a different tool's error
+        // path. The tab is left OPEN rather than closed, because a goto that
+        // timed out may have loaded something worth looking at, and it is
+        // named here so it can be reached instead of merely existing.
+        if (record.pages.has(previousActive)) record.activePageId = previousActive;
+        const message = err instanceof Error ? err.message : String(err);
+        throw new Error(
+          `new_tab opened tab "${pageId}" but could not navigate it to ${url}: ${message}. The session's active ` +
+            `tab is unchanged (still "${record.activePageId}"), so calls that omit pageId are not affected. Tab ` +
+            `"${pageId}" is open and blank: navigate it with the navigate tool, or close it with close_tab.`
+        );
+      }
+    }
     this.logger.log('tab.open', { sessionId, pageId, tabs: record.pages.size });
     return { pageId, url: page.url() };
   }
@@ -1007,6 +1157,7 @@ export class SessionStore {
     match?: (entry: ConsoleEntry) => boolean
   ): BufferRead<ConsoleEntry> {
     const record = this.getRecord(sessionId);
+    this.assertKnownPage(record, pageId);
     return this.readBuffer(record.consoleBuffer, pageId, clear, match);
   }
 
@@ -1018,6 +1169,7 @@ export class SessionStore {
     match?: (entry: NetworkEntry) => boolean
   ): BufferRead<NetworkEntry> & { filteredOutInScope: number; filteredOutInSession: number } {
     const record = this.getRecord(sessionId);
+    this.assertKnownPage(record, pageId);
     const read = this.readBuffer(record.networkBuffer, pageId, clear, match);
     const filteredOutInSession = record.networkFilteredOut;
     const filteredOutInScope =
@@ -1041,10 +1193,27 @@ export class SessionStore {
    * report because somebody drained the HTTP buffer would be its own silent
    * false pass.
    */
-  getWebSockets(sessionId: string, pageId?: string): { sockets: WebSocketEntry[]; dropped: number } {
+  getWebSockets(sessionId: string, pageId?: string): WebSocketRead {
     const record = this.getRecord(sessionId);
-    const sockets = record.websockets.entries.filter(entry => pageId === undefined || entry.pageId === pageId);
-    return { sockets, dropped: record.websockets.dropped };
+    this.assertKnownPage(record, pageId);
+    const buffer = record.websockets;
+    const sockets = buffer.entries.filter(entry => pageId === undefined || entry.pageId === pageId);
+    // Scoped exactly as every other buffer read is. This one did not go
+    // through readBuffer, so it kept handing a per-tab read the session-wide
+    // drop count that readBuffer had already been fixed to stop handing out:
+    // a tab that opened one socket and lost one reported eleven, all but one
+    // of them another tab's. The per-tab tally was already being maintained
+    // by the push path and simply had no reader.
+    const droppedInSession = buffer.dropped;
+    const droppedOpenInSession = totalOf(record.websocketsDroppedOpenByPage);
+    return {
+      sockets,
+      droppedInScope: pageId === undefined ? droppedInSession : buffer.droppedByPage.get(pageId) ?? 0,
+      droppedInSession,
+      droppedOpenInScope:
+        pageId === undefined ? droppedOpenInSession : record.websocketsDroppedOpenByPage.get(pageId) ?? 0,
+      droppedOpenInSession
+    };
   }
 
   /** Sets, replaces or (passing undefined) removes a session's network capture filter. */
@@ -1066,6 +1235,7 @@ export class SessionStore {
     match?: (entry: DialogEntry) => boolean
   ): BufferRead<DialogEntry> {
     const record = this.getRecord(sessionId);
+    this.assertKnownPage(record, pageId);
     return this.readBuffer(record.dialogBuffer, pageId, clear, match);
   }
 
@@ -1077,6 +1247,7 @@ export class SessionStore {
     match?: (entry: PageErrorEntry) => boolean
   ): BufferRead<PageErrorEntry> {
     const record = this.getRecord(sessionId);
+    this.assertKnownPage(record, pageId);
     return this.readBuffer(record.pageErrorBuffer, pageId, clear, match);
   }
 
