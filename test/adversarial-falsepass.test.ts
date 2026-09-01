@@ -156,7 +156,7 @@ function payload(result: unknown): Record<string, any> {
 
 async function sessionOn(path: string, options?: Record<string, unknown>): Promise<string> {
   const { sessionId } = await sessions.createSession(options as never);
-  await handlers.navigate({ sessionId, url: `${baseUrl}${path}` });
+  await handlers.navigate({ sessionId, url: `${baseUrl}${path}`, settleMs: 0 });
   return sessionId;
 }
 

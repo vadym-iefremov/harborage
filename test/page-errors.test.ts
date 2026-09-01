@@ -43,7 +43,7 @@ function sleep(ms: number): Promise<void> {
 async function openSession(): Promise<string> {
   const created = await handlers.create_session({});
   const { sessionId } = created.structuredContent as { sessionId: string };
-  await handlers.navigate({ sessionId, url: base });
+  await handlers.navigate({ sessionId, url: base, settleMs: 0 });
   return sessionId;
 }
 
@@ -123,7 +123,7 @@ test('page errors are a separate channel: they do not show up in read_console', 
 
 test('a tab opened through new_tab buffers its own page errors, filterable by pageId', async () => {
   const sessionId = await openSession();
-  const opened = await handlers.new_tab({ sessionId, url: base });
+  const opened = await handlers.new_tab({ sessionId, url: base, settleMs: 0 });
   const { pageId } = opened.structuredContent as { pageId: string };
 
   await handlers.evaluate({ sessionId, pageId, expression: 'Promise.reject(new Error("in the new tab")), "queued"' });

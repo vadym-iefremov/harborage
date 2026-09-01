@@ -283,7 +283,7 @@ after(async () => {
 /** A fresh session already sitting on one of the fixture pages. */
 async function sessionOn(path: string): Promise<string> {
   const { sessionId } = await sessions.createSession();
-  await handlers.navigate({ sessionId, url: `${baseUrl}${path}` });
+  await handlers.navigate({ sessionId, url: `${baseUrl}${path}`, settleMs: 0 });
   return sessionId;
 }
 
@@ -681,7 +681,7 @@ test('navigate_back says plainly when there is nothing to go back to', async () 
 
 test('navigate_back and navigate_forward walk real cross-document history', async () => {
   const sessionId = await sessionOn('/history?first');
-  await handlers.navigate({ sessionId, url: `${baseUrl}/history?second` });
+  await handlers.navigate({ sessionId, url: `${baseUrl}/history?second`, settleMs: 0 });
 
   const back = payload(await handlers.navigate_back({ sessionId }));
   assert.equal(back.navigated, true);
@@ -704,8 +704,8 @@ test('navigate_back and navigate_forward walk real cross-document history', asyn
 test('navigate_back through a hash change is same-document, and the JS context survives it', async () => {
   const sessionId = await sessionOn('/history');
   await evaluate(sessionId, 'window.__qaMarker = "alive"');
-  await handlers.navigate({ sessionId, url: `${baseUrl}/history#one` });
-  await handlers.navigate({ sessionId, url: `${baseUrl}/history#two` });
+  await handlers.navigate({ sessionId, url: `${baseUrl}/history#one`, settleMs: 0 });
+  await handlers.navigate({ sessionId, url: `${baseUrl}/history#two`, settleMs: 0 });
 
   const popstatesBefore = await evaluate<number>(sessionId, 'window.__popstates');
   const body = payload(await handlers.navigate_back({ sessionId }));

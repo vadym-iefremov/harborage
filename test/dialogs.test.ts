@@ -50,7 +50,7 @@ after(async () => {
 async function openSession(): Promise<string> {
   const created = await handlers.create_session({});
   const { sessionId } = created.structuredContent as { sessionId: string };
-  await handlers.navigate({ sessionId, url: base });
+  await handlers.navigate({ sessionId, url: base, settleMs: 0 });
   return sessionId;
 }
 
@@ -133,7 +133,7 @@ test('accept with promptText answers a prompt, and appliesTo "all" keeps answeri
 
 test('dialogs in a tab opened by new_tab are handled and recorded too', async () => {
   const sessionId = await openSession();
-  const opened = await handlers.new_tab({ sessionId, url: base });
+  const opened = await handlers.new_tab({ sessionId, url: base, settleMs: 0 });
   const { pageId } = opened.structuredContent as { pageId: string };
 
   await within(handlers.click({ sessionId, pageId, selector: '#alert' }), 8000, 'alert in a new tab');

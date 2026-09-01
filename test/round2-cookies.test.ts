@@ -59,7 +59,7 @@ function payload(result: unknown): Record<string, any> {
 
 async function freshSession(): Promise<string> {
   const { sessionId } = await sessions.createSession();
-  await handlers.navigate({ sessionId, url: urlFor('127.0.0.1') });
+  await handlers.navigate({ sessionId, url: urlFor('127.0.0.1'), settleMs: 0 });
   return sessionId;
 }
 

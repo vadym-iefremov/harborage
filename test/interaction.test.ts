@@ -113,7 +113,7 @@ after(async () => {
 /** A fresh session already sitting on the fixture page. */
 async function freshSession(): Promise<string> {
   const { sessionId } = await sessions.createSession();
-  await handlers.navigate({ sessionId, url: baseUrl });
+  await handlers.navigate({ sessionId, url: baseUrl, settleMs: 0 });
   return sessionId;
 }
 
@@ -137,7 +137,7 @@ test('navigate to a hash-only URL leaves the JS context alive and says so in its
 
   await evaluate(sessionId, 'window.__qaMarker = "alive"');
 
-  const result = await handlers.navigate({ sessionId, url: `${baseUrl}#/settings` });
+  const result = await handlers.navigate({ sessionId, url: `${baseUrl}#/settings`, settleMs: 0 });
   const body = payload(result);
 
   // The trap: the marker surviving means React state, timers and the console
@@ -160,7 +160,7 @@ test('navigate to a different document reports sameDocument false, present rathe
   const sessionId = await freshSession();
   await evaluate(sessionId, 'window.__qaMarker = "alive"');
 
-  const body = payload(await handlers.navigate({ sessionId, url: `${baseUrl}?second` }));
+  const body = payload(await handlers.navigate({ sessionId, url: `${baseUrl}?second`, settleMs: 0 }));
 
   assert.equal(body.sameDocument, false, 'the field must be present in the false case so its absence can never be read as false');
   assert.ok(!('note' in body) || body.note === undefined, 'a real load needs no same-document warning');
@@ -174,7 +174,7 @@ test('navigate to about:blank is a real document change, not a same-document nav
   // page.goto() returns null here too, so response === null on its own would
   // mislabel this one.
   const sessionId = await freshSession();
-  const body = payload(await handlers.navigate({ sessionId, url: 'about:blank' }));
+  const body = payload(await handlers.navigate({ sessionId, url: 'about:blank', settleMs: 0 }));
   assert.equal(body.sameDocument, false);
   await sessions.releaseSession(sessionId);
 });
@@ -183,7 +183,7 @@ test('reload genuinely discards the JS context', async () => {
   const sessionId = await freshSession();
   await evaluate(sessionId, 'window.__qaMarker = "alive"');
 
-  const body = payload(await handlers.reload({ sessionId }));
+  const body = payload(await handlers.reload({ sessionId, settleMs: 0 }));
   assert.equal(body.url, baseUrl);
 
   const marker = await evaluate<string | undefined>(sessionId, 'window.__qaMarker');
@@ -198,10 +198,10 @@ test('reload genuinely discards the JS context', async () => {
 test('reload after a hash navigation is what forces the real load the hash did not', async () => {
   const sessionId = await freshSession();
   await evaluate(sessionId, 'window.__qaMarker = "alive"');
-  await handlers.navigate({ sessionId, url: `${baseUrl}#/settings` });
+  await handlers.navigate({ sessionId, url: `${baseUrl}#/settings`, settleMs: 0 });
   assert.equal(await evaluate(sessionId, 'window.__qaMarker'), 'alive');
 
-  await handlers.reload({ sessionId });
+  await handlers.reload({ sessionId, settleMs: 0 });
   assert.equal(await evaluate(sessionId, 'window.__qaMarker'), undefined);
   assert.equal(await evaluate(sessionId, 'location.hash'), '#/settings', 'reload keeps the hash, it just reloads the document');
 

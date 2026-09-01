@@ -279,7 +279,9 @@ function payload(result: unknown): Record<string, any> {
 
 async function sessionOn(path: string): Promise<string> {
   const { sessionId } = await sessions.createSession();
-  await handlers.navigate({ sessionId, url: `${baseUrl}${path}` });
+  // Setup, not the thing under test: no settle window needed to put a
+  // session on a page. Tests that exercise the settle pass the real one.
+  await handlers.navigate({ sessionId, url: `${baseUrl}${path}`, settleMs: 0 });
   return sessionId;
 }
 
@@ -520,7 +522,7 @@ test('navigate to a hash-only URL is still a same-document navigation with a nul
 
 test('navigate to about:blank still explains its null status rather than claiming a document change', async () => {
   const sessionId = await sessionOn('/plain');
-  const body = payload(await handlers.navigate({ sessionId, url: 'about:blank' }));
+  const body = payload(await handlers.navigate({ sessionId, url: 'about:blank', settleMs: 0 }));
   assert.equal(body.status, null);
   assert.equal(body.ok, null);
   assert.equal(body.sameDocument, false);
@@ -582,7 +584,7 @@ test('reload of a shell that has started redirecting to a 500 reports the 500, n
   // case: navigate could never land here.
   assert.equal(await evaluate<string>(sessionId, 'document.title'), 'Flaky ok');
 
-  const body = payload(await handlers.reload({ sessionId }));
+  const body = payload(await handlers.reload({ sessionId }));  // real settle window: this test is about catching the redirect
 
   // Oracle 1: the live document, read from the page.
   const liveUrl = await evaluate<string>(sessionId, 'location.href');
@@ -619,7 +621,7 @@ test('reload that lands on about:blank reports a null status rather than the she
   const sessionId = await sessionOn('/flakyblank');
   assert.equal(await evaluate<string>(sessionId, 'document.title'), 'Flaky ok');
 
-  const body = payload(await handlers.reload({ sessionId }));
+  const body = payload(await handlers.reload({ sessionId }));  // real settle window: this test is about catching the redirect
 
   const liveUrl = await evaluate<string>(sessionId, 'location.href');
   assert.equal(liveUrl, 'about:blank', 'the reload must really have landed on about:blank');
@@ -636,7 +638,7 @@ test('reload that lands on about:blank reports a null status rather than the she
 
 test('an ordinary reload still reports a clean 200 with no documentChanged noise', async () => {
   const sessionId = await sessionOn('/plain');
-  const body = payload(await handlers.reload({ sessionId }));
+  const body = payload(await handlers.reload({ sessionId, settleMs: 0 }));
   assert.equal(body.status, 200);
   assert.equal(body.ok, true);
   assert.equal(body.url, `${baseUrl}/plain`);
@@ -649,7 +651,7 @@ test('an ordinary reload still reports a clean 200 with no documentChanged noise
 
 test('reload of a real 500 still reports the 500 (no regression on the status reporting reload already had)', async () => {
   const sessionId = await sessionOn('/broken');
-  const body = payload(await handlers.reload({ sessionId }));
+  const body = payload(await handlers.reload({ sessionId, settleMs: 0 }));
   assert.equal(
     served.filter(entry => entry.path === '/broken').at(-1)?.status,
     500,
@@ -715,8 +717,8 @@ test('navigate_back trapped into re-pushing the same URL still reports navigated
 
 test('an ordinary navigate_back and navigate_forward still report navigated: true, and match the browser\'s own index', async () => {
   const sessionId = await sessionOn('/plain');
-  await handlers.navigate({ sessionId, url: `${baseUrl}/plain#one` });
-  await handlers.navigate({ sessionId, url: `${baseUrl}/plain#two` });
+  await handlers.navigate({ sessionId, url: `${baseUrl}/plain#one`, settleMs: 0 });
+  await handlers.navigate({ sessionId, url: `${baseUrl}/plain#two`, settleMs: 0 });
 
   const before = await realHistory(sessionId);
   const back = payload(await handlers.navigate_back({ sessionId }));

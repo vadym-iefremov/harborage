@@ -2945,10 +2945,19 @@ export const inspectTools = defineTools({
       'One trap worth knowing about the raw prefix form: "iframe >> internal:control=enter-frame" with several ' +
       'iframes in the document silently enters the FIRST one rather than complaining, which is why the prefixes ' +
       'here always pin an explicit "nth=". Keep the nth when you paste one. ' +
-      'What it does NOT do: it does not reach into shadow DOM (Playwright selectors already pierce open shadow ' +
-      'roots on their own, so no prefix is needed there), and a frame that is still loading may report ' +
-      'about:blank. A cross-origin frame is listed and reachable the same way as a same-origin one, but its ' +
-      'selectorPrefix is missing if its owning element could not be read.',
+      'THAT nth IS POSITIONAL, exactly like the frame ids, and it goes stale the same way: it means "the Nth iframe ' +
+      'in the document right now", so a page that inserts an iframe ahead of the target one leaves the prefix ' +
+      'pointing at a different frame, with no error, and a click through it presses whatever is in that one ' +
+      'instead. A prefix is a snapshot, not a handle. Re-read it after anything that could add or remove an ' +
+      'iframe, which includes ads, consent banners, embedded players and any lazy mount, and prefer acting soon ' +
+      'after reading rather than caching one across steps. ' +
+      'What it does NOT do: it does not reach into shadow DOM. For an ELEMENT that is fine, because Playwright ' +
+      'selectors already pierce open shadow roots on their own and need no prefix. For a FRAME it is the one case ' +
+      'that cannot be served at all: an iframe living inside a shadow root has no addressable owning element, so ' +
+      'no prefix can be built for it and selectorPrefixUnavailable is what comes back. Reach into such a frame ' +
+      'with evaluate, snapshot, computed_style, element_box or find using its frameId, which need no prefix. ' +
+      'A frame that is still loading may report about:blank. A cross-origin frame is listed and reachable the ' +
+      'same way as a same-origin one, but its selectorPrefix is missing if its owning element could not be read.',
     inputSchema: z.object({ sessionId, pageId }),
     async handler(ctx, args) {
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
@@ -2967,7 +2976,13 @@ export const inspectTools = defineTools({
               ? { selectorPrefix }
               : {
                   selectorPrefixUnavailable:
-                    'the owning iframe element could not be read, so this frame is reachable only by frameId'
+                    'the owning iframe element could not be read, so no selector can reach into this frame from ' +
+                    'outside and this frame is reachable only by frameId. The usual cause is an iframe living ' +
+                    'inside a shadow root: the prefix builder indexes iframes with document.getElementsByTagName, ' +
+                    'which does not pierce shadow roots. Do NOT substitute an empty prefix, since a bare selector ' +
+                    'resolves in the MAIN document instead of this frame and click would press whatever it happens ' +
+                    'to hit there. Use evaluate, snapshot, computed_style, element_box or find with frame set to ' +
+                    'this frameId, all of which take a frame id directly and need no prefix.'
                 })
           };
         })
@@ -3002,7 +3017,12 @@ export const inspectTools = defineTools({
       'iframe sits inside a shadow root), no working selector can be composed: every result comes back with ' +
       'selector null and a top-level frameSelectorUnavailable explaining why, rather than a selector that looks ' +
       'fine but actually runs in the wrong document. Reach those elements with evaluate, snapshot, computed_style ' +
-      'or element_box and a frame id instead. Search by ' +
+      'or element_box and a frame id instead. ONE CAVEAT ON THOSE FRAME-CROSSING SELECTORS: the "nth=" pinned into ' +
+      'the prefix is positional, so it means "the Nth iframe in the document right now". If the page inserts an ' +
+      'iframe ahead of the target one before you act, the same selector quietly enters a different frame and ' +
+      'clicks whatever is there, reporting a perfectly ordinary success. It is the same staleness the element ' +
+      'path below has, one level up. Act on a frame-crossing selector promptly, and re-run find rather than ' +
+      'reusing one across steps on a page that mounts iframes as it goes. Search by ' +
       'visible text, by ARIA role and accessible name, by test id, or by a raw selector, and combine a raw ' +
       'selector with the others to scope the search to part of the page. ' +
       'Each result also carries the element\'s tag, trimmed text, key attributes, box, and whether it is visible ' +

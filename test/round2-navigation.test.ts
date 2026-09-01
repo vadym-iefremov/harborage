@@ -150,7 +150,7 @@ function payload(result: unknown): Record<string, unknown> {
 
 async function sessionOn(path: string): Promise<string> {
   const { sessionId } = await sessions.createSession();
-  await handlers.navigate({ sessionId, url: `${baseUrl}${path}` });
+  await handlers.navigate({ sessionId, url: `${baseUrl}${path}`, settleMs: 0 });
   return sessionId;
 }
 
@@ -189,8 +189,8 @@ test('navigate_back trapped by a popstate guard reports navigated: false, not a 
 
 test('an ordinary navigate_back reports navigated: true with a freshly re-read history index', async () => {
   const sessionId = await sessionOn('/history');
-  await handlers.navigate({ sessionId, url: `${baseUrl}/history#one` });
-  await handlers.navigate({ sessionId, url: `${baseUrl}/history#two` });
+  await handlers.navigate({ sessionId, url: `${baseUrl}/history#one`, settleMs: 0 });
+  await handlers.navigate({ sessionId, url: `${baseUrl}/history#two`, settleMs: 0 });
 
   const popstatesBefore = await evaluate<number>(sessionId, 'window.__popstates');
   const body = payload(await handlers.navigate_back({ sessionId }));
@@ -243,7 +243,7 @@ test('navigate_back re-reads history rather than trusting the pre-step reading, 
 test('navigate to a 404 reports the status instead of an ordinary success', async () => {
   const sessionId = await sessionOn('/history');
 
-  const body = payload(await handlers.navigate({ sessionId, url: `${baseUrl}/missing` }));
+  const body = payload(await handlers.navigate({ sessionId, url: `${baseUrl}/missing`, settleMs: 0 }));
 
   assert.equal(body.status, 404);
   assert.equal(body.ok, false);
@@ -255,7 +255,7 @@ test('navigate to a 404 reports the status instead of an ordinary success', asyn
 test('navigate to a 500 whose SPA shell renders its own error page still reports the status', async () => {
   const sessionId = await sessionOn('/history');
 
-  const body = payload(await handlers.navigate({ sessionId, url: `${baseUrl}/broken` }));
+  const body = payload(await handlers.navigate({ sessionId, url: `${baseUrl}/broken`, settleMs: 0 }));
 
   assert.equal(body.status, 500);
   assert.equal(body.ok, false, 'the response is a real failure even though the body rendered a clean-looking page');
@@ -266,7 +266,7 @@ test('navigate to a 500 whose SPA shell renders its own error page still reports
 
 test('navigate to a real 200 reports it as ok', async () => {
   const sessionId = await sessionOn('/history');
-  const body = payload(await handlers.navigate({ sessionId, url: `${baseUrl}/history` }));
+  const body = payload(await handlers.navigate({ sessionId, url: `${baseUrl}/history`, settleMs: 0 }));
   assert.equal(body.status, 200);
   assert.equal(body.ok, true);
   await sessions.releaseSession(sessionId);
@@ -275,7 +275,7 @@ test('navigate to a real 200 reports it as ok', async () => {
 test('navigate to about:blank says there is no HTTP response, rather than reporting a wrong status', async () => {
   const sessionId = await sessionOn('/history');
 
-  const body = payload(await handlers.navigate({ sessionId, url: 'about:blank' }));
+  const body = payload(await handlers.navigate({ sessionId, url: 'about:blank', settleMs: 0 }));
 
   assert.equal(body.status, null);
   assert.equal(body.ok, null);
@@ -289,7 +289,7 @@ test('navigate to about:blank says there is no HTTP response, rather than report
 test('navigate to a hash-only URL says status is null because it is a same-document navigation, not a failure', async () => {
   const sessionId = await sessionOn('/history');
 
-  const body = payload(await handlers.navigate({ sessionId, url: `${baseUrl}/history#settings` }));
+  const body = payload(await handlers.navigate({ sessionId, url: `${baseUrl}/history#settings`, settleMs: 0 }));
 
   assert.equal(body.sameDocument, true);
   assert.equal(body.status, null);
