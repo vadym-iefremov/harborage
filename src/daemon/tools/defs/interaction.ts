@@ -86,6 +86,35 @@ interface ShadowDrillElement extends PageElement {
   // ShadowRoot structurally satisfy "optionally has a host".
   getRootNode(): { host?: ShadowDrillElement };
 }
+/**
+ * PageElement widened with what a DOM walk needs to go UP, DOWN and across a
+ * shadow boundary, plus the one member that answers "is this an editing host".
+ *
+ * Kept off PageElement itself for the reason ShadowDrillElement's comment
+ * gives at length: getRootNode()'s declared return type here has no property
+ * in common with the real Node a live getRootNode() returns, TypeScript's
+ * weak type check rejects that pairing outright, and the one time such a
+ * member was added to PageElement directly it broke every OTHER
+ * locator.evaluate callback in this file rather than just the walking ones.
+ * So this type is only ever reached through a cast INSIDE a callback, never
+ * as a callback's own `el` parameter.
+ */
+interface TreeWalkElement extends PageElement {
+  // True on the element itself AND on anything inside an editing host, which
+  // is exactly the question "can a keystroke put text here" wants answered.
+  isContentEditable?: boolean;
+  children?: ArrayLike<TreeWalkElement>;
+  parentElement?: TreeWalkElement | null;
+  // Present (possibly null, for a closed root) only on a shadow host.
+  // activeElement is the half that matters most here: document.activeElement
+  // retargets to the host, so the element that really holds the caret inside
+  // an open shadow root is only reachable by descending this.
+  shadowRoot?: { activeElement?: TreeWalkElement | null; children?: ArrayLike<TreeWalkElement> } | null;
+  // Real signature returns Node; callers here only ever read .host off it,
+  // and both a Document and a ShadowRoot satisfy "optionally has a host".
+  getRootNode(): { host?: TreeWalkElement };
+}
+
 declare const document: {
   activeElement: PageElement | null;
   addEventListener(type: string, handler: () => void, options?: unknown): void;
@@ -107,12 +136,17 @@ declare const window: {
 const formControlTags = ['INPUT', 'TEXTAREA', 'SELECT'];
 
 /**
- * The modifier this machine's own browser binds its editing accelerators to:
- * Meta on macOS, Control everywhere else. Pressing the other one does not
- * throw, it just presses a chord the browser has no accelerator bound to, and
- * that is a trap `press_key` shares with the select-all logic below: a chord
- * built on the wrong platform's modifier reports an ordinary success and
- * silently does nothing.
+ * The modifier this machine's own browser binds its CLIPBOARD and select-all
+ * accelerators to: Meta on macOS, Control everywhere else. Pressing the other
+ * one does not throw, and a chord built for select-all on the wrong modifier
+ * reaches no such accelerator, which is the trap `press_key` shares with the
+ * select-all logic below.
+ *
+ * What must NOT be read into that: "the other modifier does nothing". On
+ * macOS it does plenty. Blink honours the emacs editing bindings there, so
+ * inside a text field Control+a moves the caret to the start of the line,
+ * Control+e to the end, and Control+k deletes from the caret to the end of the
+ * line. All three measured directly in a real input, not inferred.
  */
 const platformAcceleratorModifier = process.platform === 'darwin' ? 'Meta' : 'Control';
 
@@ -136,11 +170,21 @@ const selectAllChord = `${platformAcceleratorModifier}+a`;
  * ctrl+A on its own regardless of what the OS binds, and silently swapping
  * the modifier would be its own false pass, reporting success for a chord
  * that was never actually pressed. What this catches instead is the trap a
- * page cannot save the caller from: Control+a on macOS presses cleanly and
- * selects nothing, because the browser has no built-in accelerator on that
- * chord at all, so the call reports an ordinary success while nothing
- * happened. ControlOrMeta is exempt: Playwright itself resolves it to
- * whichever modifier is this platform's own, so it is never the wrong one.
+ * page cannot save the caller from: on macOS the browser has no select-all
+ * accelerator bound to Control at all, so a chord written for one arrives
+ * somewhere the caller did not intend.
+ *
+ * The note says that WITHOUT asserting what the press did or did not do,
+ * which is the correction this text needed. It used to state that the press
+ * "did not trigger a browser built-in editing accelerator", and that claim is
+ * measurably false: in a real macOS input Control+a moved the caret from 5 to
+ * 0, Control+e from 5 to 11, and Control+k deleted half the field. A caller
+ * told "this did nothing" after Control+k presses again and destroys more
+ * text, which is the opposite of what a warning is for. The firing logic
+ * itself was never wrong and is unchanged.
+ *
+ * ControlOrMeta is exempt: Playwright itself resolves it to whichever
+ * modifier is this platform's own, so it is never the wrong one.
  */
 function nonAcceleratorChordNote(key: string): string | null {
   const modifiers = key.split('+').slice(0, -1);
@@ -149,9 +193,15 @@ function nonAcceleratorChordNote(key: string): string | null {
   if (!modifiers.includes(nonAcceleratorModifier)) return null;
   return (
     `This chord's modifier is "${nonAcceleratorModifier}", but ${process.platform}'s own accelerator modifier is ` +
-    `"${platformAcceleratorModifier}". The press above did not throw, and it also did not trigger a browser ` +
-    `built-in editing accelerator (select-all and the rest all bind to ${platformAcceleratorModifier} here), so a ` +
-    'chord built for one of those can succeed and do nothing at all. Use ' +
+    `"${platformAcceleratorModifier}". The press did not throw, and that is the only thing this result establishes: ` +
+    'what the chord actually did is the browser\'s and the page\'s call, not this tool\'s, and it is not read back ' +
+    'here. Two different things can go wrong behind that, in opposite directions. Select-all and the other editing ' +
+    `accelerators are bound to "${platformAcceleratorModifier}" on this platform, so a chord written for one of them ` +
+    'reaches no accelerator and can report an ordinary success having selected nothing. And "Control" is not inert ' +
+    'on macOS: Chromium honours the emacs editing bindings, so in a text field Control+a moves the caret to the ' +
+    'start of the line, Control+e to the end, and Control+k DELETES from the caret to the end of the line. All three ' +
+    'measured directly. So do not read this note as "nothing happened", and do not press again on that assumption: ' +
+    'read the field back with fill, type or evaluate before concluding anything. Use ' +
     `"${platformAcceleratorModifier}+..." for this platform specifically, or "ControlOrMeta+..." for the portable ` +
     'form that resolves to the right modifier on every platform.'
   );
@@ -186,6 +236,16 @@ function tagNameOf(locator: Locator): Promise<string> {
  * Playwright selector is not always a CSS selector, so the selector case has
  * to go through a Locator, while the focused case has nothing to build one
  * from.
+ *
+ * The focused branch descends into open shadow roots rather than trusting
+ * `document.activeElement` on its own. That property RETARGETS: on a page
+ * whose editor lives in an open shadow root it names the shadow HOST, and a
+ * host's textContent does not include its shadow tree at all. Measured
+ * directly: a no-selector `type` into a shadow-DOM CodeMirror landed the text
+ * and this readback came back as the empty string, which `writeResult` then
+ * reported as a failed write with a reliable readback. The host is simply the
+ * wrong element to read, so the walk keeps descending until it reaches the one
+ * that really has the caret.
  */
 function readFieldValue(page: Page, locator: Locator | null): Promise<string> {
   if (locator) {
@@ -195,7 +255,14 @@ function readFieldValue(page: Page, locator: Locator | null): Promise<string> {
     );
   }
   return page.evaluate((tags: string[]) => {
-    const el = document.activeElement;
+    let el = document.activeElement as TreeWalkElement | null;
+    // Bounded rather than a bare while: a shadow tree that somehow hosts
+    // itself must not turn a readback into a hang.
+    for (let hops = 0; hops < 32; hops += 1) {
+      const inner = el?.shadowRoot?.activeElement;
+      if (!inner) break;
+      el = inner;
+    }
     if (!el) return '';
     return tags.includes(el.tagName) ? el.value ?? '' : el.textContent ?? '';
   }, formControlTags);
@@ -244,55 +311,348 @@ const editContextWarning =
   'instead, with evaluate.';
 
 /**
- * Whether `el`'s textContent can be trusted as a readback, and why not when
- * it cannot. Self-contained on purpose: it runs inside the page through
- * `locator.evaluate`, which serializes only this function's own source, so it
- * takes every message it might return as an argument rather than closing
- * over the module-level constants above.
+ * `<input>` types that are form controls but hold no typed text at all.
+ *
+ * A deny-list rather than an allow-list on purpose: `input.type` is read as
+ * the IDL property, and the browser normalizes any value it does not
+ * recognise to "text", so an input type this list does not name is one that
+ * really does take typed text, including ones invented after this was written.
  */
-function richEditorWarning(
-  el: PageElement,
-  messages: { markers: string; virtualized: string; editContext: string }
-): string | null {
-  let node: PageElement | null = el;
-  for (let hops = 0; node && hops < 8; hops += 1) {
-    if (node.matches(messages.markers)) return messages.virtualized;
-    node = node.parentElement ?? null;
-  }
-  return el.editContext ? messages.editContext : null;
+const nonTextInputTypes = [
+  'checkbox',
+  'radio',
+  'button',
+  'submit',
+  'reset',
+  'image',
+  'file',
+  'color',
+  'range',
+  'hidden'
+];
+
+/**
+ * One element, described in the only terms the write tools actually need:
+ * what it is, whether text can go into it, and whether reading it back
+ * afterwards means anything.
+ *
+ * Facts only, no wording. Every message these drive is built in Node below,
+ * so the in-page half stays small and there is exactly one place to change
+ * what a refusal says.
+ */
+interface TextTargetReport {
+  /** Uppercase tag name, as the DOM reports it. */
+  tag: string;
+  id: string;
+  /** The normalized `type` of an INPUT, null for every other tag. */
+  inputType: string | null;
+  /**
+   * The first couple of class names, which is often the only handle a
+   * refusal has to offer. A CodeMirror's editable node carries no id at all,
+   * so `<div>` on its own tells a caller nothing, while `<div
+   * class="cm-content">` is the selector they need next.
+   */
+  classes: string;
+  /** Inside an editing host: its own `contenteditable`, or an ancestor's. */
+  editable: boolean;
+  /** A verified Monaco or CodeMirror marker at, just above, or just below this element. */
+  rich: boolean;
+  /** An EditContext is attached, so the DOM is not this element's text store at all. */
+  editContext: boolean;
+}
+
+/** A target's description plus where the caret really sits relative to it. */
+interface TextTargetInspection {
+  /** The element the caller named, or the caret holder when there was no selector. Null when neither exists. */
+  target: TextTargetReport | null;
+  /** The element that really has the caret, shadow boundaries crossed. Null when nothing has focus. */
+  caret: TextTargetReport | null;
+  /** The caret holder IS the target. */
+  caretIsTarget: boolean;
+  /** The caret holder sits INSIDE the target, shadow boundaries crossed. */
+  caretInsideTarget: boolean;
 }
 
 /**
- * The same check as `richEditorWarning`, for the no-selector case: there is
- * no locator to evaluate against, only whatever currently has focus, so this
- * reads `document.activeElement` itself before walking up from it. Kept as
- * its own top-level function rather than sharing a call to
- * `richEditorWarning` for the same serialization reason: `page.evaluate` only
- * sends the one function it is given, not whatever it happens to call.
+ * Everything the write tools need to know about an element before they type
+ * into it, gathered in one pass inside the page.
+ *
+ * It is deliberately called two different ways, and tells them apart by the
+ * type of its first argument: `locator.evaluate(fn, arg)` invokes
+ * `fn(element, arg)`, while `page.evaluate(fn, arg)` invokes `fn(arg)`. That
+ * small trick buys something worth having. This logic decides whether a write
+ * happens at all and whether its readback may be believed, and the two
+ * previous rounds of work on this file each fixed one of a pair of
+ * near-identical copies of it and left the other one wrong. There is one copy
+ * now, so a fix cannot reach the selector case and miss the focused case.
+ *
+ * Self-contained for the usual reason: Playwright serializes only this
+ * function's own source, so a call out to a module-level helper would arrive
+ * in the page as undefined. Every inner declaration below is here for that
+ * reason and not out of preference.
  */
-function richEditorWarningForFocused(messages: {
-  markers: string;
-  virtualized: string;
-  editContext: string;
-}): string | null {
-  const el = document.activeElement;
-  if (!el) return null;
-  let node: PageElement | null = el;
-  for (let hops = 0; node && hops < 8; hops += 1) {
-    if (node.matches(messages.markers)) return messages.virtualized;
-    node = node.parentElement ?? null;
+function inspectTextTarget(elOrMarkers: PageElement | string, maybeMarkers?: string): TextTargetInspection {
+  const markers = typeof elOrMarkers === 'string' ? elOrMarkers : (maybeMarkers as string);
+  const named = typeof elOrMarkers === 'string' ? null : (elOrMarkers as unknown as TreeWalkElement);
+
+  // Written as flat loops with no inner functions, which is not a style
+  // choice. The test runner transpiles this file through esbuild with
+  // keepNames on, and esbuild rewrites a nested function declaration into a
+  // `__name(...)` call against a helper that exists in the bundle and not in
+  // the page. Playwright serializes only this function's own source, so that
+  // helper arrives undefined and every call throws "__name is not defined"
+  // inside the browser. The flat shape the rest of this file's in-page
+  // snippets use is the shape that survives serialization.
+
+  // The element that really has the caret. document.activeElement RETARGETS
+  // to the shadow host, so on a page whose editor lives in an open shadow
+  // root it names a plain <div> that can hold no text and whose textContent
+  // does not include the editor's. That is how a write into a shadow-DOM
+  // CodeMirror came back as an empty field and a failed write, with
+  // readbackReliable: true stamped over the top of it. Bounded rather than a
+  // bare while: a malformed shadow tree must not turn a readback into a hang.
+  let caretNode = document.activeElement as TreeWalkElement | null;
+  for (let hops = 0; hops < 32; hops += 1) {
+    const inner = caretNode?.shadowRoot?.activeElement;
+    if (!inner) break;
+    caretNode = inner;
   }
-  return el.editContext ? messages.editContext : null;
+
+  const targetNode = named ?? caretNode;
+  const nodes: (TreeWalkElement | null)[] = [targetNode, caretNode];
+  const reports: (TextTargetReport | null)[] = [null, null];
+
+  for (let which = 0; which < 2; which += 1) {
+    const node = nodes[which];
+    if (!node) continue;
+    // The no-selector case inspects one element as both target and caret;
+    // describing it twice would only cost two more tree walks.
+    if (which === 1 && node === nodes[0]) {
+      reports[1] = reports[0];
+      continue;
+    }
+
+    // A verified rich-editor marker AT or ABOVE the element, stepping out of
+    // a shadow tree through its host wherever the parent chain runs out.
+    // Eight hops, the budget the parentElement-only walk this replaces used.
+    let rich = false;
+    let step: TreeWalkElement | null = node;
+    for (let hops = 0; step && hops < 8; hops += 1) {
+      if (step.matches(markers)) {
+        rich = true;
+        break;
+      }
+      step = step.parentElement ?? step.getRootNode().host ?? null;
+    }
+
+    // And at most two levels BELOW it, a shadow root counting as one level.
+    //
+    // Deliberately shallow, and this is the rule worth justifying. Acres puts
+    // its real CodeMirror behind `[data-testid="expression-editor-input"]`,
+    // whose only child IS the `.cm-editor` root, and a test id named "-input"
+    // is exactly what a QA agent aims at: the markers can sit one hop BELOW
+    // the named element rather than at or above it, which an upward-only walk
+    // can never see. Two levels covers that wrapper and one more around it.
+    // An unbounded querySelector would not do: from <body>, or from a panel
+    // that merely CONTAINS an editor somewhere, it would flag a readback that
+    // legitimately covers far more than the editor, and the marker list was
+    // kept to markers verified on real Monaco and CodeMirror precisely so
+    // that nothing gets flagged for a problem it does not have. Under-firing
+    // costs a false claim about one element; over-firing costs the meaning of
+    // the flag everywhere.
+    let frontier: TreeWalkElement[] = rich ? [] : [node];
+    for (let depth = 0; depth < 2 && !rich && frontier.length > 0; depth += 1) {
+      const next: TreeWalkElement[] = [];
+      for (const parent of frontier) {
+        const own = parent.children;
+        for (let i = 0; own && i < own.length; i += 1) next.push(own[i]);
+        const shadow = parent.shadowRoot?.children;
+        for (let i = 0; shadow && i < shadow.length; i += 1) next.push(shadow[i]);
+      }
+      for (const kid of next) {
+        if (kid.matches(markers)) {
+          rich = true;
+          break;
+        }
+      }
+      frontier = next;
+    }
+
+    reports[which] = {
+      tag: node.tagName,
+      id: node.id,
+      // `.type` on an INPUT is the normalized IDL property, not the raw
+      // attribute, so an omitted or unrecognised type reads back as "text".
+      inputType: node.tagName === 'INPUT' ? node.type ?? 'text' : null,
+      // Two names at most: enough to identify a widget, short enough that a
+      // utility-class-heavy element does not bury the rest of the message.
+      classes: (node.getAttribute('class') ?? '').split(/\s+/).filter(Boolean).slice(0, 2).join(' '),
+      editable: node.isContentEditable === true,
+      rich,
+      editContext: Boolean(node.editContext)
+    };
+  }
+
+  // Whether the caret sits inside the target. Node.contains does not cross a
+  // shadow boundary, so the containment test walks the parent chain and steps
+  // out through each host instead.
+  let caretInsideTarget = false;
+  if (caretNode && targetNode && caretNode !== targetNode) {
+    let step: TreeWalkElement | null = caretNode;
+    for (let hops = 0; step && hops < 64; hops += 1) {
+      if (step === targetNode) {
+        caretInsideTarget = true;
+        break;
+      }
+      step = step.parentElement ?? step.getRootNode().host ?? null;
+    }
+  }
+
+  return {
+    target: reports[0],
+    caret: reports[1],
+    caretIsTarget: caretNode !== null && caretNode === targetNode,
+    caretInsideTarget
+  };
 }
 
-/** Arguments `richEditorWarning`/`richEditorWarningForFocused` are called with, bundled once. */
-const richEditorWarningMessages = { markers: richEditorMarkers, virtualized: virtualizedEditorWarning, editContext: editContextWarning };
+/**
+ * Runs `inspectTextTarget` against the named element, or against whatever
+ * holds the caret when there is no selector to name one.
+ *
+ * The cast is the Node-side half of the two-call-shapes trick documented on
+ * `inspectTextTarget`: page.evaluate passes its argument as the FIRST
+ * parameter, which is exactly what that function is written to expect.
+ */
+function inspectTarget(page: Page, locator: Locator | null): Promise<TextTargetInspection> {
+  return locator
+    ? locator.evaluate(inspectTextTarget, richEditorMarkers)
+    : page.evaluate(inspectTextTarget as (markers: string) => TextTargetInspection, richEditorMarkers);
+}
+
+/**
+ * Whether an element can actually hold typed text.
+ *
+ * This is the question the guards used to get wrong by asking a different one.
+ * Taking FOCUS is not taking TEXT: React Flow gives every canvas node
+ * `tabindex="0"` so it can handle arrow keys, so an ordinary click on an Acres
+ * node leaves `document.activeElement` on a plain `<div>`, and a guard that
+ * rejected only BODY and HTML waved it straight through. Tag name cannot
+ * answer this; what the element does with a keystroke can.
+ */
+function canReceiveText(report: TextTargetReport): boolean {
+  if (report.tag === 'TEXTAREA') return true;
+  // A SELECT is a form control that holds no typed text either. It gets its
+  // own message rather than the generic one, so it is not answered here.
+  if (report.tag === 'INPUT') return !nonTextInputTypes.includes(report.inputType ?? 'text');
+  return report.editable;
+}
+
+/** How an element is named in a refusal: `<div id="wrap">`, or `<input type="checkbox">` when there is no id. */
+function describeTextTarget(report: TextTargetReport): string {
+  const type = report.tag === 'INPUT' && report.inputType ? ` type="${report.inputType}"` : '';
+  const id = report.id ? ` id="${report.id}"` : '';
+  // The class only earns its place when there is no id to name the element by.
+  const classes = !report.id && report.classes ? ` class="${report.classes}"` : '';
+  return `<${report.tag.toLowerCase()}${type}${id}${classes}>`;
+}
+
+/** The tool that can act on a form control which takes no typed text, when there is one. */
+function toolForNonTextControl(report: TextTargetReport): string {
+  if (report.tag !== 'INPUT') return '';
+  const type = report.inputType ?? 'text';
+  if (type === 'file') return 'Use file_upload to give a file input a file. ';
+  if (type === 'checkbox' || type === 'radio') return 'Use click to toggle it. ';
+  if (type === 'button' || type === 'submit' || type === 'reset' || type === 'image') return 'Use click to press it. ';
+  if (type === 'range' || type === 'color') {
+    return 'A range or colour input is driven by the pointer, not the keyboard: use drag, or set it through evaluate and dispatch the input event the page listens for. ';
+  }
+  return '';
+}
+
+/**
+ * Why a write was refused, in one message, shared by `fill` and by `type`'s
+ * no-selector guard because the mistake is the same one approached from two
+ * directions: an element that can take focus is not an element that can take
+ * text.
+ *
+ * The harm this exists to stop was measured, not reasoned about. On the real
+ * Acres canvas, an ordinary click on a node followed by `type` with
+ * `clear: true` pressed select-all and Delete at document level, React Flow
+ * handled the Delete as "remove the selected node", and the flow went from
+ * three nodes to two while the result said `matched: false`, which reads as
+ * "nothing happened". On a fixture, `fill` aimed at a plain `<div>` wrapper
+ * whose focused child was a contenteditable wrote into the CHILD and reported
+ * `matched: true` against the wrapper's textContent. Both are writes into an
+ * element the caller never named, and neither is something to do quietly.
+ */
+function refusalForUnwritableTarget(lead: string, target: TextTargetReport, inspection: TextTargetInspection): string {
+  const reason =
+    target.tag === 'INPUT'
+      ? `${describeTextTarget(target)} is a form control, but not one that holds typed text`
+      : `${describeTextTarget(target)} is not an input, a textarea, or a contenteditable, so a keystroke has nowhere to land in it`;
+
+  const caret = inspection.caret;
+  const caretNote =
+    caret && inspection.caretInsideTarget && canReceiveText(caret)
+      ? `The caret is actually on ${describeTextTarget(caret)} INSIDE it, so the select-all and Delete would have gone to ` +
+        'THAT element: the write would have landed somewhere the selector never named, and the readback would have ' +
+        'been the named element\'s textContent rather than the written field\'s. Point the selector at it instead. '
+      : caret && !inspection.caretIsTarget && canReceiveText(caret)
+        ? `The caret is on ${describeTextTarget(caret)}, somewhere else on the page entirely. `
+        : '';
+
+  // Worth saying even when nothing is focused yet, which is the ordinary way
+  // this refusal is met: a QA agent aims at a test id and has clicked nothing.
+  // Without this the message would name the element and stop, leaving the one
+  // fact that gets the caller unstuck unsaid, and Acres's own expression field
+  // is exactly that shape: `[data-testid="expression-editor-input"]` is a
+  // wrapper whose only child is the `.cm-editor` root.
+  const richNote =
+    caret?.rich || target.rich
+      ? 'There is a verified Monaco or CodeMirror marker at or just below this element, so it is the wrapper around a ' +
+        'rich editor rather than the editor itself. Point the selector at the editable node inside it (".cm-content" ' +
+        'for CodeMirror, the [data-mode-id] node for Monaco), and read its value back through the editor\'s own API ' +
+        'rather than the DOM. '
+      : '';
+
+  return `${lead}: ${reason}. ` + caretNote + richNote + toolForNonTextControl(target);
+}
+
+/** Why this element's textContent readback cannot be believed, or null when it can. */
+function readbackWarningFor(target: TextTargetReport | null): string | null {
+  if (!target) return null;
+  if (target.rich) return virtualizedEditorWarning;
+  return target.editContext ? editContextWarning : null;
+}
 
 /** What the field really holds, plus whether that readback is one a rich editor can defeat. */
-function readReadbackReliability(page: Page, locator: Locator | null): Promise<string | null> {
-  return locator
-    ? locator.evaluate(richEditorWarning, richEditorWarningMessages)
-    : page.evaluate(richEditorWarningForFocused, richEditorWarningMessages);
+async function readReadbackReliability(page: Page, locator: Locator | null): Promise<string | null> {
+  const { target } = await inspectTarget(page, locator);
+  return readbackWarningFor(target);
+}
+
+/**
+ * Refuses a WRITE whose selector matches more than one element, in this file's
+ * own voice rather than Playwright's.
+ *
+ * click and hover act on the first match and say so in a note, because looking
+ * at the wrong element is recoverable. A write is not: fill and type change
+ * the page, and Playwright's strict mode is exactly what stops them writing
+ * into an arbitrary one of several matches. The strictness is right. What was
+ * wrong is that it surfaced as a raw "strict mode violation" thrown from deep
+ * inside a readback, naming neither the tool that refused nor the way out,
+ * while hover had proper guidance for the identical situation.
+ */
+async function assertSingleWriteTarget(tool: string, locator: Locator, selector: string): Promise<void> {
+  const matched = await locator.count().catch(() => undefined);
+  if (matched === undefined || matched <= 1) return;
+  throw new Error(
+    `${tool} will not write into ${JSON.stringify(selector)}: it matches ${matched} elements, and picking one of them ` +
+      'would change the page rather than merely look at the wrong thing. Playwright selectors also pierce open shadow ' +
+      'roots, so a positional path can match more of the page than it looks like it does. Narrow the selector, append ' +
+      '" >> nth=0" to name one match explicitly, or use find to confirm which element you meant. Nothing was written.'
+  );
 }
 
 /**
@@ -305,32 +665,63 @@ function readReadbackReliability(page: Page, locator: Locator | null): Promise<s
  * produced `{{ $json.mode }}result`: the editor never saw the old text go
  * away. Deleting with a key press is what a human does, so the editor handles
  * it the way it handles a human.
+ *
+ * Before any of that it asks whether the named element can hold typed text at
+ * all, which is a different question from what its tag is and from where focus
+ * happens to be. The guard this replaces asked only whether focus had landed
+ * at OR INSIDE the target, and "inside" is what made it dangerous: naming a
+ * plain wrapper whose focused child was a contenteditable passed the guard and
+ * wrote into the CHILD.
  */
 async function setFieldValue(page: Page, locator: Locator, value: string): Promise<void> {
-  const tagName = await tagNameOf(locator);
+  const inspection = await inspectTarget(page, locator);
+  const target = inspection.target;
+  if (target === null) {
+    throw new Error(
+      'fill could not read the element the selector resolved to, so it wrote nothing rather than typing into something it could not identify.'
+    );
+  }
+
   // Playwright's fill has never accepted a <select>, and the error it throws
   // describes the element rather than the way out, so say the way out here.
-  if (tagName === 'SELECT') {
+  if (target.tag === 'SELECT') {
     throw new Error(
       'fill cannot set a <select>: it only works on an input, a textarea or a contenteditable. Use select_option instead, which picks by value, by label or by index and reads the resulting selection back.'
     );
   }
-  if (formControlTags.includes(tagName)) {
+
+  if (!canReceiveText(target)) {
+    throw new Error(
+      refusalForUnwritableTarget('fill was pointed at an element that cannot receive text', target, inspection) +
+        'Nothing was written.'
+    );
+  }
+
+  if (formControlTags.includes(target.tag)) {
     await locator.fill(value);
     return;
   }
+
   await locator.focus();
 
   // Select-all is scoped to whatever holds the caret, so pressing it while
   // focus never landed on the target would select the whole document and the
   // delete below would empty the page. Refuse loudly instead.
-  const focused = await locator.evaluate((el: PageElement) => {
-    const active = document.activeElement;
-    return active !== null && (active === el || el.contains(active));
-  });
-  if (!focused) {
+  //
+  // "Landed on the target" is read through inspectTextTarget's shadow-piercing
+  // walk. document.activeElement retargets to the shadow host, so the identity
+  // test this replaces could not see focus that had genuinely landed inside an
+  // open shadow root: fill on a shadow-DOM contenteditable threw this error
+  // every single time while the element was, in fact, focused, and the write
+  // never happened at all.
+  const afterFocus = await inspectTarget(page, locator);
+  if (!afterFocus.caretIsTarget && !afterFocus.caretInsideTarget) {
     throw new Error(
-      'fill could not put focus inside the target element, so it stopped rather than pressing select-all against the whole document. Is the selector pointing at an input, a textarea, or a contenteditable?'
+      'fill could not put focus inside the target element, so it stopped rather than pressing select-all against the whole document. ' +
+        (afterFocus.caret
+          ? `The caret is on ${describeTextTarget(afterFocus.caret)}, which is outside the element named. `
+          : 'Nothing has focus at all. ') +
+        'Is the selector pointing at an input, a textarea, or a contenteditable? Nothing was written.'
     );
   }
 
@@ -1094,7 +1485,9 @@ export const interactionTools = defineTools({
   fill: defineTool({
     serializesInput: true,
     description:
-      'Set a field\'s contents in a session\'s tab, REPLACING whatever was there. Use type instead to append, or to fire per-character events. For an input, textarea or select this is Playwright\'s atomic fill. For a contenteditable, including rich editors like CodeMirror and Monaco, it focuses the element and replaces through real keyboard events (select-all, delete, insert), because those editors keep their own document model and treat a plain insertion as an insert at their cursor, appending onto the existing value instead of replacing it. Reads the field back afterwards, but that readback is DOM textContent, and for a real Monaco or CodeMirror instance textContent is not the whole story: both virtualize their lines, so it only covers what is currently rendered and reads back truncated for anything long, and an element with an EditContext attached keeps its real text there rather than in the DOM at all. When the target looks like one of these the result says so plainly: "readbackReliable" is false, "matched" is not claimed either way, and "note" names the editor\'s own API to read the value through instead (e.g. monaco.editor.getModels()[0].getValue()). For an ordinary field the result carries "value" (what the field really contains now), "matched", "readbackReliable": true, and a "note" explaining the difference when value and the request disagree.',
+      'Set a field\'s contents in a session\'s tab, REPLACING whatever was there. Use type instead to append, or to fire per-character events. For an input, textarea or select this is Playwright\'s atomic fill. For a contenteditable, including rich editors like CodeMirror and Monaco, it focuses the element and replaces through real keyboard events (select-all, delete, insert), because those editors keep their own document model and treat a plain insertion as an insert at their cursor, appending onto the existing value instead of replacing it. ' +
+      'The selector has to name an element that can actually HOLD typed text, and that is checked before anything is written: a text-holding input, a textarea, or something inside a contenteditable. Naming anything else is refused with a message saying what it is. That includes the case that looks like it works: a plain wrapper <div> around a focused field passed the old guard and the write went into the CHILD, reported as a clean success against the wrapper\'s textContent, so a value landed in an element the caller never named. It also refuses a <select> (use select_option), a checkbox, radio, button or file input (click, or file_upload), and a selector matching several elements, because choosing one of them would change the page rather than merely look at the wrong thing. ' +
+      'Reads the field back afterwards, but that readback is DOM textContent, and for a real Monaco or CodeMirror instance textContent is not the whole story: both virtualize their lines, so it only covers what is currently rendered and reads back truncated for anything long, and an element with an EditContext attached keeps its real text there rather than in the DOM at all. The markers that detect one of these are looked for at the named element, above it (out through any open shadow root), and up to two levels below it, because a selector aimed at a wrapper one hop above the editor root is the ordinary case: Acres\'s own CodeMirror sits behind [data-testid="expression-editor-input"], whose only child is the .cm-editor root. When the target looks like one of these the result says so plainly: "readbackReliable" is false, "matched" is not claimed either way, and "note" names the editor\'s own API to read the value through instead (e.g. monaco.editor.getModels()[0].getValue()). For an ordinary field the result carries "value" (what the field really contains now), "matched", "readbackReliable": true, and a "note" explaining the difference when value and the request disagree.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -1106,6 +1499,11 @@ export const interactionTools = defineTools({
     async handler(ctx, args) {
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
       const locator = target.page.locator(args.selector);
+      // Before anything is read or written. A multi-match selector used to
+      // surface as a raw Playwright strict-mode error thrown from deep inside
+      // a readback, naming neither the tool that refused nor the way out,
+      // while hover had proper guidance for the identical situation.
+      await assertSingleWriteTarget('fill', locator, args.selector);
       await setFieldValue(target.page, locator, args.value);
       const actual = await readFieldValue(target.page, locator);
       const readbackWarning = await readReadbackReliability(target.page, locator);
@@ -1122,7 +1520,9 @@ export const interactionTools = defineTools({
   type: defineTool({
     serializesInput: true,
     description:
-      'Type text into a session\'s tab character by character, with real key events, so per-character handlers, debounces, autocomplete and anything firing on a keystroke actually run. fill sets the value in one step and cannot exercise those. Does NOT clear the field first: it inserts at the caret, which is what a user typing does, so calling it twice types twice. Pass clear: true to replace the contents instead. Where the caret sits is the browser\'s call, not this tool\'s: focusing an input puts it after the existing text, focusing a contenteditable puts it before, so click the spot first if the insertion point matters. With no selector the keystrokes go to whatever currently has focus, and if NOTHING has focus this refuses outright rather than guessing: with no field to type into or read back, the only thing "no selector" could act on is the document itself, which on a contenteditable page means select-all-and-delete on clear would empty the page, and even without clear, reading the caret holder back would return document.activeElement, which is <body>, so the result would carry the entire page\'s text as "value" instead of any one field\'s. Reads the field back afterwards, but that readback is DOM textContent, and for a real Monaco or CodeMirror instance textContent is not the whole story: both virtualize their lines, so it only covers what is currently rendered and reads back truncated for anything long, and an element with an EditContext attached keeps its real text there rather than in the DOM at all. When the target looks like one of these the result says so plainly: "readbackReliable" is false, "matched" is not claimed either way, and "note" names the editor\'s own API to read the value through instead. For an ordinary field the result carries "value" (what the field really contains now), "previousValue" (what it held BEFORE the call, clear included, so a clear cannot throw something away invisibly), "matched", "readbackReliable": true, and a "note" when what landed is not the typed text inserted into what was already there.',
+      'Type text into a session\'s tab character by character, with real key events, so per-character handlers, debounces, autocomplete and anything firing on a keystroke actually run. fill sets the value in one step and cannot exercise those. Does NOT clear the field first: it inserts at the caret, which is what a user typing does, so calling it twice types twice. Pass clear: true to replace the contents instead. Where the caret sits is the browser\'s call, not this tool\'s: focusing an input puts it after the existing text, focusing a contenteditable puts it before, so click the spot first if the insertion point matters. ' +
+      'With no selector the keystrokes go to whatever currently has focus, and this refuses unless that element can actually HOLD typed text: a text-holding input, a textarea, or something inside a contenteditable. Taking focus is not the same as taking text, and the difference is destructive. React Flow gives canvas nodes tabindex="0" so they can handle arrow keys, so an ordinary click on an Acres node leaves focus on a plain <div>; with clear: true the select-all and Delete that follow reach the canvas, which reads Delete as "remove the selected node". Measured on the real app: three nodes before the call, two after, reported as matched: false. Without clear, reading that same <div> back returns its rendered text and inline CSS rather than any field\'s value. The caret holder is resolved through open shadow roots, because document.activeElement reports the shadow HOST rather than the element that really has focus. A selector matching several elements is refused too, since choosing one of them would change the page. ' +
+      'Reads the field back afterwards, but that readback is DOM textContent, and for a real Monaco or CodeMirror instance textContent is not the whole story: both virtualize their lines, so it only covers what is currently rendered and reads back truncated for anything long, and an element with an EditContext attached keeps its real text there rather than in the DOM at all. Those markers are looked for at the target, above it (out through any open shadow root) and up to two levels below it, so a selector aimed at a wrapper just above the editor root is still recognised. When the target looks like one of these the result says so plainly: "readbackReliable" is false, "matched" is not claimed either way, and "note" names the editor\'s own API to read the value through instead. For an ordinary field the result carries "value" (what the field really contains now), "previousValue" (what it held BEFORE the call, clear included, so a clear cannot throw something away invisibly), "matched", "readbackReliable": true, and a "note" when what landed is not the typed text inserted into what was already there.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -1145,22 +1545,41 @@ export const interactionTools = defineTools({
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
       const locator = args.selector === undefined ? null : target.page.locator(args.selector);
 
+      // Before anything is read or written, the same reason fill checks first:
+      // a selector matching several elements would have this tool pick one and
+      // change it, and Playwright's own refusal arrived as a bare strict-mode
+      // error from inside a readback.
+      if (locator !== null && args.selector !== undefined) {
+        await assertSingleWriteTarget('type', locator, args.selector);
+      }
+
       // Runs before ANYTHING else, including the very first readback below.
-      // With no selector, "nothing has focus" is not just a clear-time danger
-      // (select-all against the whole document): reading the field back is
-      // document.activeElement too, and an unfocused page's activeElement is
-      // <body>, so its textContent is the entire page rather than any field's.
-      // That produced a result with a multi-thousand-character page dump
-      // masquerading as a field's value, twice over (previousValue and value
-      // both), for a call that never told the caller anything about a field
-      // at all. Refusing outright is the same call fill's own focus guard
-      // makes, just made before the read that clear alone used to gate.
+      //
+      // The question is whether the caret holder can RECEIVE TEXT, not what
+      // its tag is. The guard this replaces rejected only BODY and HTML, and
+      // that is not the same test: React Flow gives every canvas node
+      // tabindex="0" so it can handle arrow keys, so an ordinary click on an
+      // Acres node leaves document.activeElement on a plain <div>, which
+      // sailed through. With clear: true the select-all and Delete that
+      // followed went to the canvas, which handles Delete as "remove the
+      // selected node". Measured on the real app: three nodes before the call,
+      // two after, and a result saying matched: false, which reads as nothing
+      // happened. Without clear, the same call read that <div> back and
+      // returned 1176 characters of rendered widget text and inline CSS as
+      // both previousValue and value, stamped readbackReliable: true.
+      //
+      // The caret holder is resolved THROUGH open shadow roots, because
+      // document.activeElement retargets to the shadow host: a page whose
+      // editor lives in a shadow root reported a plain host <div> here, passed
+      // the old tag test on that basis, landed the write in the editor, and
+      // read the host's own (empty) textContent back as the field's value.
       if (locator === null) {
-        const holder = await target.page.evaluate(() => {
-          const el = document.activeElement;
-          if (!el) return null;
-          return { tag: el.tagName, id: el.id };
-        });
+        const inspection = await inspectTarget(target.page, null);
+        const holder = inspection.caret;
+        // BODY and HTML keep a refusal of their own even when the page has
+        // made them editable, because "can it receive text" is then genuinely
+        // yes and still the wrong thing to act on: the readback would be the
+        // whole document's text, and a clear would empty the page.
         if (holder === null || holder.tag === 'BODY' || holder.tag === 'HTML') {
           throw new Error(
             'type has no selector and nothing has focus, so there is no field to act on: the caret is in the ' +
@@ -1171,6 +1590,24 @@ export const interactionTools = defineTools({
                   'emptying a contenteditable page'
                 : '') +
               '. Pass "selector" to name the field, or click into it first. Nothing was typed' +
+              (args.clear ? ' and nothing was cleared.' : '.')
+          );
+        }
+        if (!canReceiveText(holder)) {
+          throw new Error(
+            refusalForUnwritableTarget(
+              'type has no selector, and the element that currently has focus cannot receive text',
+              holder,
+              inspection
+            ) +
+              'The element only has focus because something gave it a tabindex, which is what a canvas, a tree or a ' +
+              'list widget does so it can handle arrow keys; that is not the same as being a field.' +
+              (args.clear
+                ? ' With clear: true the select-all and Delete would have gone to the document, and a widget that ' +
+                  'reads Delete as "remove the selected item" acts on it: this has been measured deleting a node from ' +
+                  'a React Flow canvas.'
+                : ' Reading it back would return its rendered text and inline CSS rather than any field\'s value.') +
+              ' Pass "selector" to name the field, or click into the field itself first. Nothing was typed' +
               (args.clear ? ' and nothing was cleared.' : '.')
           );
         }
@@ -1240,10 +1677,12 @@ export const interactionTools = defineTools({
           'Key or chord in Playwright syntax: Enter, Escape, ArrowDown, Backspace, a, Shift+Tab, and so on. Some ' +
             'names are stricter than they look: Return and Esc both throw ("Unknown key"), it is Enter and Escape. ' +
             'Cmd throws too, it is Meta. A modifier chord that merely presses fine is not the same as one that does ' +
-            'anything: Control+a on a platform whose select-all is bound to Meta reports an ordinary success and ' +
-            'selects nothing, because the browser has no accelerator on that chord at all. Use ControlOrMeta+ for a ' +
-            'platform editing accelerator (select-all and the rest): Playwright resolves it to Meta on macOS and ' +
-            'Control everywhere else, so it does the right thing on every platform this runs on.'
+            'what you meant, and this tool does not read the effect back. On a platform whose select-all is bound to ' +
+            'Meta, Control+a reaches no select-all accelerator; it is also not a no-op, because Chromium honours the ' +
+            'macOS emacs bindings, so Control+a moves the caret to the start of the line, Control+e to the end, and ' +
+            'Control+k deletes to the end of the line. Use ControlOrMeta+ for a platform editing accelerator ' +
+            '(select-all and the rest): Playwright resolves it to Meta on macOS and Control everywhere else, so it ' +
+            'does the right thing on every platform this runs on.'
         ),
       selector: z
         .string()
@@ -1297,6 +1736,7 @@ export const interactionTools = defineTools({
     description:
       'Hover the mouse over an element in a session\'s tab, moving the real pointer to it. Synthetic pointerover/mouseover events dispatched from a script only exercise the page\'s own listeners: they cannot satisfy a CSS-only :hover rule, and they cannot open a tooltip that depends on real pointer geometry. This can. Pass x and y together to hover a specific offset from the element\'s top-left corner. ' +
       'This does NOT require the selector to be unique: like click, when it matches several elements the FIRST one is hovered, and no error is raised. The result carries "matchedElements" for that reason, with a note whenever it is more than one, because Playwright selectors pierce open shadow roots and a positional path can match far more of the page than it appears to. Read it before concluding the right thing was hovered. ' +
+      'A selector matching NOTHING is waited for, not failed immediately, because an element that appears a moment later is still one to hover: the cost is that such a call spends the whole timeout before giving up. When it does, the error says so in plain terms, and says whether the selector still matches nothing (a selector problem: check it with find, or wait_for the element first) or matches something the pointer could not be moved to (a page problem: hidden, still animating, zero-sized or covered, which element_box and computed_style can show). ' +
       'Returns whether the element matches :hover afterwards as "hovering", read back against the exact element that was hovered rather than the bare selector, because reading a multi-match selector through evaluate is strict mode where hovering it is not: without that, hovering a selector matching several elements used to come back as "hovering": false, the opposite of what really happened, since the readback threw on the ambiguity and the failure was swallowed into a false negative. On the rare occasion the readback genuinely cannot run at all, for instance because the hover triggered something that removed the element from the DOM, "hovering" is null rather than false, with a note explaining why, so a readback that could not run is never mistaken for a confirmed "not hovering".',
     inputSchema: z.object({
       sessionId,
@@ -1317,7 +1757,40 @@ export const interactionTools = defineTools({
       // several elements it silently hovers the FIRST one and reports the
       // same result either way.
       const matchedElements = await target.page.locator(args.selector).count().catch(() => undefined);
-      await target.page.hover(args.selector, position ? { position } : undefined);
+      // Playwright WAITS for a selector rather than failing straight away,
+      // which is the right behaviour (an element that appears a moment later
+      // is still an element to hover) and the reason a selector matching
+      // nothing costs the whole timeout. What was wrong is what the caller got
+      // for that wait: a raw Playwright TimeoutError, with none of the
+      // guidance the rest of this file gives for the same class of mistake.
+      // The wait is kept; only the explanation is added, with the match count
+      // re-read afterwards so the message can tell "never appeared" apart from
+      // "appeared but could not be acted on".
+      const startedAt = Date.now();
+      try {
+        await target.page.hover(args.selector, position ? { position } : undefined);
+      } catch (err) {
+        if (!(err instanceof Error) || err.name !== 'TimeoutError') throw err;
+        const waitedMs = Date.now() - startedAt;
+        const stillMatching = await target.page.locator(args.selector).count().catch(() => undefined);
+        if (stillMatching === 0) {
+          throw new Error(
+            `hover found nothing to hover: ${JSON.stringify(args.selector)} matched no elements when the call ` +
+              `started and still matches none ${waitedMs}ms later, which is why this took as long as it did. ` +
+              'Playwright waits for a selector to appear rather than failing immediately, so the whole timeout is ' +
+              'spent on an element that never arrives. Check the selector with find, or wait for the element with ' +
+              'wait_for first when it is meant to appear in response to something else. The pointer was not moved.'
+          );
+        }
+        throw new Error(
+          `hover could not act on ${JSON.stringify(args.selector)} within ${waitedMs}ms, even though it matches ` +
+            `${stillMatching ?? 'some'} element(s) now. Playwright hovers only an element that is visible, stable ` +
+            'and actually hit-testable at the point it aims at, so this is a real finding about the page rather ' +
+            'than a selector typo: the element is hidden, still animating, zero-sized, or covered by something ' +
+            'else. element_box reports its geometry and whether anything is on top of it, and computed_style ' +
+            'reports the visibility. The pointer was not moved.'
+        );
+      }
       // Read back against .first(), not the bare locator. locator.evaluate IS
       // strict mode, so on a selector matching several elements it used to
       // throw where page.hover just silently acted on the first one, and the
