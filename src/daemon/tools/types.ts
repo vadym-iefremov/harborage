@@ -1,4 +1,4 @@
-import type * as z from 'zod/v4';
+import * as z from 'zod/v4';
 
 import type { SessionStore } from '../sessions.js';
 
@@ -58,12 +58,84 @@ export interface ToolDef<S extends z.ZodObject<any> = z.ZodObject<any>> {
 }
 
 /**
- * Identity helper that pins one tool's schema type so the handler's `args`
- * is inferred from `inputSchema` instead of falling back to the loose
- * default. Purely a type-level aid: it returns exactly what it is given.
+ * Edit distance, used only to decide whether an unrecognized key is close
+ * enough to a real one to be worth guessing at. Iterative, not recursive:
+ * these keys are a handful of characters each, so the classic O(n*m) table
+ * is plenty, and it never risks a stack blowing up on adversarial input.
+ */
+function levenshtein(a: string, b: string): number {
+  const rows = a.length + 1;
+  const cols = b.length + 1;
+  const distances: number[][] = Array.from({ length: rows }, () => new Array<number>(cols).fill(0));
+  for (let i = 0; i < rows; i++) distances[i][0] = i;
+  for (let j = 0; j < cols; j++) distances[0][j] = j;
+  for (let i = 1; i < rows; i++) {
+    for (let j = 1; j < cols; j++) {
+      distances[i][j] =
+        a[i - 1] === b[j - 1]
+          ? distances[i - 1][j - 1]
+          : 1 + Math.min(distances[i - 1][j], distances[i][j - 1], distances[i - 1][j - 1]);
+    }
+  }
+  return distances[a.length][b.length];
+}
+
+/** How close a misspelled key has to be to a real one before it is worth guessing at, rather than left unexplained. */
+const maxSuggestionDistance = 3;
+
+function closestValidKey(key: string, validKeys: string[]): string | undefined {
+  let best: string | undefined;
+  let bestDistance = maxSuggestionDistance + 1;
+  for (const candidate of validKeys) {
+    const distance = levenshtein(key, candidate);
+    if (distance < bestDistance) {
+      best = candidate;
+      bestDistance = distance;
+    }
+  }
+  return bestDistance <= maxSuggestionDistance ? best : undefined;
+}
+
+/**
+ * Rejects any key a caller passes that is not one of a schema's own fields,
+ * with a message that names the offending key and, when a real parameter
+ * looks close enough to be the one that was meant, guesses which.
+ *
+ * A plain `z.object(...)` silently drops a key it does not recognize rather
+ * than rejecting it, which is fine for a hand-written caller but not for an
+ * LLM one, which invents plausible parameter names constantly. Verified
+ * against the real transport: `wait_for` called with `{ timeout: 2000 }`
+ * (the schema's field is `timeoutMs`) had the typo discarded and ran with
+ * the 10000ms default, returning after 10007ms, five times what the caller
+ * actually asked for; a second call with an invented `wibble` key was
+ * accepted without complaint. Applied once here, in the one place every
+ * tool's schema passes through, rather than in 58 separate `z.object` calls.
+ */
+function rejectUnknownKeys<S extends z.ZodObject<any>>(schema: S): S {
+  const validKeys = Object.keys(schema.shape);
+  return z.strictObject(schema.shape, {
+    error: issue => {
+      if (issue.code !== 'unrecognized_keys') return undefined;
+      const named = issue.keys.map(key => {
+        const suggestion = closestValidKey(key, validKeys);
+        return suggestion === undefined ? `"${key}"` : `"${key}" (did you mean "${suggestion}"?)`;
+      });
+      return (
+        `Unrecognized parameter${issue.keys.length > 1 ? 's' : ''}: ${named.join(', ')}. ` +
+        `Valid parameters for this tool: ${validKeys.join(', ')}.`
+      );
+    }
+  }) as unknown as S;
+}
+
+/**
+ * Identity helper for everything except the schema, which it also makes
+ * strict (see `rejectUnknownKeys`). Otherwise pins one tool's schema type so
+ * the handler's `args` is inferred from `inputSchema` instead of falling
+ * back to the loose default.
  */
 export function defineTool<S extends z.ZodObject<any>>(def: ToolDef<S>): ToolDef<S> {
-  return def;
+  return { ...def, inputSchema: rejectUnknownKeys(def.inputSchema) };
 }
 
 /**

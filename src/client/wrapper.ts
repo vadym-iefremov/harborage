@@ -155,6 +155,53 @@ function createDaemonConnection(config: Config): DaemonConnection {
 }
 
 /**
+ * The MCP SDK's own default (`DEFAULT_REQUEST_TIMEOUT_MSEC`), kept as an
+ * explicit floor: a tool with no `timeoutMs`, or one under a minute, is
+ * timed exactly as it always was, unaffected by anything below.
+ */
+export const minRequestTimeoutMs = 60_000;
+
+/**
+ * Headroom given to a request beyond the `timeoutMs` a caller passed, so the
+ * tool's own timeout fires first and the caller gets its real, informative
+ * result instead of a bare transport error. Verified against the real
+ * transport: `wait_for` with `timeoutMs: 70000` actually settled at
+ * 70006ms, a 6ms overhead; five more `wait_for` calls at 1500ms and 5000ms
+ * showed the same handful of milliseconds. Ten seconds is generous headroom
+ * over that for a slower connection or a busier daemon, not a measurement of
+ * the overhead itself.
+ */
+export const requestTimeoutMarginMs = 10_000;
+
+/**
+ * Derives the transport-level timeout for one forwarded call from the
+ * `timeoutMs` a caller passed the tool itself, if any.
+ *
+ * Every tool that takes a `timeoutMs` (`wait_for`, `evaluate`, drag/wheel
+ * endpoint resolution, `download_file`, selector captures) is meant to
+ * bound ITS OWN wait, not the transport call carrying it. Before this,
+ * `client.callTool()` ran with no request options at all, so every one of
+ * them silently inherited the MCP SDK's 60-second default regardless of
+ * what was asked for: verified against the real transport, `wait_for` with
+ * `timeoutMs: 150000` threw a bare `SdkError REQUEST_TIMEOUT "Request timed
+ * out"` at exactly 60002ms, thirty seconds before the tool's own timeout
+ * would have fired, and carrying none of the "waiting for selector to be
+ * visible" context the tool's real timeout message would have had.
+ *
+ * `timeoutMs: 0` is `evaluate`'s documented "wait forever" (see its
+ * description in `src/daemon/tools/defs/inspect.ts`), which the wrapper
+ * cannot honor literally without risking pinning its one connection to the
+ * daemon indefinitely on a single wedged call, so "forever" here means "for
+ * as long as `ceilingMs` allows" rather than truly unbounded.
+ */
+export function requestTimeoutFor(args: Record<string, unknown>, ceilingMs: number): number {
+  const requested = typeof args.timeoutMs === 'number' ? args.timeoutMs : undefined;
+  if (requested === undefined) return minRequestTimeoutMs;
+  if (requested === 0) return ceilingMs;
+  return Math.min(Math.max(requested + requestTimeoutMarginMs, minRequestTimeoutMs), ceilingMs);
+}
+
+/**
  * Forwards one tool call, arguments unchanged, to the daemon; returns the
  * daemon's result unchanged.
  *
@@ -163,16 +210,25 @@ function createDaemonConnection(config: Config): DaemonConnection {
  * client left, or restarted to pick up a code change) no longer bricks every
  * open Claude Code session until the CLI itself is restarted. Once, not in a
  * loop: a daemon that genuinely cannot come back should fail fast.
+ *
+ * The derived timeout (see `requestTimeoutFor`) applies to the retry leg
+ * too, not just the first attempt: a call worth waiting 70 seconds for the
+ * first time is worth waiting 70 seconds for after a reconnect, and
+ * `transportFailureReason` already keeps a genuine `RequestTimeout` out of
+ * the retry path (see its comment), so nothing here makes a real tool-level
+ * timeout look like a transport failure worth retrying.
  */
 function forwardTool<T extends ToolName>(
   name: T,
   ensureReady: () => Promise<Client>,
+  requestTimeoutCeilingMs: number,
   invalidate?: (stale: Client) => void
 ) {
   return async (args: Record<string, unknown>) => {
+    const timeout = requestTimeoutFor(args, requestTimeoutCeilingMs);
     const client = await ensureReady();
     try {
-      return (await client.callTool({ name, arguments: args })) as never;
+      return (await client.callTool({ name, arguments: args }, { timeout })) as never;
     } catch (err) {
       const reason = transportFailureReason(err);
       if (reason === null || !invalidate) throw err;
@@ -189,7 +245,7 @@ function forwardTool<T extends ToolName>(
 
       invalidate(client);
       const reconnected = await ensureReady();
-      return (await reconnected.callTool({ name, arguments: args })) as never;
+      return (await reconnected.callTool({ name, arguments: args }, { timeout })) as never;
     }
   };
 }
@@ -209,12 +265,13 @@ function registerForwardingTool(
   name: ToolName,
   def: ToolDef,
   ensureReady: () => Promise<Client>,
+  requestTimeoutCeilingMs: number,
   invalidate?: (stale: Client) => void
 ): void {
   server.registerTool(
     name,
     { description: def.description, inputSchema: def.inputSchema },
-    forwardTool(name, ensureReady, invalidate)
+    forwardTool(name, ensureReady, requestTimeoutCeilingMs, invalidate)
   );
 }
 
@@ -227,11 +284,15 @@ function registerForwardingTool(
  * Without it a forwarded call still reports a transport failure, it just
  * cannot recover from one.
  */
-export function buildStdioServer(ensureReady: () => Promise<Client>, invalidate?: (stale: Client) => void): McpServer {
+export function buildStdioServer(
+  ensureReady: () => Promise<Client>,
+  requestTimeoutCeilingMs: number = 10 * 60 * 1000,
+  invalidate?: (stale: Client) => void
+): McpServer {
   const server = new McpServer({ name: 'harborage', version: '0.2.0' });
 
   for (const name of toolNames) {
-    registerForwardingTool(server, name, toolDefs[name], ensureReady, invalidate);
+    registerForwardingTool(server, name, toolDefs[name], ensureReady, requestTimeoutCeilingMs, invalidate);
   }
 
   return server;
@@ -247,7 +308,7 @@ export async function runWrapper(): Promise<void> {
     console.error('[harborage] background daemon readiness check failed (will retry on next tool call):', err);
   });
 
-  serveStdio(() => buildStdioServer(ensureReady, invalidate));
+  serveStdio(() => buildStdioServer(ensureReady, config.requestTimeoutCeilingMs, invalidate));
   console.error(`[harborage] client wrapper up (pid ${process.pid}), talking to daemon at http://${config.host}:${config.port}`);
 
   let cleaningUp = false;

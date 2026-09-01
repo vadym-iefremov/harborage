@@ -57,6 +57,32 @@ export interface Config {
    * outlive a merely idle one.
    */
   maxInFlightAgeMs: number;
+  /**
+   * The longest the client wrapper will hold a forwarded call open on the
+   * transport before giving up on the daemon ever answering, regardless of
+   * the `timeoutMs` a caller passed the tool itself.
+   *
+   * Every tool that takes a `timeoutMs` runs on a bound the wrapper does not
+   * otherwise see: `client.callTool()` is transport-level and defaults to the
+   * MCP SDK's own 60-second `DEFAULT_REQUEST_TIMEOUT_MSEC`, unrelated to
+   * whatever the tool itself was asked to wait for. Verified against the
+   * real transport: `wait_for` with `timeoutMs: 150000` threw a bare `SdkError
+   * REQUEST_TIMEOUT "Request timed out"` at exactly 60002ms, with no mention
+   * of what was being waited for, because the transport gave up on the call
+   * thirty seconds before wait_for's own timeout would have. The wrapper now
+   * derives a per-call transport timeout from `timeoutMs` (see `forwardTool`
+   * in `src/client/wrapper.ts`) so the tool's own timeout fires first and
+   * produces its real, informative result; this is the outer bound on that,
+   * so a call that asks to wait forever (`evaluate`'s `timeoutMs: 0`) or for
+   * longer than this cannot pin the wrapper's connection indefinitely.
+   *
+   * Defaults to the same ten minutes as `maxInFlightAgeMs` rather than a
+   * second, unrelated number: past `maxInFlightAgeMs` the daemon's own
+   * reaper stops believing an in-flight call and reaps its session out from
+   * under it (see that field's comment), so waiting past that point on the
+   * transport side has nothing left to wait for anyway.
+   */
+  requestTimeoutCeilingMs: number;
   /** How often the daemon's single in-process timer sweeps sessions + registry. */
   sweepIntervalMs: number;
   /**
@@ -154,6 +180,7 @@ export function loadConfig(): Config {
     idleTimeoutMs: num('HARBORAGE_IDLE_TIMEOUT_MS', 15 * 60 * 1000),
     escalatedIdleTimeoutMs: num('HARBORAGE_ESCALATED_IDLE_TIMEOUT_MS', 60 * 60 * 1000),
     maxInFlightAgeMs: num('HARBORAGE_MAX_IN_FLIGHT_AGE_MS', 10 * 60 * 1000),
+    requestTimeoutCeilingMs: num('HARBORAGE_REQUEST_TIMEOUT_CEILING_MS', 10 * 60 * 1000),
     sweepIntervalMs: num('HARBORAGE_SWEEP_INTERVAL_MS', 60 * 1000),
     shutdownGraceMs: num('HARBORAGE_SHUTDOWN_GRACE_MS', 10 * 1000),
     stateDir,
