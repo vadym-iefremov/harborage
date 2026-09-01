@@ -161,6 +161,31 @@ Only remove the worktree if both come back empty. Never kill what they find in
 order to clear the way, and never use a broad `pkill`: those are somebody
 else's running tests.
 
+### Every worktree shares one `.git`, so treat git state as shared too
+
+Worktrees give you a private working directory. They do not give you a private
+stash stack, index or set of refs. All of that lives in the one `.git` and is
+visible to, and writable by, every worktree at once.
+
+The stash is the sharp edge. `git stash pop` and `git stash apply` take
+whatever is on TOP of the shared stack, which may be a different worktree's
+work in progress. This was caught live here, not theorised: after a tool
+timeout stashed one agent's changes, `git stash list` showed another branch's
+entry sitting above it, and a bare pop would have dropped that other branch's
+work into an unrelated tree.
+
+- **Prefer not to stash.** `git diff > /tmp/my.patch` and `git apply`, or a
+  work-in-progress commit, are private to you. A checkpoint commit on your own
+  branch costs nothing and can be amended or squashed later.
+- **If you must stash, never pop bare.** Run `git stash list`, find your own
+  entry by its branch label, and pop it by explicit index.
+- **Leave entries that are not yours alone**, and say so in your report.
+
+The rule generalises: address shared state explicitly and by identity, never
+by "the most recent one" or "the top of the stack". It is the same discipline
+as reaping a process by its exact PID rather than by a name that matches, and
+it fails the same way when ignored.
+
 ## Pull requests
 
 - Branch from `main`.
