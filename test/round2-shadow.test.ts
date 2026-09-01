@@ -376,8 +376,7 @@ test('wheel reports a clean pass and a real scroll for an unoccluded scrollable 
   const body = payload(await handlers.wheel({ sessionId, point: { selector: '#shadowScrollBoxClean' }, deltaY: 50 }));
 
   assert.equal(body.pointHit.matchesTarget, true, 'an unoccluded shadow-DOM point must not read as occluded by its own host');
-  assert.equal(body.pointHit.elementAtPoint, null);
-  assert.equal(body.matched, true);
+    assert.equal(body.matched, true);
   assert.ok(!('note' in body), 'a clean pass that really scrolled needs no note');
 
   // Exercises readScrollState's own shadow-boundary blindness: document.elementFromPoint

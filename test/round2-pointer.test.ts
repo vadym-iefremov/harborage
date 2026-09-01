@@ -161,7 +161,12 @@ test('drag treats a hit on a descendant of the named element as a clean pass', a
   const body = payload(await handlers.drag({ sessionId, source: { selector: '#btn' }, target: { x: 300, y: 300 }, steps: 5 }));
 
   assert.equal(body.sourceHit.matchesTarget, true, 'a hit on a descendant of the target is still a hit on the target');
-  assert.equal(body.sourceHit.elementAtPoint, null);
+  assert.equal(
+    body.sourceHit.elementAtPoint.id,
+    'btnLabel',
+    'elementAtPoint names what is really topmost even on a MATCH, so a selector-based endpoint is never less informative than the same coordinates passed raw'
+  );
+  assert.equal(body.sourceHit.elementAtPoint.containsTarget, false, 'the label is a descendant of the button, not an ancestor of it');
   assert.equal(body.matched, true);
 
   await sessions.releaseSession(sessionId);
@@ -248,7 +253,6 @@ test('wheel reports a clean pass and a real scroll for an unoccluded container',
   const body = payload(await handlers.wheel({ sessionId, point: { selector: '#cleanScrollBox' }, deltaY: 50 }));
 
   assert.equal(body.pointHit.matchesTarget, true);
-  assert.equal(body.pointHit.elementAtPoint, null);
   assert.equal(body.matched, true);
   assert.equal(body.moved, true, 'an unoccluded scroll container really does scroll');
   assert.ok(!('note' in body), 'a clean pass that really scrolled needs no note');

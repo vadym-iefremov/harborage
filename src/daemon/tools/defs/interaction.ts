@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs';
 import { basename, isAbsolute } from 'node:path';
 
-import type { Locator, Page } from 'playwright';
+import type { ElementHandle, Locator, Page } from 'playwright';
 import * as z from 'zod/v4';
 
 import { defineTool, defineTools, text, type ToolContext, type ToolResult } from '../types.js';
@@ -122,10 +122,41 @@ declare const window: {
   innerHeight: number;
   devicePixelRatio: number;
   getSelection(): { removeAllRanges(): void } | null;
-  getComputedStyle(element: PageElement): { overflowX: string; overflowY: string };
+  getComputedStyle(element: PageElement): {
+    overflowX: string;
+    overflowY: string;
+    borderLeftWidth: string;
+    borderTopWidth: string;
+    paddingLeft: string;
+    paddingTop: string;
+  };
+  // Used to wait out one renderer frame after dispatching an input event, so a
+  // readback cannot run before the page's own listeners have. See wheel.
+  requestAnimationFrame(callback: () => void): number;
   __harborageDragProbed?: boolean;
   __harborageDragStarts?: number;
 };
+
+/**
+ * An <iframe> element, as seen from its PARENT document.
+ *
+ * Reached only through a cast inside a callback, never as a callback's own
+ * `el` parameter, for the reason ShadowDrillElement's comment gives at
+ * length. Playwright types frameElement() as ElementHandle<SVGElement |
+ * HTMLElement>, and under the test tsconfig (which does pull in lib.dom) a
+ * narrower declared parameter stops the callback type-checking.
+ *
+ * offsetWidth and offsetHeight are the LAYOUT border box, in CSS pixels
+ * before any transform; getBoundingClientRect is the same box after every
+ * ancestor transform has been applied. The ratio between them is the scale
+ * factor the point has to be divided by on the way in, which is what makes a
+ * transformed iframe map correctly rather than silently by a translation.
+ */
+interface FrameHostElement extends PageElement {
+  offsetWidth?: number;
+  offsetHeight?: number;
+  getBoundingClientRect(): { left: number; top: number; width: number; height: number };
+}
 
 /** The tags whose contents live in `.value` rather than in their child nodes. */
 const formControlTags = ['INPUT', 'TEXTAREA', 'SELECT'];
@@ -528,22 +559,47 @@ async function readDragProbe(page: Page, armedOn: number): Promise<boolean | nul
 }
 
 /**
- * Turns one pointer endpoint into the viewport point the mouse will visit.
+ * An endpoint whose selector has been waited for and scrolled into view, but NOT yet measured.
  *
- * Three shapes, because a canvas app needs all three: a selector alone means
- * the element's centre, a selector with an offset means a spot inside it (the
- * drag handle in a node's header, not its middle), and a bare x/y means a
- * region of a canvas that is not a DOM element at all and has no selector to
- * name it. Shared by drag and wheel: a wheel has to land on a point too,
+ * The split between preparing and measuring exists because of a bug drag had all to itself.
+ * drag resolved its source completely, then resolved its target, and resolving the target calls
+ * scrollIntoViewIfNeeded, which scrolls the page out from under the source point that was
+ * already measured. The gesture then pressed at coordinates that could be thousands of pixels
+ * stale. The hit test did catch it, so it was never a false pass, but it reported <html> with
+ * containsTarget true and sent the caller hunting for a scrim, never mentioning that the tool's
+ * own second endpoint had moved the first.
+ *
+ * Preparing both endpoints before measuring either one fixes it exactly: every scroll this call
+ * is going to perform has already happened by the time any box is read. It cannot be fixed by
+ * re-resolving the source afterwards, because that would scroll again and invalidate the target
+ * in turn, and two elements far enough apart genuinely cannot both be on screen at once. That
+ * case is now reported rather than papered over: see drag's off-screen note.
+ */
+interface PreparedEndpoint {
+  selector?: string;
+  offsetX?: number;
+  offsetY?: number;
+  locator?: Locator;
+  matchedElements?: number;
+  raw?: { x: number; y: number };
+}
+
+/**
+ * Waits for one pointer endpoint's selector and scrolls it into view, without measuring it.
+ *
+ * Three shapes, because a canvas app needs all three: a selector alone means the element's
+ * centre, a selector with an offset means a spot inside it (the drag handle in a node's header,
+ * not its middle), and a bare x/y means a region of a canvas that is not a DOM element at all
+ * and has no selector to name it. Shared by drag and wheel: a wheel has to land on a point too,
  * because a canvas zooms toward the pointer.
  */
-async function resolvePointerPoint(
+async function preparePointerEndpoint(
   page: Page,
   spec: PointerEndpoint,
   tool: string,
   which: string,
   timeout: number
-): Promise<PointerPoint> {
+): Promise<PreparedEndpoint> {
   const hasSelector = spec.selector !== undefined;
   const hasX = spec.x !== undefined;
   const hasY = spec.y !== undefined;
@@ -557,7 +613,7 @@ async function resolvePointerPoint(
     );
   }
   if (!hasSelector) {
-    return { x: spec.x as number, y: spec.y as number };
+    return { raw: { x: spec.x as number, y: spec.y as number } };
   }
 
   const selector = spec.selector as string;
@@ -582,21 +638,72 @@ async function resolvePointerPoint(
     );
   }
 
-  const box = await locator.boundingBox({ timeout }).catch(() => null);
+  // Counted after the wait, never before: an element that has not attached yet counts zero, and
+  // a count taken then would report an ambiguity that does not exist or miss one that does.
+  const matchedElements = await all.count().catch(() => undefined);
+  return {
+    selector,
+    locator,
+    ...(hasX ? { offsetX: spec.x as number, offsetY: spec.y as number } : {}),
+    ...(matchedElements === undefined ? {} : { matchedElements })
+  };
+}
+
+/**
+ * Reads a prepared endpoint's box and turns it into the viewport point the mouse will visit.
+ *
+ * Deliberately performs no scrolling of its own. Every scroll a call is going to do has
+ * happened by the time this runs, so a point measured here is still valid when the mouse
+ * reaches it.
+ */
+async function measurePointerEndpoint(
+  prepared: PreparedEndpoint,
+  tool: string,
+  which: string,
+  timeout: number
+): Promise<PointerPoint> {
+  if (prepared.raw) return { x: prepared.raw.x, y: prepared.raw.y };
+
+  const selector = prepared.selector as string;
+  const box = await (prepared.locator as Locator).boundingBox({ timeout }).catch(() => null);
   if (!box) {
     throw new Error(
       `${tool} found the ${which} selector ${JSON.stringify(selector)} but it has no layout box, so there is no point to aim at. It is probably display:none or zero-sized.`
     );
   }
 
-  // Counted after the wait, never before: an element that has not attached yet counts zero, and
-  // a count taken then would report an ambiguity that does not exist or miss one that does.
-  const matchedElements = await all.count().catch(() => undefined);
-  const point = hasX
-    ? { selector, x: box.x + (spec.x as number), y: box.y + (spec.y as number) }
-    : { selector, x: box.x + box.width / 2, y: box.y + box.height / 2 };
-  return matchedElements === undefined ? point : { ...point, matchedElements };
+  const point =
+    prepared.offsetX === undefined
+      ? { selector, x: box.x + box.width / 2, y: box.y + box.height / 2 }
+      : { selector, x: box.x + prepared.offsetX, y: box.y + (prepared.offsetY as number) };
+  return prepared.matchedElements === undefined ? point : { ...point, matchedElements: prepared.matchedElements };
 }
+
+/** Prepare and measure in one step, for a tool with only one endpoint and so nothing to invalidate. */
+async function resolvePointerPoint(
+  page: Page,
+  spec: PointerEndpoint,
+  tool: string,
+  which: string,
+  timeout: number
+): Promise<PointerPoint> {
+  return measurePointerEndpoint(await preparePointerEndpoint(page, spec, tool, which, timeout), tool, which, timeout);
+}
+
+/**
+ * How far the flattened-tree walk and the shadow drill are allowed to run.
+ *
+ * Both are guards against a malformed or hostile tree, NOT expected limits,
+ * and both are now high enough that no real document reaches them: the
+ * previous walk cap of 200 was reachable (measured: 199 intervening levels
+ * passed, 200 failed) by recursive tree UIs and deeply nested rich text, and
+ * hitting it produced a confident MISS naming the leaf, with the "an ancestor
+ * is on top" remedy that could not possibly apply. A cap that is hit is now
+ * reported as an UNKNOWN answer rather than a wrong one, so raising the
+ * numbers is a second line of defence rather than the fix.
+ */
+const HIT_TEST_WALK_CAP = 10000;
+const HIT_TEST_DRILL_CAP = 100;
 
 /** How a covering element is named, the same shape element_box's occludedBy uses. */
 interface TopmostElement {
@@ -604,8 +711,8 @@ interface TopmostElement {
   id: string;
   classes: string | null;
   /**
-   * Whether this element is a DOM ANCESTOR of the one the caller named, null
-   * for a raw x/y endpoint that named nothing to be an ancestor of.
+   * Whether this element is an ANCESTOR of the one the caller named, in the
+   * flattened tree, null when there was nothing named to be an ancestor of.
    *
    * Worth a field of its own because the two shapes need opposite remedies. An
    * unrelated element on top is an overlay: move it, or aim at it instead. An
@@ -616,8 +723,90 @@ interface TopmostElement {
    * painted by the ancestor, a clip-path cut-out, and a wrapped inline whose
    * box centre falls between its line boxes all look like from here, and none
    * of them are fixed by changing a z-index.
+   *
+   * Computed by walking UP the flattened tree from the named element, the exact
+   * mirror of the walk that decides matchesTarget, and NOT by Node.contains().
+   * contains() does not cross a shadow boundary, so a button inside an open
+   * shadow root under its light-DOM wrapper's ::after scrim used to report
+   * false here and get the overlay remedy, while the byte-identical light-DOM
+   * shape on the same page reported true and got the right one. The verdict was
+   * correct in both; only the diagnosis flipped, and only because a shadow root
+   * happened to be in the way.
    */
   containsTarget: boolean | null;
+  /**
+   * Set when the thing that took the event is not in the same document as the
+   * element named, because an ancestor FRAME was covered. The remedy is
+   * different again: nothing inside the frame can fix it.
+   */
+  inAncestorFrame?: boolean;
+}
+
+/** What a hit test concluded, including the case where it honestly could not conclude. */
+interface PointerHit {
+  matchesTarget: boolean | null;
+  elementAtPoint: TopmostElement | null;
+  /**
+   * Present only when matchesTarget is null DESPITE a selector having been
+   * given, which means a cap was hit and the answer is unknown rather than
+   * negative. Kept distinct from the ordinary matchesTarget null (a raw x/y
+   * endpoint, which named nothing to check) by that field's presence.
+   */
+  unknownReason?: string;
+}
+
+/**
+ * The chain of <iframe> elements from the main frame down to the frame the
+ * locator's element actually lives in, outermost first. Empty for the main
+ * frame, which is the overwhelmingly common case.
+ *
+ * This exists because of a coordinate-space bug that made drag and wheel lie
+ * in BOTH directions for any iframe not positioned at exactly (0, 0).
+ * resolvePointerPoint takes its point from Playwright's boundingBox, which is
+ * relative to the MAIN frame's viewport, and the mouse correctly goes to that
+ * pixel. The hit test then ran through locator.evaluate, which executes inside
+ * the FRAME's document, and handed that main-frame coordinate to the frame's
+ * own elementFromPoint. The two spaces differ by the iframe's offset, so an
+ * iframe at (0, 100) produced a confident false failure naming the frame's
+ * <html>, and an iframe at (60, 40) over a large target produced a false PASS,
+ * because the mis-mapped point landed on an uncovered part of the same element
+ * while the real press went to a cover the tool never saw. list_frames tells
+ * callers to prepend a frame prefix to any selector and drag and wheel accept
+ * one, so this was a reachable path rather than a corner.
+ *
+ * Walking the chain, rather than simply translating the point, also closes a
+ * hole that was there before: something in a PARENT document covering the
+ * iframe swallows the event before it ever reaches the frame, and a hit test
+ * that only ever looks inside the frame cannot see that at all.
+ *
+ * Costs two round trips on every hit test with a selector, one for the element
+ * handle and one for its owning frame, and that is deliberate rather than
+ * conditional. The alternative was sniffing the selector string for
+ * Playwright's internal enter-frame step, which is the only string form that
+ * can reach a subframe today, and making a correctness-critical answer depend
+ * on a substring of an internal selector-engine name is exactly the kind of
+ * shortcut this round exists to remove.
+ */
+async function pointerFrameChain(locator: Locator): Promise<ElementHandle[]> {
+  const handle = await locator.elementHandle().catch(() => null);
+  if (!handle) return [];
+  const chain: ElementHandle[] = [];
+  try {
+    let frame = await handle.ownerFrame();
+    while (frame && frame.parentFrame()) {
+      const frameElement = await frame.frameElement();
+      chain.unshift(frameElement);
+      frame = frame.parentFrame();
+    }
+  } catch {
+    // A frame detached mid-walk. Whatever is left is not a usable chain, and
+    // guessing from a partial one would be worse than saying nothing.
+    for (const entry of chain) await entry.dispose().catch(() => {});
+    return [];
+  } finally {
+    await handle.dispose().catch(() => {});
+  }
+  return chain;
 }
 
 /**
@@ -628,8 +817,8 @@ interface TopmostElement {
  * on top of that box, so a selector that used to be safe to press stays "resolved" correctly
  * even after a modal or a loading spinner covers it completely. The mouse still goes to the
  * right coordinates; the coordinates just no longer belong to the element the caller thinks
- * they do. element_box asks the identical question for a plain click target, and this runs the
- * identical test rather than inventing a second one.
+ * they do. element_box asks the identical question for a plain click target, and shares the
+ * identical in-page walk.
  *
  * The test is the browser's own answer, not an approximation of it. A pointerdown at (x, y)
  * dispatches on the deepest node the hit test finds there and then propagates up the FLATTENED
@@ -661,7 +850,15 @@ interface TopmostElement {
  *
  * Note that <body> and <html> are on the composed path of every point, so a caller who really
  * does name "body" matches everywhere. That is correct, not a loophole: a press anywhere on the
- * page does run body's listeners.
+ * page does run body's listeners. elementAtPoint is filled in whenever the topmost node is not
+ * the named element ITSELF, match or no match, so naming "body" with an offset still tells you
+ * what is really at that point rather than being strictly less informative than passing the
+ * same coordinates raw.
+ *
+ * A pointer event does not propagate across a frame boundary, so the composed path of an
+ * element inside an iframe is bounded by that frame's document. The frame chain above is walked
+ * first for exactly that reason: each ancestor frame has to actually receive the event at that
+ * point before the question of what happens inside it means anything.
  *
  * A raw x/y endpoint names no element, so there is nothing to compare against: matchesTarget
  * comes back null rather than false, which would read as a failure that was never checked.
@@ -671,15 +868,16 @@ interface TopmostElement {
  *
  * The in-page snippet below is deliberately a second copy of element_box's, in inspect.ts,
  * rather than a shared helper: both run under a tsconfig with no dom lib, each against its own
- * minimal element shim, so sharing would cost more than it saves. They must stay in step. If
- * one changes, change the other.
+ * minimal element shim, so sharing would cost more than it saves. What is shared is the exact
+ * algorithm: the shadow drill, the composed-path walk, the mirrored ancestor walk behind
+ * containsTarget, and both caps. What is NOT shared, and must not be assumed to be, is the
+ * frame handling: this tool aims a real mouse at a MAIN-frame coordinate and therefore has to
+ * verify every ancestor frame on the way down, while element_box measures and hit-tests
+ * entirely within one frame's own coordinate space. Each file says so at its own copy.
  */
-async function hitTestPointerPoint(
-  page: Page,
-  point: PointerPoint
-): Promise<{ matchesTarget: boolean | null; elementAtPoint: TopmostElement | null }> {
+async function hitTestPointerPoint(page: Page, point: PointerPoint): Promise<PointerHit> {
   if (point.selector === undefined) {
-    const elementAtPoint = await page.evaluate((arg: { x: number; y: number }) => {
+    const elementAtPoint = await page.evaluate((arg: { x: number; y: number; drillCap: number }) => {
       // Drilled the same way the selector branch below is, and for the same reason: without
       // it, a raw point sitting inside a shadow tree would always be reported as the shadow
       // host itself, which is a useless answer for a diagnostic field whose whole point is
@@ -688,7 +886,8 @@ async function hitTestPointerPoint(
       // file keeps type-checking against a real HTMLElement.
       let hit = document.elementFromPoint(arg.x, arg.y) as ShadowDrillElement | null;
       let shadowDrillDepth = 0;
-      while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function' && shadowDrillDepth < 20) {
+      while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function') {
+        if (shadowDrillDepth >= arg.drillCap) break;
         const deeper = hit.shadowRoot.elementFromPoint(arg.x, arg.y);
         if (!deeper || deeper === hit) break;
         hit = deeper;
@@ -697,69 +896,168 @@ async function hitTestPointerPoint(
       return hit
         ? { tagName: String(hit.tagName).toLowerCase(), id: hit.id || '', classes: hit.getAttribute('class'), containsTarget: null }
         : null;
-    }, point);
+    }, { x: point.x, y: point.y, drillCap: HIT_TEST_DRILL_CAP });
     return { matchesTarget: null, elementAtPoint };
   }
 
   // .first(), because locator.evaluate is strict mode and would throw outright on the same
-  // multi-match selector resolvePointerPoint just took the first match of. Without this, a
-  // selector matching several elements resolved to a point and then died hit-testing it.
-  // A fresh locator rather than the one resolvePointerPoint already built: this runs
-  // immediately afterwards against the same page, so it resolves to the same element, and
-  // reusing it here would mean threading a Locator through resolvePointerPoint's return
-  // value for every caller that never needs it.
+  // multi-match selector resolvePointerPoint just took the first match of. A fresh locator
+  // rather than the one resolvePointerPoint already built: this runs immediately afterwards
+  // against the same page, so it resolves to the same element, and reusing it would mean
+  // threading a Locator through resolvePointerPoint's return value for every caller that
+  // never needs one.
   const locator = page.locator(point.selector).first();
-  return locator.evaluate((el: PageElement, arg: { x: number; y: number }) => {
-    // Step one: the true topmost node. document.elementFromPoint retargets to the shadow HOST
-    // for anything inside a shadow tree, open or closed, so on its own it never names what is
-    // really there. ShadowRoot.elementFromPoint does not retarget, so re-querying the same
-    // point against hit.shadowRoot recovers the real node, and repeating it handles shadow
-    // roots nested in shadow roots. A closed root reports shadowRoot null, so the drill stops
-    // at the host, which is the honest answer: nothing outside can see into a closed root.
-    let hit = document.elementFromPoint(arg.x, arg.y) as ShadowDrillElement | null;
-    let shadowDrillDepth = 0;
-    while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function' && shadowDrillDepth < 20) {
-      const deeper = hit.shadowRoot.elementFromPoint(arg.x, arg.y);
-      if (!deeper || deeper === hit) break;
-      hit = deeper;
-      shadowDrillDepth += 1;
-    }
-    if (!hit) return { matchesTarget: false, elementAtPoint: null };
 
-    // Step two: climb the flattened tree from that node, which is the path a real pointerdown
-    // propagates along, and look for the element the caller named. assignedSlot is tried FIRST
-    // and that order matters: a slotted light-DOM node's flattened parent is the <slot> it was
-    // distributed into, inside the shadow tree, while its parentNode is the host outside it, so
-    // checking parentNode first skips every shadow-tree element that paints around it. The
-    // nodeType 11 step is the shadow root itself, which is not an element and has no parent of
-    // its own; hopping to its host is what carries the walk back out into the light DOM. The
-    // step cap is a guard against a malformed tree, not an expected limit.
-    let matchesTarget = false;
-    let node: FlatNode | null = hit as FlatNode;
-    let steps = 0;
-    while (node && steps < 200) {
-      if ((node as unknown) === (el as unknown)) {
-        matchesTarget = true;
-        break;
-      }
-      node = node.assignedSlot ?? (node.nodeType === 11 ? (node.host ?? null) : (node.parentNode ?? null));
-      steps += 1;
-    }
-
-    return {
-      matchesTarget,
-      elementAtPoint: matchesTarget
-        ? null
-        : {
-            tagName: String(hit.tagName).toLowerCase(),
-            id: hit.id || '',
-            classes: hit.getAttribute('class'),
-            // An ancestor of the named element taking the press is a different diagnosis from
-            // an overlay taking it, and the caller cannot tell them apart from a tag name.
-            containsTarget: hit.contains(el)
+  // Descend the frame chain first, translating the point into each frame's own coordinate
+  // space and checking at every level that the event really reaches the next frame down.
+  const chain = await pointerFrameChain(locator);
+  let local = { x: point.x, y: point.y };
+  try {
+    for (const frameElement of chain) {
+      const step = await frameElement.evaluate(
+        (element: unknown, arg: { x: number; y: number; drillCap: number }) => {
+          const host = element as FrameHostElement;
+          let hit = document.elementFromPoint(arg.x, arg.y) as ShadowDrillElement | null;
+          let shadowDrillDepth = 0;
+          while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function') {
+            if (shadowDrillDepth >= arg.drillCap) break;
+            const deeper = hit.shadowRoot.elementFromPoint(arg.x, arg.y);
+            if (!deeper || deeper === hit) break;
+            hit = deeper;
+            shadowDrillDepth += 1;
           }
-    };
-  }, point);
+          // An <iframe> has no rendered light-DOM children of its own, so the only clean
+          // answer at this point is the iframe element itself. Anything else, including the
+          // frame's own ancestors when something with pointer-events: none is in the way, is
+          // the parent document swallowing the event before the frame ever sees it.
+          const reaches = (hit as unknown) === (host as unknown);
+          const rect = host.getBoundingClientRect();
+          const style = window.getComputedStyle(host);
+          const scaleX = host.offsetWidth ? rect.width / host.offsetWidth : 1;
+          const scaleY = host.offsetHeight ? rect.height / host.offsetHeight : 1;
+          // The child document is painted in the iframe's CONTENT box, so the origin is the
+          // border box plus border and padding, each scaled the same way the box was.
+          const originX = rect.left + ((parseFloat(style.borderLeftWidth) || 0) + (parseFloat(style.paddingLeft) || 0)) * scaleX;
+          const originY = rect.top + ((parseFloat(style.borderTopWidth) || 0) + (parseFloat(style.paddingTop) || 0)) * scaleY;
+          return {
+            reaches,
+            x: (arg.x - originX) / (scaleX || 1),
+            y: (arg.y - originY) / (scaleY || 1),
+            hit: hit
+              ? {
+                  tagName: String(hit.tagName).toLowerCase(),
+                  id: hit.id || '',
+                  classes: hit.getAttribute('class'),
+                  containsTarget: false,
+                  inAncestorFrame: true
+                }
+              : null
+          };
+        },
+        { x: local.x, y: local.y, drillCap: HIT_TEST_DRILL_CAP }
+      );
+      if (!step.reaches) return { matchesTarget: false, elementAtPoint: step.hit };
+      local = { x: step.x, y: step.y };
+    }
+  } finally {
+    for (const frameElement of chain) await frameElement.dispose().catch(() => {});
+  }
+
+  return locator.evaluate(
+    (el: PageElement, arg: { x: number; y: number; walkCap: number; drillCap: number }) => {
+      // Step one: the true topmost node. document.elementFromPoint retargets to the shadow HOST
+      // for anything inside a shadow tree, open or closed, so on its own it never names what is
+      // really there. ShadowRoot.elementFromPoint does not retarget, so re-querying the same
+      // point against hit.shadowRoot recovers the real node, and repeating it handles shadow
+      // roots nested in shadow roots. A closed root reports shadowRoot null, so the drill stops
+      // at the host, which is the honest answer: nothing outside can see into a closed root.
+      let hit = document.elementFromPoint(arg.x, arg.y) as ShadowDrillElement | null;
+      let shadowDrillDepth = 0;
+      let truncated = false;
+      while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function') {
+        if (shadowDrillDepth >= arg.drillCap) {
+          truncated = true;
+          break;
+        }
+        const deeper = hit.shadowRoot.elementFromPoint(arg.x, arg.y);
+        if (!deeper || deeper === hit) break;
+        hit = deeper;
+        shadowDrillDepth += 1;
+      }
+      if (!hit) return { matchesTarget: false, elementAtPoint: null };
+
+      // Step two: climb the flattened tree from that node, which is the path a real pointerdown
+      // propagates along, and look for the element the caller named. assignedSlot is tried FIRST
+      // and that order matters: a slotted light-DOM node's flattened parent is the <slot> it was
+      // distributed into, inside the shadow tree, while its parentNode is the host outside it, so
+      // checking parentNode first skips every shadow-tree element that paints around it. The
+      // nodeType 11 step is the shadow root itself, which is not an element and has no parent of
+      // its own; hopping to its host is what carries the walk back out into the light DOM.
+      let matchesTarget = false;
+      let node: FlatNode | null = hit as FlatNode;
+      let steps = 0;
+      while (node) {
+        if ((node as unknown) === (el as unknown)) {
+          matchesTarget = true;
+          break;
+        }
+        if (steps >= arg.walkCap) {
+          truncated = true;
+          break;
+        }
+        node = node.assignedSlot ?? (node.nodeType === 11 ? (node.host ?? null) : (node.parentNode ?? null));
+        steps += 1;
+      }
+
+      // The mirror walk, UP from the named element, answering whether the thing that took the
+      // event is an ancestor of it. Node.contains() was used here and was wrong: it does not
+      // cross a shadow boundary, so the identical scrim-over-a-button shape reported one
+      // diagnosis in the light DOM and the opposite one inside a shadow root.
+      let containsTarget = false;
+      if (!matchesTarget) {
+        let up: FlatNode | null = el as unknown as FlatNode;
+        let upSteps = 0;
+        while (up) {
+          if ((up as unknown) === (hit as unknown)) {
+            containsTarget = true;
+            break;
+          }
+          if (upSteps >= arg.walkCap) {
+            truncated = true;
+            break;
+          }
+          up = up.assignedSlot ?? (up.nodeType === 11 ? (up.host ?? null) : (up.parentNode ?? null));
+          upSteps += 1;
+        }
+      }
+
+      const elementAtPoint =
+        (hit as unknown) === (el as unknown)
+          ? null
+          : {
+              tagName: String(hit.tagName).toLowerCase(),
+              id: hit.id || '',
+              classes: hit.getAttribute('class'),
+              containsTarget
+            };
+      // A cap that was actually reached means the walk gave up, not that the element is not
+      // there. Reporting that as a confident miss is what produced the "an ancestor is on top"
+      // remedy for a tree that simply happened to be deep, so it is reported as unknown.
+      if (truncated && !matchesTarget) {
+        return {
+          matchesTarget: null,
+          elementAtPoint,
+          unknownReason:
+            'The hit test gave up before it could answer: the DOM at this point is nested deeper than the ' +
+            'walk is allowed to run, so whether a press here reaches the named element is UNKNOWN rather ' +
+            'than known to be false. Nothing here is evidence of an overlay. Aim at a shallower element, ' +
+            'or check the page for a runaway nesting loop.'
+        };
+      }
+      return { matchesTarget, elementAtPoint };
+    },
+    { x: local.x, y: local.y, walkCap: HIT_TEST_WALK_CAP, drillCap: HIT_TEST_DRILL_CAP }
+  );
 }
 
 /** How `elementAtPoint` is named in a sentence, for the note a mismatched hit test writes. */
@@ -767,7 +1065,8 @@ function describeElement(el: TopmostElement | null): string {
   if (!el) return 'nothing that elementFromPoint could find';
   const id = el.id ? ` id=${JSON.stringify(el.id)}` : '';
   const classes = el.classes ? ` class=${JSON.stringify(el.classes)}` : '';
-  return `<${el.tagName}${id}${classes}>`;
+  const where = el.inAncestorFrame ? ', in an ancestor frame' : '';
+  return `<${el.tagName}${id}${classes}>${where}`;
 }
 
 /**
@@ -780,6 +1079,14 @@ function describeElement(el: TopmostElement | null): string {
  * to change a z-index sends them after an overlay that does not exist.
  */
 function missRemedy(el: TopmostElement | null): string {
+  if (el?.inAncestorFrame) {
+    return (
+      'That element is in an ANCESTOR FRAME, not in the same document as the selector: the point never ' +
+      'reaches the iframe at all, so nothing inside the frame receives the event and nothing inside the ' +
+      'frame can fix it. Something in the parent document is covering the iframe, or the iframe itself is ' +
+      'pointer-events: none. Deal with the parent document first.'
+    );
+  }
   if (el?.containsTarget) {
     return (
       'That element is an ANCESTOR of the selector in the DOM, not an overlay: the point is inside the named element\'s ' +
@@ -1660,6 +1967,9 @@ export const interactionTools = defineTools({
       'A resolved selector is only a bounding box, and a box says nothing about what is drawn on top of it, so BOTH endpoints are hit-tested before the mouse ever moves, with the same test element_box runs for a plain click target. The question it answers is the one that matters: would a real pointerdown at these coordinates reach the element you named? A pointerdown dispatches on the deepest node at the point and propagates up the FLATTENED tree, so matchesTarget is "the named element is on the composed path of whatever is really topmost there". sourceHit and targetHit each carry it (null for a raw x/y endpoint, which names nothing to compare against) alongside elementAtPoint, which names what really received the press whenever that is not a match. ' +
       'Read the asymmetry carefully, because it is easy to get backwards and this tool used to have it backwards: an ANCESTOR of the element that took the press is on the composed path and MATCHES (a <button> whose centre is painted by its own inline label, or a parent that receives the press because its child is pointer-events: none), while a DESCENDANT of it is NOT and does not. So a drag endpoint that falls just outside a canvas node and lands on the pane behind it is a MISS, not a hit on the node, even though the pane contains the node. Note that <body> and <html> are on the composed path of every point, so a selector naming "body" matches everywhere, correctly: a press anywhere really does run body\'s listeners. When elementAtPoint is an ancestor of your selector it says so with "containsTarget": true, because that is a different diagnosis from an overlay and needs a different remedy: the point is inside your element\'s box but outside anything it hit-tests, which is what pointer-events: none, visibility: hidden, a ::before or ::after scrim on a wrapper, a clip-path cut-out, a wrapped inline, or an offset that simply falls off the element all look like. Changing a z-index will not help any of those. ' +
       'Shadow DOM is handled by the same walk, in both directions: an endpoint inside an open or closed shadow root that is genuinely unoccluded matches rather than reading as occluded by its own host; a shadow HOST matches when the press lands on its own shadow content, because the host is on that content\'s composed path; a shadow-tree wrapper matches when the press lands on light-DOM children slotted into it; and a real overlay sitting on top of a target INSIDE THAT SAME shadow root is still caught and named. When a selector\'s point does not reach its own element the top-level result carries "matched": false and a "note" naming the endpoint, what took the press, and what to do about it, so a press that silently lands on a modal, a loading overlay or the container behind a node cannot read as a normal drag. This does NOT throw for a missed endpoint: a canvas point deliberately under a transparent hit-testing overlay is a real drag, so check "matched" rather than assuming a resolved call pressed what it was asked to. ' +
+      'elementAtPoint is filled in whenever the topmost node is not the named element ITSELF, on a match as well as on a miss, so naming "body" with an offset tells you exactly as much about that point as passing the same coordinates raw would. "matched" is true, false, or NULL: null means the hit test could not answer, not that it passed, which currently happens only when the DOM at that point is nested deeper than the walk is allowed to run. A note always says which. ' +
+      'A frame-prefixed selector from list_frames is fully supported and hit-tested in the MAIN frame\'s coordinate space, which is where the mouse actually goes. Every ancestor frame is checked on the way down, because a pointer event cannot cross a frame boundary: if something in a PARENT document covers the iframe, the press never reaches the frame at all, and that is reported with elementAtPoint carrying "inAncestorFrame": true and a note saying nothing inside the frame can fix it. ' +
+      'Both endpoints are waited for and scrolled into view BEFORE either is measured, because resolving one endpoint scrolls the page and would otherwise leave the other one\'s coordinates stale. When the two cannot be on screen at the same time, which no single mouse gesture can do, the result says exactly that rather than letting the hit test blame an overlay at a clamped point. ' +
       'Neither endpoint selector has to be unique. Like click and hover, a selector matching several elements resolves to the FIRST one and no error is raised; the resolved source and target each carry "matchedElements", with a note whenever it is more than one. That is worth knowing before you read a result: ".react-flow__node" on a canvas with eleven nodes resolves happily to whichever one is first in the DOM. ' +
       'Clears any existing text selection before pressing, deliberately: a press landing inside a selection left over from an earlier drag makes the browser drag that selection instead, and the page then sees no pointermove at all. Does NOT wait for either element to appear: call wait_for first. Does NOT verify that anything moved, so assert the page state yourself afterwards.',
     inputSchema: z.object({
@@ -1709,8 +2019,28 @@ export const interactionTools = defineTools({
     async handler(ctx, args) {
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
       const timeout = args.timeoutMs ?? POINTER_ENDPOINT_TIMEOUT_MS;
-      const from = await resolvePointerPoint(target.page, args.source, 'drag', 'source', timeout);
-      const to = await resolvePointerPoint(target.page, args.target, 'drag', 'target', timeout);
+      // BOTH endpoints are waited for and scrolled into view BEFORE either is measured.
+      // Resolving an endpoint scrolls it into view, and scrolling moves everything else on the
+      // page, so measuring the source and then resolving the target used to leave the source
+      // point stale by however far the page scrolled. Measured at 2320px stale in one case: the
+      // press landed on <html> and the note blamed a scrim, never mentioning that this call's
+      // own second endpoint had moved the first.
+      const sourcePrepared = await preparePointerEndpoint(target.page, args.source, 'drag', 'source', timeout);
+      const targetPrepared = await preparePointerEndpoint(target.page, args.target, 'drag', 'target', timeout);
+      const from = await measurePointerEndpoint(sourcePrepared, 'drag', 'source', timeout);
+      const to = await measurePointerEndpoint(targetPrepared, 'drag', 'target', timeout);
+
+      // Two elements far enough apart genuinely cannot both be on screen at once, and no
+      // ordering of the resolution fixes that: it is a real property of the gesture being
+      // asked for. Naming it here is the difference between a caller seeing the actual cause
+      // and chasing the phantom overlay the hit test is about to report at a clamped point.
+      const viewport = target.page.viewportSize();
+      const offScreen = viewport
+        ? (['source', 'target'] as const).filter(which => {
+            const point = which === 'source' ? from : to;
+            return point.x < 0 || point.y < 0 || point.x >= viewport.width || point.y >= viewport.height;
+          })
+        : [];
 
       // Checked before the mouse ever moves, not after: an overlay that would swallow the
       // press is true right now, and pressing anyway would tell it the drag succeeded no
@@ -1769,6 +2099,12 @@ export const interactionTools = defineTools({
       const mismatched = (['source', 'target'] as const).filter(
         which => (which === 'source' ? sourceHit : targetHit).matchesTarget === false
       );
+      // An endpoint whose hit test gave up is UNKNOWN, not clean. Folding it into the true
+      // branch of "matched" would turn "we could not tell" into "it landed correctly", which is
+      // the exact shape of unearned confidence this tool exists to avoid.
+      const unknown = (['source', 'target'] as const).filter(
+        which => (which === 'source' ? sourceHit : targetHit).unknownReason !== undefined
+      );
       const anySelectorGiven = from.selector !== undefined || to.selector !== undefined;
 
       // Two independent things can each want to attach a note (an occluded endpoint, and a
@@ -1780,6 +2116,19 @@ export const interactionTools = defineTools({
       // exists to never do to a caller.
       const notes: string[] = [];
       notes.push(...multiMatchNote([{ which: 'source', point: from }, { which: 'target', point: to }]));
+      if (offScreen.length > 0) {
+        notes.push(
+          `The resolved ${offScreen.join(' and ')} point is outside the viewport, so the mouse could not actually ` +
+            'visit it. Both endpoints were scrolled into view before either was measured, so this is not a stale ' +
+            'coordinate: it means the two endpoints cannot be on screen at the same time, which no single mouse ' +
+            'gesture can do. Scroll or zoom so both are visible, drag in stages, or use raw x/y coordinates for a ' +
+            'point you know is on screen. Whatever the hit test reports for that endpoint is about a clamped point ' +
+            'rather than the element.'
+        );
+      }
+      for (const which of unknown) {
+        notes.push(`At ${which}: ${(which === 'source' ? sourceHit : targetHit).unknownReason}`);
+      }
       if (mismatched.length > 0) {
         notes.push(
           `The press did not land on the ${mismatched.join(' or ')} selector's own element: ` +
@@ -1814,7 +2163,7 @@ export const interactionTools = defineTools({
         button,
         ...(modifiers.length > 0 ? { modifiers } : {}),
         nativeDrag,
-        ...(anySelectorGiven ? { matched: mismatched.length === 0 } : {}),
+        ...(anySelectorGiven ? { matched: mismatched.length > 0 ? false : unknown.length > 0 ? null : true } : {}),
         ...(notes.length > 0 ? { note: notes.join(' ') } : {})
       });
     }
@@ -1970,6 +2319,8 @@ export const interactionTools = defineTools({
       'Turn the mouse wheel in a session\'s tab, which is how a canvas is zoomed and how anything with its own scroll container is scrolled. WHERE the wheel lands matters and is not incidental: a canvas zooms toward the pointer, so "point" takes the same shape as drag\'s endpoints (a selector, a raw x/y viewport point, or a selector plus an offset inside it). Omitting it aims at the centre of the viewport, deliberately, rather than at wherever some earlier click or hover happened to leave the pointer. deltaY is positive to scroll down and negative to scroll up, deltaX positive to scroll right, matching a real wheel. MODIFIERS ARE THE PINCH: a browser delivers a trackpad pinch as a wheel event with ctrlKey set, and canvas libraries branch on exactly that, so modifiers: ["Control"] is the only way to test the zoom path in an app whose plain wheel pans. They are held for the whole gesture and released afterwards. Use "repeat" when one large delta and several small ones are not the same thing, which is common: libraries that accumulate deltas, debounce, or clamp per event behave differently, and "delay" spaces the events out for one that debounces. Always reads back what really moved: the result carries the point used, the total deltas dispatched, the scroll offsets before and after (for the page and for whichever container the browser would actually scroll at that point), and "moved". Note that "moved": false is CORRECT for a canvas zoom, because a zoom is a CSS transform rather than a scroll and nothing here can observe it generically: assert the app\'s own state for that. It is a real failure if you expected a scroll. ' +
       'Resolving "point" only measures a box, it says nothing about what is drawn on top of it, and mouse.wheel dispatches at raw coordinates with none of Playwright\'s own actionability checks in the way, so the point is hit-tested before the event fires, with the same test drag and element_box run. It answers whether a real pointer event at those coordinates would reach the element named, by checking that element against the COMPOSED PATH of whatever is really topmost at the point. "pointHit" carries matchesTarget (null when point has no selector, which names nothing to compare against) and elementAtPoint, naming what really received the event whenever that is not a match. ' +
       'The asymmetry is the part to read carefully: an ANCESTOR of the element that took the event is on the composed path and matches, a DESCENDANT of it is not. A wheel aimed at a point that falls outside a scroll container and onto the pane behind it is therefore a MISS, not a hit on the container, even though the pane contains it. That combination, a clean-looking hit with nothing scrolled, is exactly what a canvas zoom looks like, so getting it wrong lets a dead wheel be explained away as a zoom. When elementAtPoint is an ancestor of your selector it says so with "containsTarget": true, which means the point is inside your element\'s box but outside anything it hit-tests (pointer-events: none, a pseudo-element scrim on a wrapper, a clip-path cut-out, or an offset that falls off the element): a z-index change will not fix any of those. Shadow DOM is handled in both directions, so an unoccluded element inside an open or closed shadow root matches, a shadow host matches when the event lands on its own shadow content, and a real overlay inside the same shadow root is still caught and named. "scroll" is drilled the same way: a scrollable container that lives inside a shadow root is found and reported on, not just the shadow host\'s own ancestors. When a selector\'s point does not reach its own element the result carries "matched": false and a "note" naming what took the event and what to do about it. This does NOT throw for a missed point: a canvas point deliberately under a transparent hit-testing overlay is a real target, so check "matched" rather than assuming a resolved call landed where it was aimed. ' +
+      'A frame-prefixed selector from list_frames is hit-tested in the MAIN frame\'s coordinate space, which is where the event actually goes, and every ancestor frame is checked on the way down: a pointer event cannot cross a frame boundary, so something in a PARENT document covering the iframe means the wheel never reaches the frame at all, reported with "inAncestorFrame": true. "matched" is true, false, or NULL, where null means the hit test could not answer rather than that it passed. ' +
+      'Waits for a real renderer round trip after dispatching, so by the time this returns the page has run its own wheel handlers. Without that the readback could observe a page that had not yet seen the event, which was invisible whenever something DID scroll and wide open whenever nothing did. ' +
       'The point\'s selector does not have to be unique. Like click and hover, a selector matching several elements resolves to the FIRST one with no error; the resolved point carries "matchedElements", with a note whenever it is more than one. Does NOT dispatch a pinch gesture, a touch event, or a smooth scroll animation of its own.',
     inputSchema: z.object({
       sessionId,
@@ -2064,6 +2415,21 @@ export const interactionTools = defineTools({
         }
       }
 
+      // Chromium returns from the CDP wheel dispatch BEFORE the renderer has necessarily run
+      // the page's own listeners, so reading straight back can observe a page that has not yet
+      // seen the event. Measured directly with a probe that bypassed this tool: the listener
+      // was still unfired in 2 of 20 trials at idle and 3 of 150 under load. What used to hide
+      // it is readSettledScrollState's sleep(25) poll, and only by accident: when nothing on
+      // the page is scrollable its first two reads agree immediately and it returns without
+      // ever sleeping, so the mask is exactly one 25ms tick with no structural relationship to
+      // event delivery. Two chained animation frames are a real renderer round trip, so this
+      // waits for the thing that actually matters instead of for a duration that usually
+      // covers it. Swallowed on failure because a gesture that navigated the page away has no
+      // renderer left to wait for, and that is not a wheel failure.
+      await target.page
+        .evaluate(() => new Promise<void>(resolve => window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve()))))
+        .catch(() => {});
+
       const after = await readSettledScrollState(target.page, point.x, point.y);
       const moved = !sameScrollState(before, after);
 
@@ -2073,6 +2439,9 @@ export const interactionTools = defineTools({
       // `note:` spreads back to back would let the second one silently overwrite the first.
       const notes: string[] = [];
       notes.push(...multiMatchNote([{ which: 'point', point }]));
+      if (pointHit.unknownReason !== undefined) {
+        notes.push(pointHit.unknownReason);
+      }
       if (pointHit.matchesTarget === false) {
         notes.push(
           `The wheel event did not land on the point's own selector's element: ${describeElement(pointHit.elementAtPoint)} received it instead, ` +
@@ -2099,7 +2468,9 @@ export const interactionTools = defineTools({
         totalDeltaY: deltaY * repeat,
         scroll: { before, after },
         moved,
-        ...(point.selector !== undefined ? { matched: pointHit.matchesTarget !== false } : {}),
+        ...(point.selector !== undefined
+          ? { matched: pointHit.matchesTarget === false ? false : pointHit.unknownReason !== undefined ? null : true }
+          : {}),
         ...(notes.length > 0 ? { note: notes.join(' ') } : {})
       });
     }

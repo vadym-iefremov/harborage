@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import type { Frame, Locator, Page } from 'playwright';
+import type { ElementHandle, Frame, Locator, Page } from 'playwright';
 import * as z from 'zod/v4';
 
 import { sessionCacheDir } from '../../screenshotCache.js';
@@ -277,6 +277,22 @@ interface ProbeElement {
 }
 
 /**
+ * An <iframe> element, as seen from its PARENT document.
+ *
+ * Reached only through a cast inside a callback, never as a callback's own
+ * `el` parameter, for the reason ProbeElement's own comments give: Playwright
+ * types frameElement() as ElementHandle<SVGElement | HTMLElement>, and under
+ * the test tsconfig (which does pull in lib.dom) a narrower declared parameter
+ * stops the callback type-checking. offsetWidth is the LAYOUT border box before
+ * any transform, getBoundingClientRect the same box after every ancestor
+ * transform, and the ratio is the scale a point crosses the boundary by.
+ */
+interface FrameHostElement extends ProbeElement {
+  offsetWidth?: number;
+  offsetHeight?: number;
+}
+
+/**
  * One step of the flattened tree: an element, a ShadowRoot, or the Document.
  *
  * Not an element type, because the walk genuinely passes through nodes that
@@ -304,6 +320,9 @@ declare const window: {
   scrollX: number;
   scrollY: number;
   devicePixelRatio: number;
+  // Compared by reference only, which is allowed across origins, so this is
+  // the one iframe check that works in a cross-origin frame as well.
+  top: unknown;
 };
 declare function getComputedStyle(element: unknown, pseudoElement?: string | null): ProbeStyle;
 declare const CSS: { escape(value: string): string };
@@ -504,6 +523,128 @@ function frameTree(page: Page): FrameNode[] {
 }
 
 /** Resolves a frame id from list_frames, or explains which ids do exist. */
+/** How element_box names something in an ancestor frame that swallowed a click. */
+interface AncestorFrameOccluder {
+  tagName: string;
+  id: string;
+  classes: string | null;
+  containsTarget: boolean;
+  inAncestorFrame: true;
+}
+
+/**
+ * For each hit-test point inside a subframe, whatever in an ANCESTOR document is covering the
+ * iframe there, or null when the click really does reach the frame.
+ *
+ * element_box's own probe measures and hit-tests entirely inside one frame, which is right for
+ * its coordinate contract (documented: inside an iframe the coordinates are relative to that
+ * frame's own viewport) and is why it was immune to the coordinate-space bug drag and wheel had.
+ * But it also meant the probe could not see one document out: a modal in the PARENT covering the
+ * whole iframe swallowed every click while element_box reported topmostAtCentre true and
+ * occludedBy null, confirmed against a real pointerdown listener that never fired. A pointer
+ * event does not propagate across a frame boundary, so "would a click reach this element" is
+ * only answerable once every ancestor frame is known to receive it first.
+ *
+ * Costs nothing at all for the overwhelmingly common main-frame case, because the caller only
+ * reaches this when the probe itself reported window !== window.top. That check rides along in
+ * the probe that was already running, needs no round trip of its own, and works for a
+ * cross-origin frame too, unlike anything that would have to touch contentDocument.
+ */
+async function ancestorFrameOccluders(
+  locator: Locator,
+  points: ({ x: number; y: number } | null)[]
+): Promise<(AncestorFrameOccluder | null)[]> {
+  const blank = points.map(() => null);
+  const handle = await locator.first().elementHandle().catch(() => null);
+  if (!handle) return blank;
+
+  const chain: ElementHandle[] = [];
+  try {
+    let frame = await handle.ownerFrame();
+    while (frame && frame.parentFrame()) {
+      chain.unshift(await frame.frameElement());
+      frame = frame.parentFrame();
+    }
+  } catch {
+    for (const entry of chain) await entry.dispose().catch(() => {});
+    await handle.dispose().catch(() => {});
+    return blank;
+  }
+  await handle.dispose().catch(() => {});
+  if (chain.length === 0) return blank;
+
+  try {
+    // chain[i] is the <iframe> living in frame i's document, whose content is frame i+1, so its
+    // origin and scale map a point from frame i's space into frame i+1's. The element's own
+    // points arrive in the innermost frame's space, so they are mapped back OUT first, and the
+    // reachability checks then run from the outermost frame inwards.
+    const steps: { originX: number; originY: number; scaleX: number; scaleY: number }[] = [];
+    for (const frameElement of chain) {
+      steps.push(
+        await frameElement.evaluate((element: unknown) => {
+          const host = element as FrameHostElement;
+          const rect = host.getBoundingClientRect();
+          const style = getComputedStyle(host);
+          const scaleX = host.offsetWidth ? rect.width / host.offsetWidth : 1;
+          const scaleY = host.offsetHeight ? rect.height / host.offsetHeight : 1;
+          return {
+            originX: rect.left + ((parseFloat(style.getPropertyValue('border-left-width')) || 0) + (parseFloat(style.getPropertyValue('padding-left')) || 0)) * scaleX,
+            originY: rect.top + ((parseFloat(style.getPropertyValue('border-top-width')) || 0) + (parseFloat(style.getPropertyValue('padding-top')) || 0)) * scaleY,
+            scaleX: scaleX || 1,
+            scaleY: scaleY || 1
+          };
+        })
+      );
+    }
+
+    // perLevel[i] holds every point expressed in frame i's own coordinate space.
+    const perLevel: ({ x: number; y: number } | null)[][] = [];
+    let current = points;
+    for (let level = chain.length - 1; level >= 0; level -= 1) {
+      const step = steps[level]!;
+      current = current.map(point => (point ? { x: point.x * step.scaleX + step.originX, y: point.y * step.scaleY + step.originY } : null));
+      perLevel[level] = current;
+    }
+
+    const blocked: (AncestorFrameOccluder | null)[] = points.map(() => null);
+    for (let level = 0; level < chain.length; level += 1) {
+      const answers = await chain[level]!.evaluate(
+        (element: unknown, arg: { points: ({ x: number; y: number } | null)[] }) => {
+          const host = element as FrameHostElement;
+          return arg.points.map(point => {
+            if (!point) return null;
+            let hit = document.elementFromPoint(point.x, point.y);
+            let depth = 0;
+            while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function' && depth < 100) {
+              const deeper = hit.shadowRoot.elementFromPoint(point.x, point.y);
+              if (!deeper || deeper === hit) break;
+              hit = deeper;
+              depth += 1;
+            }
+            // An <iframe> has no rendered light-DOM children, so the only clean answer here is
+            // the iframe element itself. Anything else is the parent document taking the click
+            // before the frame ever sees it.
+            if ((hit as unknown) === (host as unknown)) return null;
+            return hit
+              ? { tagName: String(hit.tagName).toLowerCase(), id: hit.id || '', classes: hit.getAttribute('class'), containsTarget: false, inAncestorFrame: true as const }
+              : { tagName: 'html', id: '', classes: null, containsTarget: false, inAncestorFrame: true as const };
+          });
+        },
+        { points: perLevel[level]! }
+      );
+      answers.forEach((answer, index) => {
+        // First failing level wins: the outermost thing in the way is the one to deal with.
+        if (answer && !blocked[index]) blocked[index] = answer;
+      });
+    }
+    return blocked;
+  } catch {
+    return blank;
+  } finally {
+    for (const frameElement of chain) await frameElement.dispose().catch(() => {});
+  }
+}
+
 function resolveFrame(page: Page, frameId: string | undefined): Frame | undefined {
   if (frameId === undefined) return undefined;
   const nodes = frameTree(page);
@@ -1451,7 +1592,9 @@ export const inspectTools = defineTools({
       'topmostUnknownReason says why and what to do (scroll it into view, then ask again). Reporting whatever ' +
       'unrelated element happens to sit at the clamped point as an occluder would be a fabricated diagnosis with ' +
       'a remedy that cannot work. topmostUnknownReason is also filled in when no hit test ran at all, because the ' +
-      'element is not visible or is entirely outside the viewport. ' +
+      'element is not visible or is entirely outside the viewport, and when the DOM at that point is nested so ' +
+      'deep that the walk gave up: topmostAtCentre is null there too, because "we could not tell" is not the same ' +
+      'answer as "something is covering it". ' +
       'What it does NOT do: it never waits. A selector whose element has not rendered yet comes back as ' +
       'matched: 0, not as a timeout, so settle the page first. It hit-tests one point, so an element covered only ' +
       'at its edges still reports topmostAtCentre true. It does not tell you what an element looks like: use ' +
@@ -1548,7 +1691,7 @@ export const inspectTools = defineTools({
                   const inViewport = coverage > 0;
 
                   let topmostAtCentre: boolean | null = null;
-                  let occludedBy: { tagName: string; id: string; classes: string | null; containsTarget: boolean } | null = null;
+                  let occludedBy: { tagName: string; id: string; classes: string | null; containsTarget: boolean; inAncestorFrame?: true } | null = null;
                   let hitTestPoint: { x: number; y: number } | null = null;
                   let hitTestPointIsCentre: boolean | null = null;
                   let topmostUnknownReason: string | null = null;
@@ -1586,7 +1729,12 @@ export const inspectTools = defineTools({
                     // nothing outside can see into a closed root.
                     let hit = document.elementFromPoint(centreX, centreY);
                     let shadowDrillDepth = 0;
-                    while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function' && shadowDrillDepth < 20) {
+                    let truncated = false;
+                    while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function') {
+                      if (shadowDrillDepth >= 100) {
+                        truncated = true;
+                        break;
+                      }
                       const deeper = hit.shadowRoot.elementFromPoint(centreX, centreY);
                       if (!deeper || deeper === hit) break;
                       hit = deeper;
@@ -1644,16 +1792,58 @@ export const inspectTools = defineTools({
                       let onComposedPath = false;
                       let node: FlatNode | null = hit as FlatNode;
                       let steps = 0;
-                      while (node && steps < 200) {
+                      while (node) {
                         if ((node as unknown) === (element as unknown)) {
                           onComposedPath = true;
+                          break;
+                        }
+                        // A cap that is actually reached means the walk gave up, not that the
+                        // element is absent from the path. The previous cap of 200 was
+                        // reachable (measured: 199 intervening levels passed, 200 failed) and
+                        // produced a confident MISS naming the leaf, with the "an ancestor is
+                        // on top" remedy that cannot apply to a page whose only sin is being
+                        // deep. Both caps are guards against a malformed tree now, not limits
+                        // any real document meets, and reaching one is reported as unknown.
+                        if (steps >= 10000) {
+                          truncated = true;
                           break;
                         }
                         node = node.assignedSlot ?? (node.nodeType === 11 ? (node.host ?? null) : (node.parentNode ?? null));
                         steps += 1;
                       }
 
-                      if (onComposedPath) {
+                      // The mirror walk, UP from this element, answering whether the thing that
+                      // took the click is an ancestor of it. Node.contains() was used here and
+                      // was wrong: it does not cross a shadow boundary, so a button inside an
+                      // open shadow root under its light-DOM wrapper's ::after scrim reported
+                      // containsTarget false and earned the overlay remedy, while the
+                      // byte-identical light-DOM shape on the same page reported true and
+                      // earned the right one. The verdict was correct in both cases; only the
+                      // diagnosis flipped, and only because a shadow root was in the way.
+                      let hitContainsElement = false;
+                      if (!onComposedPath) {
+                        let up: FlatNode | null = element as unknown as FlatNode;
+                        let upSteps = 0;
+                        while (up) {
+                          if ((up as unknown) === (hit as unknown)) {
+                            hitContainsElement = true;
+                            break;
+                          }
+                          if (upSteps >= 10000) {
+                            truncated = true;
+                            break;
+                          }
+                          up = up.assignedSlot ?? (up.nodeType === 11 ? (up.host ?? null) : (up.parentNode ?? null));
+                          upSteps += 1;
+                        }
+                      }
+
+                      if (!onComposedPath && truncated) {
+                        topmostUnknownReason =
+                          'The hit test gave up before it could answer: the DOM at this point is nested deeper ' +
+                          'than the walk is allowed to run, so whether a click here reaches this element is ' +
+                          'UNKNOWN rather than known to be false. Nothing here is evidence of an overlay.';
+                      } else if (onComposedPath) {
                         topmostAtCentre = true;
                       } else if (hitTestPointIsCentre === false) {
                         // The point tested is NOT the element's centre, so a miss
@@ -1675,7 +1865,7 @@ export const inspectTools = defineTools({
                           // An ancestor of this element taking the click is a
                           // different diagnosis from an overlay taking it, and the
                           // caller cannot tell them apart from a tag name.
-                          containsTarget: hit.contains(element)
+                          containsTarget: hitContainsElement
                         };
                       }
                     }
@@ -1712,13 +1902,40 @@ export const inspectTools = defineTools({
                     topmostUnknownReason,
                     hitTestPoint,
                     hitTestPointIsCentre,
+                    // Whether this probe ran inside a subframe, so the caller knows to check
+                    // the ancestor documents too. Free: it rides along in the evaluate that
+                    // was already running, and unlike anything touching contentDocument it
+                    // works for a cross-origin frame. Stripped from the result below.
+                    frameLocal: window !== window.top,
                     position: style.getPropertyValue('position'),
                     zIndex: style.getPropertyValue('z-index')
                   };
                 });
               }, { limit });
 
-        results.push({ selector, matched, returned: elements.length, elements });
+        // Only when the probe itself said it ran in a subframe, so the main-frame path pays
+        // nothing at all for this: no handle, no owner-frame lookup, no extra round trip.
+        if (elements.some(element => element.frameLocal)) {
+          const occluders = await ancestorFrameOccluders(
+            root.locator(selector),
+            elements.map(element => element.hitTestPoint)
+          );
+          occluders.forEach((occluder, index) => {
+            if (!occluder) return;
+            const element = elements[index];
+            if (!element) return;
+            element.topmostAtCentre = false;
+            element.occludedBy = occluder;
+            element.topmostUnknownReason = null;
+          });
+        }
+
+        results.push({
+          selector,
+          matched,
+          returned: elements.length,
+          elements: elements.map(({ frameLocal, ...rest }) => rest)
+        });
       }
 
       return text({
