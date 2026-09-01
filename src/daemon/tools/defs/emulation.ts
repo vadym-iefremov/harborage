@@ -50,6 +50,21 @@ const overrideCloseHooked = new WeakSet<Page>();
 /** Which permission names this session has granted, so clear_permissions can report what it actually took away. */
 const grantedPermissions = new WeakMap<BrowserContext, Set<string>>();
 
+/**
+ * Whether a tab currently has an ACTIVE override from each of the three
+ * CDP-only knobs (user agent, timezone, locale), tracked independently per
+ * knob so a reset's own verification can tell two things apart that look
+ * identical from a single before/after reading: a reset issued on a tab that
+ * had nothing overridden (a legitimate no-op) versus a reset that silently
+ * failed to remove one that was genuinely active. Chromium exposes no way to
+ * query "is there currently an override" from outside, so this is this
+ * module's own bookkeeping: set true on a successful non-reset call, false on
+ * a successful reset.
+ */
+const userAgentOverrideActive = new WeakMap<Page, boolean>();
+const timezoneOverrideActive = new WeakMap<Page, boolean>();
+const localeOverrideActive = new WeakMap<Page, boolean>();
+
 /** Whether a fake clock has been installed for this session, since Playwright's clock calls no-op silently without one. */
 const clockInstalled = new WeakMap<BrowserContext, boolean>();
 
@@ -315,7 +330,8 @@ export const emulationTools = defineTools({
       'Playwright itself cannot do this: it fixes userAgent per browser context at creation time and offers no later setter, so this goes through CDP (Emulation.setUserAgentOverride) on a CDP session this tool keeps attached for the life of the tab. Doing the same thing through send_cdp_command does NOT work: that tool detaches after every call, and Chromium reverts the override the moment the session that set it detaches, so the change silently disappears before you can observe it. ' +
       'Verified behaviour: it changes BOTH navigator.userAgent and the outgoing User-Agent request header, and it survives navigations and reloads in that tab. acceptLanguage likewise changes both navigator.language and the outgoing Accept-Language header. ' +
       'One caveat worth knowing: overriding the user agent stops Chromium sending the Sec-CH-UA client hint headers, so a server that sniffs client hints rather than the UA string sees nothing at all rather than seeing your override. ' +
-      'Scoped to one tab: other tabs in the same session, and every other session, keep the real identity. Reads the result back out of the page rather than echoing the request.',
+      'Scoped to one tab: other tabs in the same session, and every other session, keep the real identity. Reads the result back out of the page rather than echoing the request. ' +
+      'reset\'s "matched" is verified against the value the tab held immediately BEFORE this call, not against a value this tool assumes is empty: navigator.userAgent is never empty in any real browser, so that assumption could never fail and would report matched: true whether or not the reset actually took. When this tool has no override of its own active on the tab, a reset is a legitimate no-op and "matched" is trivially true; when one was active, "matched" is only true if the user agent genuinely changed.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -357,15 +373,29 @@ export const emulationTools = defineTools({
       }
 
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
+      const wasActive = userAgentOverrideActive.get(target.page) === true;
+      // Read before the reset, and only when there is something to disprove:
+      // a reset on a tab with no override of ours active is a legitimate
+      // no-op, and probing twice for nothing would just be a wasted round
+      // trip.
+      const before = wantsReset && wasActive ? await probe<IdentityState>(target, IDENTITY_PROBE) : null;
+
       // An empty userAgent is CDP's own way of clearing the override, which
       // restores the genuine UA string and the client hints along with it.
       const params: Record<string, unknown> = { userAgent: wantsReset ? '' : (args.userAgent as string) };
       if (args.acceptLanguage !== undefined) params.acceptLanguage = args.acceptLanguage;
       if (args.platform !== undefined) params.platform = args.platform;
       await sendOverride(target, 'Emulation.setUserAgentOverride', params, 'The user agent override');
+      userAgentOverrideActive.set(target.page, !wantsReset);
 
       const identity = await probe<IdentityState>(target, IDENTITY_PROBE);
-      const matched = wantsReset ? identity.userAgent.length > 0 : identity.userAgent === args.userAgent;
+      // navigator.userAgent is never empty in a real browser, so checking
+      // for a non-empty string on reset could never fail: it reported
+      // matched: true whether or not the reset actually took. Comparing
+      // against the value from immediately before the call can fail, which
+      // is the point: a reset that silently did nothing now shows before
+      // and after reading the same string.
+      const matched = wantsReset ? before === null || identity.userAgent !== before.userAgent : identity.userAgent === args.userAgent;
       return text({
         pageId: target.pageId,
         requested: wantsReset ? 'the browser\'s real user agent' : args.userAgent,
@@ -376,8 +406,9 @@ export const emulationTools = defineTools({
         ...(matched
           ? {}
           : {
-              note:
-                'The page does not report the requested user agent. Trust "userAgent", not the request: something in the page may be shadowing navigator.userAgent.'
+              note: wantsReset
+                ? 'The page still reports the same user agent it had before this reset, and this tab had an override active: the reset likely did not take. Trust "userAgent", and try again.'
+                : 'The page does not report the requested user agent. Trust "userAgent", not the request: something in the page may be shadowing navigator.userAgent.'
             })
       });
     }
@@ -388,7 +419,8 @@ export const emulationTools = defineTools({
       'Override the timezone for one tab, AFTER the session already exists, so Date arithmetic, Intl formatting and anything rendering a local time behave as they would for a user in that zone. ' +
       'Playwright takes timezoneId only as a context-creation option and has no later setter, so this goes through CDP (Emulation.setTimezoneOverride) on a CDP session kept attached for the life of the tab. send_cdp_command cannot do this: it detaches after each call, and Chromium drops the override with the session that set it. ' +
       'Verified: the override survives navigations and reloads in that tab, and stays inside that tab. An unknown zone id is rejected loudly by the browser rather than quietly ignored. ' +
-      'It does NOT change the locale, so dates stay formatted in the machine\'s language at the new offset: use set_locale for that. Reads Intl.DateTimeFormat().resolvedOptions().timeZone back out of the page rather than echoing the request.',
+      'It does NOT change the locale, so dates stay formatted in the machine\'s language at the new offset: use set_locale for that. Reads Intl.DateTimeFormat().resolvedOptions().timeZone back out of the page rather than echoing the request. ' +
+      'reset\'s "matched" is verified against the zone the tab resolved immediately BEFORE this call: when this tool has no override of its own active on the tab, a reset is a legitimate no-op and "matched" is trivially true; when one was active, "matched" is only true if the resolved zone genuinely changed. (The one gap: if the override happened to be set to the exact zone the machine already uses, the before and after readings coincide even though the reset itself worked, which reads as a false mismatch. Rare, and the observable behaviour is identical either way, so it is left as a known limitation rather than solved with a second source of truth.)',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -410,6 +442,15 @@ export const emulationTools = defineTools({
       }
 
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
+      const wasActive = timezoneOverrideActive.get(target.page) === true;
+      const before =
+        wantsReset && wasActive
+          ? await probe<{ timezoneId: string; januaryOffsetMinutes: number; julyOffsetMinutes: number }>(
+              target,
+              TIMEZONE_PROBE
+            )
+          : null;
+
       // CDP treats an empty timezoneId as "disable the override".
       await sendOverride(
         target,
@@ -417,12 +458,16 @@ export const emulationTools = defineTools({
         { timezoneId: wantsReset ? '' : (args.timezoneId as string) },
         `The timezone override ${JSON.stringify(args.timezoneId ?? '')}`
       );
+      timezoneOverrideActive.set(target.page, !wantsReset);
 
       const state = await probe<{ timezoneId: string; januaryOffsetMinutes: number; julyOffsetMinutes: number }>(
         target,
         TIMEZONE_PROBE
       );
-      const matched = wantsReset ? true : state.timezoneId === args.timezoneId;
+      // Hardcoding true here used to mean a reset that silently did not take
+      // could never be caught. Comparing against the zone from immediately
+      // before the call can fail, which is the point.
+      const matched = wantsReset ? before === null || state.timezoneId !== before.timezoneId : state.timezoneId === args.timezoneId;
       return text({
         pageId: target.pageId,
         requested: wantsReset ? 'the machine timezone' : args.timezoneId,
@@ -430,7 +475,11 @@ export const emulationTools = defineTools({
         matched,
         ...(matched
           ? {}
-          : { note: 'The page resolves a different zone than the one requested. Trust "timezoneId", not the request.' })
+          : {
+              note: wantsReset
+                ? 'The page still resolves the same zone it had before this reset, and this tab had an override active: the reset likely did not take. Trust "timezoneId", and try again.'
+                : 'The page resolves a different zone than the one requested. Trust "timezoneId", not the request.'
+            })
       });
     }
   }),
@@ -440,7 +489,8 @@ export const emulationTools = defineTools({
       'Override the locale for one tab, AFTER the session already exists, so Intl number, date, currency and collation formatting behave as they would for a user in that locale. ' +
       'Playwright takes locale only as a context-creation option and has no later setter, so this goes through CDP (Emulation.setLocaleOverride) on a CDP session kept attached for the life of the tab. send_cdp_command cannot do this: it detaches after each call, and Chromium drops the override with the session that set it. ' +
       'IMPORTANT and measured: this moves Intl only. It does NOT move navigator.language or navigator.languages, so a page that picks its translations off navigator.language carries on in the original language while its numbers and dates change underneath. The result reports navigator.language back so you can see that for yourself. To move navigator.language too, pass acceptLanguage to set_user_agent. ' +
-      'Verified: the override survives navigations and reloads in that tab, and stays inside that tab. An invalid locale name is rejected loudly by the browser.',
+      'Verified: the override survives navigations and reloads in that tab, and stays inside that tab. An invalid locale name is rejected loudly by the browser. ' +
+      'reset\'s "matched" is verified against the locale the tab resolved immediately BEFORE this call: when this tool has no override of its own active on the tab, a reset is a legitimate no-op and "matched" is trivially true; when one was active, "matched" is only true if the resolved locale genuinely changed.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -458,6 +508,15 @@ export const emulationTools = defineTools({
       }
 
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
+      const wasActive = localeOverrideActive.get(target.page) === true;
+      const before =
+        wantsReset && wasActive
+          ? await probe<{ locale: string; navigatorLanguage: string; sampleNumber: string; sampleDate: string }>(
+              target,
+              LOCALE_PROBE
+            )
+          : null;
+
       // CDP restores the default when the params carry no locale at all.
       await sendOverride(
         target,
@@ -465,19 +524,25 @@ export const emulationTools = defineTools({
         wantsReset ? {} : { locale: args.locale as string },
         `The locale override ${JSON.stringify(args.locale ?? '')}`
       );
+      localeOverrideActive.set(target.page, !wantsReset);
 
       const state = await probe<{ locale: string; navigatorLanguage: string; sampleNumber: string; sampleDate: string }>(
         target,
         LOCALE_PROBE
       );
-      const matched = wantsReset ? true : state.locale === args.locale;
+      // Hardcoding true here used to mean a reset that silently did not take
+      // could never be caught. Comparing against the locale from immediately
+      // before the call can fail, which is the point.
+      const matched = wantsReset ? before === null || state.locale !== before.locale : state.locale === args.locale;
       return text({
         pageId: target.pageId,
         requested: wantsReset ? 'the browser locale' : args.locale,
         ...state,
         matched,
         note:
-          'navigatorLanguage is reported because a locale override deliberately does not move it. If the page chooses its language from navigator.language, this call changed its formatting but not its translations.'
+          wantsReset && !matched
+            ? 'The page still resolves the same locale it had before this reset, and this tab had an override active: the reset likely did not take. Trust "locale", and try again.'
+            : 'navigatorLanguage is reported because a locale override deliberately does not move it. If the page chooses its language from navigator.language, this call changed its formatting but not its translations.'
       });
     }
   }),
