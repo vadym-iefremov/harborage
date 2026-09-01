@@ -1525,9 +1525,31 @@ export const inspectTools = defineTools({
                     const centreY = Math.min(Math.max(trueY, 0), window.innerHeight - 1);
                     hitTestPoint = { x: Math.round(centreX * 100) / 100, y: Math.round(centreY * 100) / 100 };
                     hitTestPointIsCentre = centreX === trueX && centreY === trueY;
-                    const hit = document.elementFromPoint(centreX, centreY);
+                    // document.elementFromPoint retargets into the shadow host for
+                    // ANYTHING inside a shadow tree, open or closed. Measured
+                    // against real Chromium: a plain unoccluded <button> inside an
+                    // open shadow root, nothing on top of it, still came back with
+                    // hit equal to its own host <div id="host">, topmostAtCentre
+                    // false and occludedBy naming the host, a fabricated overlay
+                    // on every web component on the page. hit.contains(element)
+                    // alone would fix that, but it would ALSO wave through a real
+                    // overlay sitting on top of the element inside the SAME shadow
+                    // root, because that overlay retargets to the identical host
+                    // too. ShadowRoot.elementFromPoint, unlike Document's, does not
+                    // retarget, so re-querying the same point against
+                    // hit.shadowRoot recovers what is actually topmost inside the
+                    // shadow tree, and repeating it handles shadow roots nested in
+                    // shadow roots.
+                    let hit = document.elementFromPoint(centreX, centreY);
+                    let shadowDrillDepth = 0;
+                    while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function' && shadowDrillDepth < 20) {
+                      const deeper = hit.shadowRoot.elementFromPoint(centreX, centreY);
+                      if (!deeper || deeper === hit) break;
+                      hit = deeper;
+                      shadowDrillDepth += 1;
+                    }
                     if (hit) {
-                      topmostAtCentre = hit === element || element.contains(hit);
+                      topmostAtCentre = hit === element || element.contains(hit) || hit.contains(element);
                       if (!topmostAtCentre) {
                         occludedBy = {
                           tagName: String(hit.tagName).toLowerCase(),
