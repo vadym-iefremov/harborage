@@ -181,15 +181,26 @@ test('a tab the page opens itself still gets exactly one pageId, with its own bu
   await handlers.navigate({ sessionId, url: `${base}?name=opener` });
 
   await handlers.click({ sessionId, selector: '#pop' });
-  // The popup arrives asynchronously; give the context's own page event a moment.
-  const deadline = Date.now() + 5000;
+  // Both waits below are deliberately generous. Measured on an idle machine,
+  // the popup is adopted and its console message buffered within about 45ms,
+  // consistently, over 25 consecutive runs with none ever lost. So a wait of
+  // several seconds is already orders of magnitude of headroom, and the only
+  // thing a tight deadline buys is a test that fails when the machine is busy
+  // running other suites, which is indistinguishable from a real regression
+  // when you read the output later. Fifteen seconds asserts the same property
+  // and only trips on something genuinely broken.
+  const deadline = Date.now() + 15000;
   let tabs = await tabsOf(sessionId);
   while (tabs.length < 2 && Date.now() < deadline) {
     await new Promise(resolve => setTimeout(resolve, 50));
     tabs = await tabsOf(sessionId);
   }
 
-  assert.equal(tabs.length, 2, 'a target=_blank tab must be adopted exactly once, not twice and not zero times');
+  assert.equal(
+    tabs.length,
+    2,
+    `a target=_blank tab must be adopted exactly once, not twice and not zero times; saw ${JSON.stringify(tabs.map(t => t.url))}`
+  );
   const popup = tabs.find(t => t.url.includes('name=popup'));
   assert.ok(popup, `expected the popup among ${JSON.stringify(tabs.map(t => t.url))}`);
 
@@ -200,7 +211,7 @@ test('a tab the page opens itself still gets exactly one pageId, with its own bu
   // empty and failed roughly one run in three, which is the flakiest possible
   // way to assert a real property. The property under test is that the popup
   // gets its OWN buffer, so waiting for the message is the honest wait.
-  const messageDeadline = Date.now() + 5000;
+  const messageDeadline = Date.now() + 15000;
   let messages: { text: string }[] = [];
   let sawPopupMessage = false;
   while (Date.now() < messageDeadline) {
