@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs';
 import { basename, isAbsolute } from 'node:path';
 
-import type { Locator, Page } from 'playwright';
+import type { Locator, Page, Response } from 'playwright';
 import * as z from 'zod/v4';
 
 import { defineTool, defineTools, text, type ToolContext, type ToolResult } from '../types.js';
@@ -820,7 +820,27 @@ async function historyStep(
   // nothing. What is left below is evidence a step really happened: a real
   // HTTP response came back, the URL is different, or the document's own
   // identity changed.
-  const navigated = response !== null || url !== previousUrl || (before !== null && after !== null && before !== after);
+  const moved = response !== null || url !== previousUrl || (before !== null && after !== null && before !== after);
+
+  // Movement is necessary but not sufficient, and this is where a whole class
+  // of guarded step used to slip through. `afterHistory` was already read for
+  // exactly this purpose and then never consulted in the verdict, so a page
+  // that catches the popstate and pushes the caller SOMEWHERE ELSE, rather
+  // than back to the same URL, satisfied every term above: the URL really did
+  // change, so `moved` was true, and the tool reported a clean back step with
+  // a reassuring note. Reproduced on a real page: the history index went from
+  // 4 to 5, meaning the tab ended up one entry FURTHER FORWARD than it
+  // started, and the call still passed. That is what a client-side auth
+  // bounce does, and it is the opposite of going back.
+  //
+  // Chromium's own index says which way the tab actually went, so use it: a
+  // back step has to leave the index lower than it was and a forward step has
+  // to leave it higher. Null when the history query is unavailable, and then
+  // the evidence-of-movement rule above stands on its own rather than a
+  // missing reading vetoing a real step.
+  const indexDelta = history === null || afterHistory === null ? null : afterHistory.index - history.index;
+  const wentTheRightWay = indexDelta === null ? null : direction === 'back' ? indexDelta < 0 : indexDelta > 0;
+  const navigated = moved && wentTheRightWay !== false;
 
   const notes: string[] = [];
   if (navigated && sameDocument) {
@@ -828,7 +848,21 @@ async function historyStep(
       'Same-document step: the URL changed but the document was NOT reloaded. The JS context, in-page state and the console buffer all survive, and the page saw a popstate event rather than a load. This is what a hash or pushState entry looks like going back.'
     );
   }
-  if (!navigated) {
+  if (!navigated && wentTheRightWay === false && moved) {
+    const opposite = direction === 'back' ? 'forward' : 'back';
+    notes.push(
+      `The tab moved, but the wrong way: this ${direction} step left it on ${url}, and Chromium's own history index ` +
+        `went from ${history?.index} to ${afterHistory?.index}, ` +
+        (indexDelta === 0
+          ? 'which is exactly where it started. '
+          : `which is ${Math.abs(indexDelta ?? 0)} entr${Math.abs(indexDelta ?? 0) === 1 ? 'y' : 'ies'} ${opposite} of where it started. `) +
+        'That is a page intercepting the popstate this step fired and pushing its own entries on top, which is what a ' +
+        'route guard, an unsaved-changes interceptor or a client-side auth bounce to a login page does. The URL ' +
+        `changing is NOT evidence the ${direction} step landed: it changed because the page moved the tab itself. ` +
+        'Treat this as a blocked step. "url" still says where the tab really ended up, so read it rather than assuming ' +
+        'the tab stayed put.'
+    );
+  } else if (!navigated) {
     notes.push(
       `Nothing moved: the tab is still on ${previousUrl}, even though there was a ${direction} entry to step to. ` +
         'This is what a route guard or an unsaved-changes interceptor looks like from the outside: the page saw the ' +
@@ -844,6 +878,7 @@ async function historyStep(
     title: await target.page.title().catch(() => ''),
     sameDocument: navigated ? sameDocument : false,
     previousUrl,
+    ...(history ? { previousHistoryIndex: history.index } : {}),
     ...(afterHistory ? { historyIndex: afterHistory.index, historyLength: afterHistory.length } : {}),
     ...(notes.length ? { note: notes.join(' ') } : {})
   });
@@ -947,12 +982,91 @@ async function readSettledScrollState(page: Page, x: number, y: number): Promise
   return previous;
 }
 
+/** One main-frame document response, kept so a navigation's final document can be given its own status. */
+interface DocumentResponse {
+  /** The Playwright Response object, kept only to compare by identity against the one goto returned. */
+  response: Response;
+  url: string;
+  status: number;
+  ok: boolean;
+}
+
+/** What the tab is showing right now, read in one evaluate so url and title cannot come from two different documents. */
+interface PageSnapshot {
+  identity: number | null;
+  url: string;
+  title: string;
+}
+
+/** How long navigate waits for a page that is still throwing itself at another document to stop. */
+const NAVIGATION_SETTLE_MS = 500;
+
+/** How often it re-reads while waiting. */
+const NAVIGATION_SETTLE_POLL_MS = 10;
+
+/** A URL with any fragment removed, since a fragment never reaches the server and so never has a status of its own. */
+function withoutHash(url: string): string {
+  const hash = url.indexOf('#');
+  return hash === -1 ? url : url.slice(0, hash);
+}
+
+/**
+ * url, title and document identity read together, in one round trip.
+ *
+ * Reading them separately is how navigate came to describe two documents at
+ * once: page.url() answered from one document and page.title() from the next.
+ */
+async function readPageSnapshot(page: Page): Promise<PageSnapshot> {
+  const identity = await documentIdentity(page);
+  const [url, title] = await Promise.all([
+    Promise.resolve(page.url()),
+    page.title().catch(() => '')
+  ]);
+  return { identity, url, title };
+}
+
+/**
+ * Waits until the tab has stopped replacing its own document, then reports
+ * what is finally there.
+ *
+ * A client-side redirect is not part of the navigation goto performed: goto
+ * resolves against the document IT fetched, and the page then throws itself
+ * at another one. A 200 shell that runs location.replace to a 500, and a meta
+ * refresh chain, both do it, and both are ordinary shapes for a client-side
+ * auth bounce. Without this wait navigate reported a document that had
+ * already been replaced by the time the caller read the answer.
+ *
+ * Two conditions have to hold together before this returns: the snapshot has
+ * to be unchanged across two consecutive reads, AND no further main-frame
+ * document response can have arrived in between. Stability alone is not
+ * enough, because the gap between one document finishing and the next request
+ * going out is easily shorter than a poll. The deadline is deliberately short
+ * (half a second): a page that keeps redirecting forever gets described as it
+ * was at the deadline rather than hanging the most-called tool in the surface.
+ */
+async function settleAfterNavigation(page: Page, documents: DocumentResponse[]): Promise<PageSnapshot> {
+  let snapshot = await readPageSnapshot(page);
+  let seen = documents.length;
+  const deadline = Date.now() + NAVIGATION_SETTLE_MS;
+  for (;;) {
+    await sleep(NAVIGATION_SETTLE_POLL_MS);
+    const next = await readPageSnapshot(page);
+    const stable = next.identity === snapshot.identity && next.url === snapshot.url;
+    const quiet = documents.length === seen;
+    snapshot = next;
+    seen = documents.length;
+    if (stable && quiet) return snapshot;
+    if (Date.now() >= deadline) return snapshot;
+  }
+}
+
 /** Tools that drive a tab: moving it somewhere and acting on the page. */
 export const interactionTools = defineTools({
   navigate: defineTool({
     description:
       'Navigate a session\'s tab to a URL. A URL differing from the current one only in its hash is a SAME-DOCUMENT navigation: the browser changes the address but does not reload, so the JS context, in-page state (React state, timers, subscriptions) and the console buffer all survive. This tool does not quietly force a reload in that case, because navigating to a hash is a legitimate thing to test. It reports it instead: every result carries a "sameDocument" boolean, present in both the true and the false case, plus a note when it is true. Use reload when you need a real page load. ' +
-      'This is the most-called tool in the whole surface, and it reports the real HTTP outcome rather than treating a rendered page as success: every result carries "status" (the HTTP status code) and "ok" (whether it was in the 200 to 299 range), exactly as reload does, so navigating to a URL that answers 404 or 500 does not read as an ordinary success just because something rendered, which matters most for an SPA shell that paints its own error state under a failing response. "status" and "ok" are both null when there genuinely is no HTTP response to report a status FOR, which is not a failure: a same-document navigation, about:blank, or a non-HTTP scheme such as data: or javascript:. A note explains which of those it was, so a null status is never mistaken for a navigation that silently failed.',
+      'This is the most-called tool in the whole surface, and it reports the real HTTP outcome rather than treating a rendered page as success: every result carries "status" (the HTTP status code) and "ok" (whether it was in the 200 to 299 range), exactly as reload does, so navigating to a URL that answers 404 or 500 does not read as an ordinary success just because something rendered, which matters most for an SPA shell that paints its own error state under a failing response. "status" and "ok" are both null when there genuinely is no HTTP response to report a status FOR, which is not a failure: a same-document navigation, about:blank, or a non-HTTP scheme such as data: or javascript:. A note explains which of those it was, so a null status is never mistaken for a navigation that silently failed. ' +
+      'ONE PAYLOAD ALWAYS DESCRIBES ONE DOCUMENT. "status" and "ok" belong to the document "url" and "title" describe, not to whatever the first request happened to answer, and the call waits briefly for a page that is still throwing itself at another document to stop before reading any of them. That matters because a client-side redirect is an ordinary shape: a 200 shell that runs location.replace on a failing route, a meta refresh chain, or a router bouncing an unauthenticated visitor to a login page. When one happens the result also carries "documentChanged", holding the response the navigation itself measured ("from"), the document finally described ("to"), and every main-frame document this call saw, in order, plus a note saying so. So ok: true beside a login page title, or beside a 500 error page, is a shape you will not see here. If the final document has no HTTP response of its own, because it ended on about:blank or a data: URL, "status" and "ok" are null rather than carrying the earlier document\'s status. A page that keeps redirecting for longer than half a second is described as it stood at that point rather than hanging the call.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -962,24 +1076,69 @@ export const interactionTools = defineTools({
     async handler(ctx, args) {
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
       const before = await documentIdentity(target.page);
-      const response = await target.page.goto(args.url, args.waitUntil ? { waitUntil: args.waitUntil } : undefined);
-      const after = await documentIdentity(target.page);
+
+      // Every main-frame document response for the life of this call, in
+      // order. goto() hands back exactly one response, the one for the
+      // request IT made, and that is not necessarily the document the caller
+      // ends up looking at: a 200 shell that runs location.replace, or a meta
+      // refresh, fetches further documents that goto knows nothing about.
+      // Recording them is what lets the final document be given its own
+      // status instead of inheriting the shell's.
+      const documents: DocumentResponse[] = [];
+      const onResponse = (response: Response): void => {
+        try {
+          const request = response.request();
+          if (request.frame() !== target.page.mainFrame()) return;
+          if (request.resourceType() !== 'document') return;
+          documents.push({ response, url: response.url(), status: response.status(), ok: response.ok() });
+        } catch {
+          // A request whose frame has already gone throws when asked for it.
+          // Nothing to record, and nothing worth failing the navigation over.
+        }
+      };
+      target.page.on('response', onResponse);
+
+      let response: Response | null;
+      let settled: PageSnapshot;
+      try {
+        response = await target.page.goto(args.url, args.waitUntil ? { waitUntil: args.waitUntil } : undefined);
+        // Read once the page has stopped replacing its own document, and read
+        // url and title together. Both halves matter: without the wait the
+        // answer describes a document that is already gone, and without the
+        // single read url could come from one document and title from the
+        // next.
+        settled = await settleAfterNavigation(target.page, documents);
+      } finally {
+        target.page.off('response', onResponse);
+      }
 
       // A response means a document really was fetched and swapped in. A null
       // response is ambiguous on its own, so the identity check settles it.
       // When the identity is unreadable we say "same document", erring toward
       // warning the caller: a spurious warning costs one redundant reload, a
       // missed one costs a false pass.
-      const sameDocument = response === null && (before === null || after === null || before === after);
+      const sameDocument = response === null && (before === null || settled.identity === null || before === settled.identity);
 
-      // navigate is the most-called tool here, and until now it discarded
-      // `response` the moment sameDocument was settled: a URL that answered
-      // 404 or 500 came back looking like an ordinary success, and for an SPA
-      // shell that renders its own error state under a failing response even
-      // "title" gave nothing away. Reported the same way reload already
-      // reports it, so the two tools agree on what a caller should read.
-      const status = response?.status() ?? null;
-      const ok = response?.ok() ?? null;
+      // WHICH DOCUMENT DOES "status" DESCRIBE? It describes the one "url" and
+      // "title" describe, and nothing else. It used to be goto's own
+      // response, unconditionally, which is the same document only when the
+      // page did not move itself afterwards. A 200 shell that redirects to a
+      // 500 came back as "status": 200, "ok": true beside the error page's
+      // own title, and a caller reading ok: true there draws exactly the
+      // wrong conclusion. Matched by URL, ignoring the fragment, because a
+      // fragment never reaches the server and so never carries a status.
+      const finalKey = withoutHash(settled.url);
+      const finalDocument = documents.filter(entry => withoutHash(entry.url) === finalKey).at(-1);
+      const gotoDocument = response === null ? undefined : documents.find(entry => entry.response === response);
+      const status = response === null ? null : (finalDocument?.status ?? null);
+      const ok = response === null ? null : (finalDocument?.ok ?? null);
+
+      // The described document is not the one goto measured. Either a later
+      // document response is the one on screen, or the tab ended up somewhere
+      // with no HTTP response of its own at all.
+      const documentChanged =
+        response !== null &&
+        (finalDocument !== undefined ? finalDocument !== gotoDocument : finalKey !== withoutHash(response.url()));
 
       const notes: string[] = [];
       if (sameDocument) {
@@ -997,14 +1156,31 @@ export const interactionTools = defineTools({
           'This navigation produced no HTTP response, so "status" and "ok" are null: that is what about:blank and a non-HTTP scheme (for instance data: or javascript:) look like, not a failure. The document did change, a fresh one was created, just not through anything this tool can report an HTTP status for.'
         );
       }
+      if (documentChanged && response !== null) {
+        notes.push(
+          `The page moved itself after the response was measured: the navigation to ${response.url()} answered ${response.status()}, and the document now on screen is ${settled.url}. That is a client-side redirect (location.assign or replace, a meta refresh, or a router bouncing an unauthenticated visitor), and "documentChanged" lists every main-frame document this call saw, in order. ` +
+            (finalDocument !== undefined
+              ? `"status" and "ok" describe the document "url" and "title" describe, this last one, NOT the ${response.status()} that started the chain.`
+              : 'The final document has no HTTP response of its own to report (about:blank, a data: URL or a same-document rewrite), so "status" and "ok" are null rather than carrying the earlier document\'s status.')
+        );
+      }
 
       return text({
         pageId: target.pageId,
-        url: target.page.url(),
-        title: await target.page.title().catch(() => ''),
+        url: settled.url,
+        title: settled.title,
         sameDocument,
         status,
         ok,
+        ...(documentChanged && response !== null
+          ? {
+              documentChanged: {
+                from: { url: response.url(), status: response.status(), ok: response.ok() },
+                to: { url: settled.url, status, ok },
+                documents: documents.map(entry => ({ url: entry.url, status: entry.status, ok: entry.ok }))
+              }
+            }
+          : {}),
         ...(notes.length ? { note: notes.join(' ') } : {})
       });
     }
@@ -1792,14 +1968,14 @@ export const interactionTools = defineTools({
 
   navigate_back: defineTool({
     description:
-      'Go back one entry in a session\'s tab history, the way a user presses the browser Back button. Real history matters wherever an app writes its state into the URL and restores it from a popstate event, and nothing else here exercises that path. When there is no entry to go back to this does NOT quietly succeed: the result says "navigated": false with a note, so a no-op can never read as a step. Nor does it quietly succeed when there WAS an entry to go to but the step never actually landed: a page can catch the popstate event this fires and push its own URL right back, which is exactly what a route guard or an unsaved-changes interceptor does, and "navigated" is false with a note for that too, so a back button an app is trapping the user on cannot read as a clean pass. Otherwise it reports the resulting URL and "sameDocument", exactly as navigate does: true means the URL changed without a reload, so the JS context, in-page state and the console buffer all survived, which is what a hash or pushState step back looks like. "historyIndex" and "historyLength" are always read fresh from the browser\'s own history after the step, not computed from where the tab was before it, so they describe where the tab really ended up.',
+      'Go back one entry in a session\'s tab history, the way a user presses the browser Back button. Real history matters wherever an app writes its state into the URL and restores it from a popstate event, and nothing else here exercises that path. When there is no entry to go back to this does NOT quietly succeed: the result says "navigated": false with a note, so a no-op can never read as a step. Nor does it quietly succeed when there WAS an entry to go to but the step never actually landed. A page can catch the popstate event this fires and push its own entries on top, which is what a route guard, an unsaved-changes interceptor or a client-side auth bounce does, and it takes two shapes: the page re-pushes the URL the tab was already on, so nothing appears to move, or it pushes somewhere else entirely, so the URL changes and the tab ends up level with or FURTHER FORWARD than where it started. Both report "navigated": false with a note naming what happened, because neither is a step back. The verdict is settled against Chromium\'s own navigation history, not against the URL: a back step has to leave the history index LOWER than it was, and "previousHistoryIndex" and "historyIndex" are both reported so the movement can be checked rather than taken on trust. "url" always says where the tab really ended up, blocked or not, so read it rather than assuming a blocked step left the tab where it was. Otherwise it reports the resulting URL and "sameDocument", exactly as navigate does: true means the URL changed without a reload, so the JS context, in-page state and the console buffer all survived, which is what a hash or pushState step back looks like. "historyIndex" and "historyLength" are always read fresh from the browser\'s own history after the step, not computed from where the tab was before it, so they describe where the tab really ended up.',
     inputSchema: z.object({ sessionId, pageId, waitUntil }),
     handler: (ctx, args) => historyStep(ctx, args, 'back')
   }),
 
   navigate_forward: defineTool({
     description:
-      'Go forward one entry in a session\'s tab history, the way a user presses the browser Forward button. The counterpart to navigate_back, and it behaves identically: sitting at the newest entry there is nothing ahead, and the result says "navigated": false with a note rather than looking like a step, and the same is true when there was an entry to go to but a page trapped the step and pushed its own URL right back. Note that navigating anywhere new discards the forward entries, so a forward step is only available directly after a back step.',
+      'Go forward one entry in a session\'s tab history, the way a user presses the browser Forward button. The counterpart to navigate_back, and it behaves identically: sitting at the newest entry there is nothing ahead, and the result says "navigated": false with a note rather than looking like a step. The same is true when there was an entry to go to but a page trapped the step, whether it pushed the tab\'s own URL straight back or pushed it somewhere else: a forward step counts only when Chromium\'s own history index ends up HIGHER than it started, and "previousHistoryIndex" and "historyIndex" report both readings. Note that navigating anywhere new discards the forward entries, so a forward step is only available directly after a back step.',
     inputSchema: z.object({ sessionId, pageId, waitUntil }),
     handler: (ctx, args) => historyStep(ctx, args, 'forward')
   }),
