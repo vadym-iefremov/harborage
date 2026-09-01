@@ -58,6 +58,34 @@ interface PageFile {
   size: number;
   type: string;
 }
+/**
+ * PageElement widened with the two members needed to drill through and climb
+ * back out of a shadow tree: shadowRoot for hitTestPointerPoint's descent,
+ * getRootNode for readScrollState's ascent.
+ *
+ * Kept off PageElement itself rather than added to it, because
+ * Locator.evaluate's real Playwright signature checks a callback's own
+ * element parameter against a genuine HTMLElement (the test tsconfig, unlike
+ * this file's own, does pull in lib.dom), and getRootNode()'s declared
+ * return type here, `{ host?: ShadowDrillElement }`, has no property in
+ * common with the real Node a live getRootNode() returns. TypeScript's weak
+ * type check rejects that pairing outright, which broke every OTHER
+ * locator.evaluate callback in this file, not just the ones that actually
+ * touch a shadow tree, the one time this was added directly to PageElement.
+ * Applied only where drilling is actually needed, through a cast on
+ * document.elementFromPoint's own result, never on a callback's `el`.
+ */
+interface ShadowDrillElement extends PageElement {
+  // Present (possibly null, for a closed root) on any element that is
+  // itself a shadow host. Absent entirely on one that is not. The same
+  // drill element_box's topmostAtCentre runs; see the matching member on
+  // ProbeElement in inspect.ts.
+  shadowRoot?: { elementFromPoint?(x: number, y: number): ShadowDrillElement | null } | null;
+  // Real signature returns Node, which is not this interface, but callers
+  // here only ever read .host off the result, and both a Document and a
+  // ShadowRoot structurally satisfy "optionally has a host".
+  getRootNode(): { host?: ShadowDrillElement };
+}
 declare const document: {
   activeElement: PageElement | null;
   addEventListener(type: string, handler: () => void, options?: unknown): void;
@@ -564,7 +592,20 @@ async function hitTestPointerPoint(
 ): Promise<{ matchesTarget: boolean | null; elementAtPoint: TopmostElement | null }> {
   if (point.selector === undefined) {
     const elementAtPoint = await page.evaluate((arg: { x: number; y: number }) => {
-      const hit = document.elementFromPoint(arg.x, arg.y);
+      // Drilled the same way the selector branch below is, and for the same reason: without
+      // it, a raw point sitting inside a shadow tree would always be reported as the shadow
+      // host itself, which is a useless answer for a diagnostic field whose whole point is
+      // naming what is really there. Cast rather than declared, per ShadowDrillElement's own
+      // comment: document's shared declaration stays PageElement so every other call in this
+      // file keeps type-checking against a real HTMLElement.
+      let hit = document.elementFromPoint(arg.x, arg.y) as ShadowDrillElement | null;
+      let shadowDrillDepth = 0;
+      while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function' && shadowDrillDepth < 20) {
+        const deeper = hit.shadowRoot.elementFromPoint(arg.x, arg.y);
+        if (!deeper || deeper === hit) break;
+        hit = deeper;
+        shadowDrillDepth += 1;
+      }
       return hit ? { tagName: String(hit.tagName).toLowerCase(), id: hit.id || '', classes: hit.getAttribute('class') } : null;
     }, point);
     return { matchesTarget: null, elementAtPoint };
@@ -576,7 +617,35 @@ async function hitTestPointerPoint(
   // value for every caller that never needs it.
   const locator = page.locator(point.selector);
   return locator.evaluate((el: PageElement, arg: { x: number; y: number }) => {
-    const hit = document.elementFromPoint(arg.x, arg.y);
+    // document.elementFromPoint retargets into the shadow host for ANYTHING inside a shadow
+    // tree, open or closed, and Node.contains() does not cross that boundary the other way:
+    // confirmed directly against real Chromium, a shadow host does not contain() its own
+    // shadow content, because a node's parent inside a shadow tree is the shadow root, not the
+    // host. So without drilling, hit === el, el.contains(hit) and hit.contains(el) are ALL
+    // false for anything inside a shadow root, occluded or not: a real drag or wheel target
+    // with nothing whatsoever on top of it read as occluded by its own host, the drag/wheel
+    // version of the bug element_box's topmostAtCentre had before its own fix (see inspect.ts).
+    // Drilling through hit.shadowRoot.elementFromPoint recovers the real topmost node inside
+    // the shadow tree, so the three comparisons above work again exactly as they do in the
+    // light DOM: hit === el for a clean unoccluded target, and hit.contains(el) / el.contains(hit)
+    // for an ordinary ancestor/descendant nesting, now evaluated within the shadow root's own
+    // tree instead of against a host outside it. That is also what keeps a real overlay honest
+    // once the drill is added: an overlay sitting on top of the target INSIDE THAT SAME shadow
+    // root drills down to become `hit` itself, a SIBLING of `el`, not an ancestor, so it fails
+    // all three comparisons and is reported as the occluder, rather than being missed (as it
+    // was without the drill) or waved through as an ancestor it never structurally was.
+    // ShadowRoot.elementFromPoint, unlike Document's, does not retarget, so re-querying the
+    // same point against hit.shadowRoot is what makes this work, and repeating it handles
+    // shadow roots nested in shadow roots. Kept in step with element_box's identical drill in
+    // inspect.ts; if one changes, change the other.
+    let hit = document.elementFromPoint(arg.x, arg.y) as ShadowDrillElement | null;
+    let shadowDrillDepth = 0;
+    while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function' && shadowDrillDepth < 20) {
+      const deeper = hit.shadowRoot.elementFromPoint(arg.x, arg.y);
+      if (!deeper || deeper === hit) break;
+      hit = deeper;
+      shadowDrillDepth += 1;
+    }
     if (!hit) return { matchesTarget: false, elementAtPoint: null };
     const matchesTarget = hit === el || el.contains(hit) || hit.contains(el);
     return {
@@ -799,7 +868,20 @@ function readScrollState(page: Page, x: number, y: number): Promise<ScrollState>
     ([px, py]: [number, number]) => {
       const scroller = document.scrollingElement;
       const state: ScrollState = { page: { x: scroller?.scrollLeft ?? 0, y: scroller?.scrollTop ?? 0 } };
-      let node = document.elementFromPoint(px, py);
+      // document.elementFromPoint retargets into the shadow host for anything inside a shadow
+      // tree (the same trap hitTestPointerPoint above drills through), so without this a point
+      // sitting over a scrollable container that lives INSIDE a shadow root would never even
+      // see that container: the walk below would start at the host, which is not itself
+      // scrollable, and climb its own ancestors instead, missing the real target entirely.
+      // Cast rather than declared, per ShadowDrillElement's own comment above.
+      let node = document.elementFromPoint(px, py) as ShadowDrillElement | null;
+      let shadowDrillDepth = 0;
+      while (node && node.shadowRoot && typeof node.shadowRoot.elementFromPoint === 'function' && shadowDrillDepth < 20) {
+        const deeper = node.shadowRoot.elementFromPoint(px, py);
+        if (!deeper || deeper === node) break;
+        node = deeper;
+        shadowDrillDepth += 1;
+      }
       while (node) {
         // Overflowing content is not enough: an overflow:hidden box holds
         // content it will never scroll, and a canvas that zooms by scaling its
@@ -812,7 +894,18 @@ function readScrollState(page: Page, x: number, y: number): Promise<ScrollState>
           state.target = { tag: node.tagName.toLowerCase(), id: node.id, x: node.scrollLeft ?? 0, y: node.scrollTop ?? 0 };
           break;
         }
-        node = node.parentElement ?? null;
+        const parent = (node.parentElement ?? null) as ShadowDrillElement | null;
+        if (parent) {
+          node = parent;
+          continue;
+        }
+        // parentElement stops dead at a shadow boundary, the same way it did in
+        // computed_style's layer walk (inspect.ts): the top node inside an open or closed
+        // shadow root has parentElement null even though a real ancestor of it, the host,
+        // sits right outside. getRootNode().host steps across the boundary so a scrollable
+        // ancestor outside the shadow tree is still found rather than the walk stopping
+        // short and silently reporting no scrollable target at all.
+        node = node.getRootNode().host ?? null;
       }
       return state;
     },
@@ -1411,7 +1504,7 @@ export const interactionTools = defineTools({
     serializesInput: true,
     description:
       'Drag from one point to another in a session\'s tab with a real mouse: press, several intermediate moves, release. One atomic gesture, not a separate grab and drop, because a half-finished drag leaves the page in a state nothing else here can recover. Covers BOTH kinds of dragging: pointer-event canvases (React Flow, dnd-kit, d3-drag, anything moving an element from pointermove) and native HTML5 drag-and-drop (draggable="true" with dragstart/dragover/drop). The same mouse sequence drives both, so there is no mode to choose. Source and target each take a selector (the element\'s centre), a raw x/y viewport point (for a region of a canvas that is not a DOM element), or a selector plus x/y (an offset inside it, e.g. a node\'s drag handle). IF THE DRAG APPEARS TO DO NOTHING, in this order: raise "steps", because most drag libraries spend the first move activating the drag and only start following on later ones, so too few moves fires every event and moves nothing; set "holdMs" if the app uses a long-press or delay-activated drag, which cancels outright when the pointer moves too soon; set "settleMs" if the drop lands but the app has not finished reacting; check the coordinates in the result, which are where the mouse really went. Returns the resolved source and target points, plus \'nativeDrag\': true when the browser ran the gesture as a native HTML5 drag rather than as pointer events, which tells a canvas drag that did nothing exactly why; false when the probe genuinely ran and saw no native drag start; and null, with a note, on the rare gesture that navigates the page away before the probe can be read, since a fresh document\'s own counter is not evidence about the document that navigated away, and reporting that as false would be exactly the kind of unearned negative this field exists to avoid. ' +
-      'A resolved selector is only a bounding box, and a box says nothing about what is drawn on top of it, so BOTH endpoints are hit-tested with elementFromPoint before the mouse ever moves, the same test element_box runs for a plain click target. sourceHit and targetHit each carry matchesTarget (true when the point really belongs to the named selector, an ancestor of it, or a descendant of it; null for a raw x/y endpoint, which names nothing to compare against) and elementAtPoint (what is really there, named the way element_box\'s occludedBy is, whenever that differs from a clean match). When a selector\'s point does not reach its own element the top-level result carries "matched": false and a "note" naming the endpoint and what covered it instead, so a press that silently lands on a modal or a loading overlay cannot read as a normal drag. This does NOT throw for an occluded endpoint: a canvas point that is deliberately under a transparent hit-testing overlay, or a selector naming a node nested inside the thing that truly receives the gesture, are both real drags, so check "matched" rather than assuming a resolved call pressed what it was asked to. ' +
+      'A resolved selector is only a bounding box, and a box says nothing about what is drawn on top of it, so BOTH endpoints are hit-tested with elementFromPoint before the mouse ever moves, the same test element_box runs for a plain click target. sourceHit and targetHit each carry matchesTarget (true when the point really belongs to the named selector, an ancestor of it, or a descendant of it; null for a raw x/y endpoint, which names nothing to compare against) and elementAtPoint (what is really there, named the way element_box\'s occludedBy is, whenever that differs from a clean match). The hit test accounts for shadow DOM the same way element_box does: an endpoint inside an open or closed shadow root that is genuinely unoccluded reports matchesTarget true, not false against its own host, and a real overlay sitting on top of it INSIDE THAT SAME shadow root is still caught rather than waved through by the retargeting that makes the first case work. When a selector\'s point does not reach its own element the top-level result carries "matched": false and a "note" naming the endpoint and what covered it instead, so a press that silently lands on a modal or a loading overlay cannot read as a normal drag. This does NOT throw for an occluded endpoint: a canvas point that is deliberately under a transparent hit-testing overlay, or a selector naming a node nested inside the thing that truly receives the gesture, are both real drags, so check "matched" rather than assuming a resolved call pressed what it was asked to. ' +
       'Clears any existing text selection before pressing, deliberately: a press landing inside a selection left over from an earlier drag makes the browser drag that selection instead, and the page then sees no pointermove at all. Does NOT wait for either element to appear: call wait_for first. Does NOT verify that anything moved, so assert the page state yourself afterwards.',
     inputSchema: z.object({
       sessionId,
@@ -1715,7 +1808,7 @@ export const interactionTools = defineTools({
     serializesInput: true,
     description:
       'Turn the mouse wheel in a session\'s tab, which is how a canvas is zoomed and how anything with its own scroll container is scrolled. WHERE the wheel lands matters and is not incidental: a canvas zooms toward the pointer, so "point" takes the same shape as drag\'s endpoints (a selector, a raw x/y viewport point, or a selector plus an offset inside it). Omitting it aims at the centre of the viewport, deliberately, rather than at wherever some earlier click or hover happened to leave the pointer. deltaY is positive to scroll down and negative to scroll up, deltaX positive to scroll right, matching a real wheel. MODIFIERS ARE THE PINCH: a browser delivers a trackpad pinch as a wheel event with ctrlKey set, and canvas libraries branch on exactly that, so modifiers: ["Control"] is the only way to test the zoom path in an app whose plain wheel pans. They are held for the whole gesture and released afterwards. Use "repeat" when one large delta and several small ones are not the same thing, which is common: libraries that accumulate deltas, debounce, or clamp per event behave differently, and "delay" spaces the events out for one that debounces. Always reads back what really moved: the result carries the point used, the total deltas dispatched, the scroll offsets before and after (for the page and for whichever container the browser would actually scroll at that point), and "moved". Note that "moved": false is CORRECT for a canvas zoom, because a zoom is a CSS transform rather than a scroll and nothing here can observe it generically: assert the app\'s own state for that. It is a real failure if you expected a scroll. ' +
-      'Resolving "point" only measures a box, it says nothing about what is drawn on top of it, and mouse.wheel dispatches at raw coordinates with none of Playwright\'s own actionability checks in the way, so the point is hit-tested with elementFromPoint before the event fires, the same test element_box runs for a plain click target. "pointHit" carries matchesTarget (true when the point really belongs to the named selector, an ancestor of it, or a descendant of it; null when point has no selector, which names nothing to compare against) and elementAtPoint (what is really there, named the way element_box\'s occludedBy is, whenever that differs from a clean match, or just informationally for a selector-less point when something is cheap to report). When a selector\'s point does not reach its own element the result carries "matched": false and a "note" naming what covered it, so a wheel that silently scrolled or zoomed the wrong container cannot read as having hit the one asked for. This does NOT throw for an occluded point: a canvas point deliberately under a transparent hit-testing overlay is a real target, so check "matched" rather than assuming a resolved call landed where it was aimed. Does NOT dispatch a pinch gesture, a touch event, or a smooth scroll animation of its own.',
+      'Resolving "point" only measures a box, it says nothing about what is drawn on top of it, and mouse.wheel dispatches at raw coordinates with none of Playwright\'s own actionability checks in the way, so the point is hit-tested with elementFromPoint before the event fires, the same test element_box runs for a plain click target. "pointHit" carries matchesTarget (true when the point really belongs to the named selector, an ancestor of it, or a descendant of it; null when point has no selector, which names nothing to compare against) and elementAtPoint (what is really there, named the way element_box\'s occludedBy is, whenever that differs from a clean match, or just informationally for a selector-less point when something is cheap to report). The hit test accounts for shadow DOM the same way element_box does: a point inside an open or closed shadow root that is genuinely unoccluded reports matchesTarget true, not false against its own host, and a real overlay sitting on top of it INSIDE THAT SAME shadow root is still caught rather than waved through by the retargeting that makes the first case work. "scroll" is drilled the same way: a scrollable container that lives inside a shadow root is found and reported on, not just the shadow host\'s own ancestors. When a selector\'s point does not reach its own element the result carries "matched": false and a "note" naming what covered it, so a wheel that silently scrolled or zoomed the wrong container cannot read as having hit the one asked for. This does NOT throw for an occluded point: a canvas point deliberately under a transparent hit-testing overlay is a real target, so check "matched" rather than assuming a resolved call landed where it was aimed. Does NOT dispatch a pinch gesture, a touch event, or a smooth scroll animation of its own.',
     inputSchema: z.object({
       sessionId,
       pageId,
