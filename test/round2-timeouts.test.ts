@@ -5,10 +5,29 @@ import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 
 import { cliEntry, cleanupTempDirs, daemonHealth, makeTestConfig, waitFor, wrapperEnv } from './helpers.js';
-import type { Config } from '../src/shared/config.js';
+import { loadConfig, type Config } from '../src/shared/config.js';
 import { toolDefs } from '../src/daemon/tools/schemas.js';
-import { minRequestTimeoutMs, requestTimeoutFor, requestTimeoutMarginMs } from '../src/client/wrapper.js';
+import { requestTimeoutFor, requestTimeoutMarginMs, type RequestTimeoutBounds } from '../src/client/wrapper.js';
 import { toJSONSchema } from 'zod/v4';
+
+/**
+ * loadConfig reads process.env directly; this file only reads the two
+ * fields it added (never writes them), so it does not need
+ * config-defaults.test.ts's withEnv save/restore dance.
+ */
+function withEnv(name: string, value: string, run: () => void): void {
+  const previous = process.env[name];
+  process.env[name] = value;
+  try {
+    run();
+  } finally {
+    if (previous === undefined) delete process.env[name];
+    else process.env[name] = previous;
+  }
+}
+
+/** Mirrors requestTimeoutFor's production defaults, so the unit tests below read as "unless overridden". */
+const productionBounds: RequestTimeoutBounds = { floorMs: 60_000, ceilingMs: 10 * 60 * 1000 };
 
 /**
  * Two defects from the same QA round: a schema that silently drops a key it
@@ -139,28 +158,62 @@ test('a real wrapper rejects the misnamed key over the actual stdio transport, f
 // ---------------------------------------------------------------------------
 
 test('requestTimeoutFor: no timeoutMs gets the unchanged 60s floor', () => {
-  assert.equal(requestTimeoutFor({}, 10 * 60 * 1000), minRequestTimeoutMs);
+  assert.equal(requestTimeoutFor({}, productionBounds), productionBounds.floorMs);
 });
 
 test('requestTimeoutFor: a small timeoutMs still gets at least the 60s floor', () => {
-  assert.equal(requestTimeoutFor({ timeoutMs: 1500 }, 10 * 60 * 1000), minRequestTimeoutMs);
+  assert.equal(requestTimeoutFor({ timeoutMs: 1500 }, productionBounds), productionBounds.floorMs);
 });
 
 test('requestTimeoutFor: a timeoutMs past 60s is no longer clamped down to 60s', () => {
   // This is the exact shape of the bug: timeoutMs: 150000 used to become a
   // transport timeout of 60000 regardless. It must now be timeoutMs plus
   // margin, comfortably clear of the old fixed 60000.
-  const result = requestTimeoutFor({ timeoutMs: 150_000 }, 10 * 60 * 1000);
+  const result = requestTimeoutFor({ timeoutMs: 150_000 }, productionBounds);
   assert.equal(result, 150_000 + requestTimeoutMarginMs);
-  assert.ok(result > minRequestTimeoutMs, 'must not regress to the old fixed 60s cutoff');
+  assert.ok(result > productionBounds.floorMs, 'must not regress to the old fixed 60s cutoff');
 });
 
 test('requestTimeoutFor: timeoutMs 0 (evaluate\'s "wait forever") maps to the ceiling, not to Infinity', () => {
-  assert.equal(requestTimeoutFor({ timeoutMs: 0 }, 10 * 60 * 1000), 10 * 60 * 1000);
+  assert.equal(requestTimeoutFor({ timeoutMs: 0 }, productionBounds), productionBounds.ceilingMs);
 });
 
 test('requestTimeoutFor: a huge timeoutMs is capped at the ceiling, not left unbounded', () => {
-  assert.equal(requestTimeoutFor({ timeoutMs: 999_999_999 }, 10 * 60 * 1000), 10 * 60 * 1000);
+  assert.equal(requestTimeoutFor({ timeoutMs: 999_999_999 }, productionBounds), productionBounds.ceilingMs);
+});
+
+test('requestTimeoutFor: a small configured floor still bounds an absent timeoutMs, but yields fast to margin once one is given', () => {
+  // The whole reason the floor is configurable: proving "a defined timeoutMs
+  // is not clamped down to the floor" needs a live test that actually waits
+  // out whatever the floor is (see the live test below), and 60 real seconds
+  // is too slow to pay on every run. The margin (10s, not itself
+  // configurable) is fixed, though, so a floor this small is smaller than
+  // the margin: once ANY timeoutMs is given, even a tiny one, timeoutMs plus
+  // margin already clears a 1000ms floor by itself, so this is margin math,
+  // not a floor-vs-margin race. The floor still does its actual job, which
+  // is bounding the no-timeoutMs case, exactly as it does at production scale.
+  const smallBounds: RequestTimeoutBounds = { floorMs: 1000, ceilingMs: 10 * 60 * 1000 };
+  assert.equal(requestTimeoutFor({}, smallBounds), smallBounds.floorMs);
+  const result = requestTimeoutFor({ timeoutMs: 1 }, smallBounds);
+  assert.equal(result, 1 + requestTimeoutMarginMs);
+  assert.ok(result > smallBounds.floorMs, 'must not clamp a defined timeoutMs back down to the floor');
+});
+
+test('loadConfig: the request timeout floor defaults to the MCP SDK\'s own 60s, unless overridden', () => {
+  const previous = process.env.HARBORAGE_REQUEST_TIMEOUT_FLOOR_MS;
+  delete process.env.HARBORAGE_REQUEST_TIMEOUT_FLOOR_MS;
+  try {
+    assert.equal(loadConfig().requestTimeoutFloorMs, 60_000);
+  } finally {
+    if (previous === undefined) delete process.env.HARBORAGE_REQUEST_TIMEOUT_FLOOR_MS;
+    else process.env.HARBORAGE_REQUEST_TIMEOUT_FLOOR_MS = previous;
+  }
+});
+
+test('loadConfig: the request timeout floor is overridable by environment variable', () => {
+  withEnv('HARBORAGE_REQUEST_TIMEOUT_FLOOR_MS', '1234', () => {
+    assert.equal(loadConfig().requestTimeoutFloorMs, 1234);
+  });
 });
 
 test('a real wrapper actually passes the derived timeout to the transport: the ceiling is enforced end to end', async () => {
@@ -215,35 +268,40 @@ test('a real wrapper gives evaluate\'s timeoutMs: 0 the "as long as the ceiling 
   assert.ok(elapsedMs >= 1200, `expected the call to run for roughly the ceiling, took only ${elapsedMs}ms`);
 });
 
-test('a call whose timeoutMs exceeds 60s is no longer cut off at 60s by the wrapper (the slow one)', async () => {
-  // The one test in this file allowed to actually run past a minute: proving
-  // the OLD fixed 60000ms transport cutoff is gone requires living past it
-  // for real. Kept to exactly one, and to as little over 60s as leaves a
-  // safe margin: wait_for's own overhead was measured at single-digit
-  // milliseconds (70000ms -> 70006ms), so one second of margin is generous,
-  // not padding for its own sake.
-  const config = await testConfig();
-  const client = await connectWrapper(config, 'round2-past-60s-test');
+test('a call whose timeoutMs exceeds the floor is no longer cut off at the floor by the wrapper', async () => {
+  // Same property the old version of this test proved by genuinely waiting
+  // past the production 60s floor: a timeoutMs above the floor gets
+  // timeoutMs plus margin, not clamped down to the floor. The floor is
+  // configurable (see requestTimeoutFloorMs in src/shared/config.ts) purely
+  // so this can be proved in about a second and a half instead of a minute:
+  // requestTimeoutFor's own branch logic does not care whether the floor is
+  // 1000 or 60000, only whether timeoutMs is above or below it, and the
+  // "loadConfig: the request timeout floor defaults to..." test above
+  // already pins the real production default to 60000 without waiting at
+  // all. A floor of 1000ms and a timeoutMs of 1500ms exercise the exact
+  // same "above the floor" branch the production numbers do.
+  const config = await testConfig({ requestTimeoutFloorMs: 1000 });
+  const client = await connectWrapper(config, 'round2-past-floor-test');
 
   const created = await client.callTool({ name: 'create_session', arguments: {} });
   const { sessionId } = created.structuredContent as { sessionId: string };
 
   const startedAt = Date.now();
   const result = await client.callTool(
-    { name: 'wait_for', arguments: { sessionId, selector: '#never-appears', timeoutMs: 61_000 } },
-    // Generous on the outer (test -> wrapper) hop for the same reason as the
-    // ceiling test above: only the wrapper -> daemon leg is under test here.
-    { timeout: 120_000 }
+    { name: 'wait_for', arguments: { sessionId, selector: '#never-appears', timeoutMs: 1500 } },
+    { timeout: 30_000 }
   );
   const elapsedMs = Date.now() - startedAt;
 
-  // Before this fix: an SdkError REQUEST_TIMEOUT at ~60002ms, carrying none
-  // of wait_for's own context. Now: wait_for's own real failure, because the
-  // wrapper's transport timeout (61000 + 10000 margin) outlasts it.
+  // Before this fix (at production scale: a 60000ms floor and a timeoutMs
+  // above it): an SdkError REQUEST_TIMEOUT at the floor, carrying none of
+  // wait_for's own context. Now: wait_for's own real failure, because the
+  // wrapper's transport timeout (timeoutMs plus margin) outlasts both
+  // wait_for's own wait and the floor.
   assert.ok(result.isError, `expected wait_for's own timeout error, got: ${JSON.stringify(result)}`);
   const text = resultText(result);
   assert.match(text, /wait_for gave up after/, `expected wait_for's own message, got: ${text}`);
   assert.doesNotMatch(text, /request timed out/i, `must not be the bare transport timeout, got: ${text}`);
-  assert.ok(elapsedMs > 60_000, `expected this to genuinely outlast the old 60s cutoff, took ${elapsedMs}ms`);
-  assert.ok(elapsedMs < 65_000, `expected wait_for's own ~61000ms timeout to fire, not something later, took ${elapsedMs}ms`);
+  assert.ok(elapsedMs > 1000, `expected this to genuinely outlast the 1000ms floor, took ${elapsedMs}ms`);
+  assert.ok(elapsedMs < 4000, `expected wait_for's own ~1500ms timeout to fire, not something later, took ${elapsedMs}ms`);
 });
