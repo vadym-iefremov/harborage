@@ -311,6 +311,10 @@ declare const document: {
   querySelectorAll(selector: string): ArrayLike<ProbeElement>;
   getElementsByTagName(tag: string): ArrayLike<ProbeElement>;
   elementFromPoint(x: number, y: number): ProbeElement | null;
+  // The whole hit-test stack at a point, nearest first, which is how the
+  // contrast walk finds things painting over the same pixels that are not on
+  // the ancestor chain it composited.
+  elementsFromPoint(x: number, y: number): ArrayLike<ProbeElement>;
 };
 declare const window: {
   innerWidth: number;
@@ -357,8 +361,41 @@ const forceablePseudoStates = ['hover', 'focus', 'focus-within', 'focus-visible'
  */
 const probeAttribute = 'data-harborage-probe';
 
+/**
+ * The attribute computed_style tags a POSSIBLE closed shadow host with, so a
+ * CDP pass can settle whether it really is one.
+ *
+ * A closed shadow root is designed to be invisible to page script:
+ * assignedSlot returns null inside one and the host's shadowRoot property is
+ * null, so from inside the page an ordinary <div> and a <div> hosting a closed
+ * root with a slot are indistinguishable. The consequence was concrete: text
+ * slotted into a closed root whose wrapper paints white, on a black page, is
+ * invisible at a true 1.0:1 and this tool reported 21:1 with no flag at all.
+ *
+ * CDP is not bound by that privacy rule. DOM.getDocument with pierce: true
+ * reports closed roots and their contents, so tagging the candidates here and
+ * looking them up there settles it. Removed again in a finally.
+ */
+const closedHostProbeAttribute = 'data-harborage-closed-host-probe';
+
 /** How many matches a diagnostics tool reports per selector unless told otherwise. */
 const defaultMatchLimit = 20;
+
+/**
+ * How far a ratio on TRANSLUCENT text can move for reasons alpha compositing
+ * does not model, in ratio points.
+ *
+ * Chromium's text rasteriser applies a gamma to glyph coverage that a <div>
+ * filled with the same colour does not get. Measured across 100 opacities: a
+ * solid box matches 255 - round(255 * opacity) exactly, every time, while a
+ * full-block glyph at the same opacity lands up to one 8-bit step darker.
+ * One step near the dark end of the scale is worth about a quarter of a ratio
+ * point, which is enough to move a result across a WCAG line. Rather than
+ * emulate a platform text rasteriser, whose behaviour depends on the font,
+ * the smoothing settings and the backdrop, the tool says when a ratio is
+ * close enough to a threshold for that to decide the verdict.
+ */
+const textGammaRatioSlack = 0.25;
 
 const opaqueWhite: Rgba = { r: 255, g: 255, b: 255, a: 1 };
 
@@ -422,14 +459,55 @@ function formatRgb(color: Rgba): string {
  * ancestor in the stack instead of stopping at the corner the way the screen
  * does.
  */
-function over(source: Rgba, backdrop: Rgba): Rgba {
+function over(source: Rgba, backdrop: Rgba, report?: PaintReport): Rgba {
   const alpha = source.a + backdrop.a * (1 - source.a);
   if (alpha === 0) return { ...fullyTransparent };
   const mix = (s: number, d: number): number => {
     const premultiplied = s * source.a + d * backdrop.a * (1 - source.a);
+    if (premultiplied > 255 && report) report.ranPastTheCeiling = true;
     return Math.min(255, Math.max(0, premultiplied)) / alpha;
   };
   return { r: mix(source.r, backdrop.r), g: mix(source.g, backdrop.g), b: mix(source.b, backdrop.b), a: alpha };
+}
+
+/**
+ * What happened during one compositing walk that the caller needs to know
+ * about, as opposed to the colour it produced.
+ *
+ * `ranPastTheCeiling` records that a channel came out above the top of sRGB
+ * and had to be pinned there. On its own that is fine and matches the screen:
+ * across 588 wide-gamut cases the pinned value is what Chromium paints. It
+ * stops being fine in combination with an opacity group, and see
+ * `wideGamutOverflowRisk` for what Chromium does then.
+ */
+interface PaintReport {
+  ranPastTheCeiling: boolean;
+}
+
+/**
+ * Whether this stack can drive Chromium into painting a colour no colour
+ * model predicts.
+ *
+ * Measured, not theorised. A wide-gamut colour carrying alpha, inside an
+ * element with opacity below 1, over a light backdrop: Chromium WRAPS the
+ * overflowing channel instead of pinning it. color(display-p3 0 1 0 / .35)
+ * under opacity .7 over white is painted rgb(193, 1, 193), a magenta, where
+ * every model of compositing says rgb(193, 255, 193), a pale green. The green
+ * channel computes to 256.1 and comes out as 1.
+ *
+ * Isolated across 108 combinations: it needs the opacity group (0 of 36 cases
+ * at opacity 1 are affected, 18 of 72 below it), it needs the overflow (only
+ * the light backdrops break, never black), and it does NOT need two layers,
+ * which is what it first looked like. One is enough.
+ *
+ * This is emulatable and deliberately not emulated. It is a defect in an
+ * 8-bit write path, it will be fixed, and a tool that reproduced it would
+ * quietly start lying on the Chromium version that fixes it while claiming
+ * more precision than the round below it has. Refusing is correct in both
+ * worlds, and it costs only the cases that are genuinely unpredictable.
+ */
+function wideGamutOverflowRisk(report: PaintReport, layers: PaintLayer[]): boolean {
+  return report.ranPastTheCeiling && layers.some(layer => layer.opacity < 1);
 }
 
 interface PaintLayer {
@@ -446,10 +524,10 @@ interface PaintLayer {
  * have to be composited first, then the whole result faded, rather than each
  * layer's alpha being multiplied on the way down.
  */
-function paintGroup(layers: PaintLayer[], index: number, innermost: Rgba): Rgba {
+function paintGroup(layers: PaintLayer[], index: number, innermost: Rgba, report: PaintReport): Rgba {
   const layer = layers[index];
-  const inner = index + 1 < layers.length ? paintGroup(layers, index + 1, innermost) : innermost;
-  const painted = over(inner, layer.bg);
+  const inner = index + 1 < layers.length ? paintGroup(layers, index + 1, innermost, report) : innermost;
+  const painted = over(inner, layer.bg, report);
   return { ...painted, a: painted.a * layer.opacity };
 }
 
@@ -460,9 +538,9 @@ function paintGroup(layers: PaintLayer[], index: number, innermost: Rgba): Rgba 
  * canvas before this matters; it only shows through for a page that does not,
  * which is precisely the dark-mode case that used to come out white.
  */
-function flattenOntoCanvas(layers: PaintLayer[], innermost: Rgba, canvas: Rgba): Rgba {
-  if (layers.length === 0) return over(innermost, canvas);
-  return over(paintGroup(layers, 0, innermost), canvas);
+function flattenOntoCanvas(layers: PaintLayer[], innermost: Rgba, canvas: Rgba, report: PaintReport): Rgba {
+  if (layers.length === 0) return over(innermost, canvas, report);
+  return over(paintGroup(layers, 0, innermost, report), canvas, report);
 }
 
 /** WCAG 2.x sRGB channel transfer function. The clamp matters: WCAG luminance is defined on sRGB only. */
@@ -504,11 +582,152 @@ function round(value: number, places: number): number {
   return Math.round(value * factor) / factor;
 }
 
+/**
+ * A CSS opacity as Chromium actually applies it: quantised to an 8-bit alpha.
+ *
+ * Chromium renders an opacity group into an 8-bit surface, so the fraction it
+ * multiplies by is round(opacity * 255) / 255, not the author's float.
+ * Measured across 99 opacities from 0.01 to 0.99, black over white:
+ * 255 - round(255 * opacity) matches the painted pixel in 100 of 100 cases,
+ * while round(255 * (1 - opacity)) misses 4 of them by one 8-bit step. One
+ * step is small but it is one-directional, and near a WCAG threshold a
+ * one-directional error is the difference between a reported pass and a
+ * reported fail on the same pixel.
+ */
+function quantisedOpacity(raw: string): number {
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return 1;
+  return Math.round(Math.min(1, Math.max(0, value)) * 255) / 255;
+}
+
 interface RawLayer {
   tagName: string;
   id: string;
   backgroundColor: string;
   opacity: string;
+  /** "none", or a gradient or image this walk cannot reduce to a single colour. */
+  backgroundImage: string;
+  /** "none", or a filter that recolours everything this layer and its descendants paint. */
+  filter: string;
+  /** "none", or a filter applied to whatever is painted BEHIND this layer. */
+  backdropFilter: string;
+  /** "normal", or a blend mode that is not the source-over this composites with. */
+  mixBlendMode: string;
+  /**
+   * True for an SVG element that is not the <svg> root. Chromium never paints
+   * background-color on one, so compositing it in invents a backdrop that is
+   * not on screen: black text inside <g style="background-color: black"> on a
+   * white page is painted at 21:1 and was being reported as 1:1.
+   */
+  svgNonRoot: boolean;
+}
+
+/**
+ * One thing painting in the same place as the measured element that the
+ * ancestor walk has no way to account for.
+ *
+ * The walk composites ancestors. Anything else that paints over the same
+ * pixels, a positioned sibling, a <canvas> under a transparent container, an
+ * overlay, is simply not in that stack, and compositing without it produces a
+ * number with no relationship to the screen. Measured: black text in a
+ * transparent container over a white-painted <canvas> is a true 21:1 and was
+ * reported as 1:1 against the black page behind the canvas.
+ */
+interface ForeignPainter {
+  tagName: string;
+  id: string;
+  /** "over" when it hit-tests above the element, "behind" when it is an overlapping sibling further out. */
+  where: string;
+  /** What it paints: a colour, an image, or replaced content such as a canvas. */
+  paints: string;
+}
+
+/** One reason the composited answer cannot be trusted, with a code a caller can branch on. */
+interface Unaccounted {
+  code: string;
+  detail: string;
+}
+
+/**
+ * Everything painting behind or over the glyph that the ancestor walk cannot
+ * reduce to a colour.
+ *
+ * This function is the answer to the failure that produced it. The refusal
+ * machinery existed, and exactly one situation was wired to it (gradient text
+ * via background-clip), while six others quietly produced a confident 21:1 on
+ * text painted at 1.0:1 with `passes: {aaText: true}` and nothing to branch
+ * on. Prose in the tool description does not help a caller reading a number.
+ * So every situation where the walk genuinely cannot know reaches one signal
+ * here, and every one of them is measured against painted pixels in
+ * test/round4-color.test.ts rather than reasoned about.
+ *
+ * The occlusion rule is what keeps this from being noise. A background image
+ * or a backdrop-filter further out than an opaque colour cannot change the
+ * pixel behind the glyph, so it is not reported. A filter or a blend mode is
+ * reported wherever it sits, because both recolour their whole subtree, the
+ * glyph included, no matter what is painted in between.
+ */
+function unaccountedFor(layers: RawLayer[], paintLayers: PaintLayer[], foreign: ForeignPainter[]): Unaccounted[] {
+  const found: Unaccounted[] = [];
+  const add = (code: string, detail: string): void => {
+    if (!found.some(entry => entry.code === code)) found.push({ code, detail });
+  };
+
+  // True once everything between this layer and the glyph is opaque, walking
+  // inward from the element. Layers are outermost first, so the element is
+  // last and the scan runs backwards.
+  const coveredFromOutside: boolean[] = new Array(layers.length).fill(false);
+  let covered = false;
+  for (let index = layers.length - 1; index >= 0; index -= 1) {
+    coveredFromOutside[index] = covered;
+    const paint = paintLayers[index];
+    if (paint.opacity >= 1 && paint.bg.a >= 1) covered = true;
+  }
+
+  layers.forEach((layer, index) => {
+    const where = layer.id ? `<${layer.tagName} id="${layer.id}">` : `<${layer.tagName}>`;
+    if (layer.filter && layer.filter !== 'none') {
+      add(
+        'filter',
+        `${where} has filter: ${layer.filter}, which recolours everything it and its descendants paint, the text ` +
+          'included. The composited colours below are the ones before that filter ran.'
+      );
+    }
+    if (layer.mixBlendMode && layer.mixBlendMode !== 'normal') {
+      add(
+        'mixBlendMode',
+        `${where} has mix-blend-mode: ${layer.mixBlendMode}, so it is not composited with the source-over this ` +
+          'walk assumes. The painted result is a function of the backdrop that plain alpha compositing cannot express.'
+      );
+    }
+    if (coveredFromOutside[index]) return;
+    if (layer.backgroundImage && layer.backgroundImage !== 'none') {
+      add(
+        'backgroundImage',
+        `${where} paints ${layer.backgroundImage.slice(0, 80)}, and nothing opaque sits between it and the text. ` +
+          'An image or a gradient is many colours, so there is no single backdrop colour to measure against.'
+      );
+    }
+    if (layer.backdropFilter && layer.backdropFilter !== 'none') {
+      add(
+        'backdropFilter',
+        `${where} has backdrop-filter: ${layer.backdropFilter}, which recolours whatever is painted behind it ` +
+          'before the text goes on top. The stack below is what would have been there without it.'
+      );
+    }
+  });
+
+  for (const painter of foreign) {
+    const where = painter.id ? `<${painter.tagName} id="${painter.id}">` : `<${painter.tagName}>`;
+    add(
+      'foreignPainter',
+      `${where} paints ${painter.paints} ${painter.where === 'over' ? 'over' : 'behind'} this element but is not an ` +
+        'ancestor of it, so it is not in the stack composited below. Only ancestors can be composited: a ' +
+        'positioned sibling, an overlay or a <canvas> underneath is invisible to this walk.'
+    );
+  }
+
+  return found;
 }
 
 /** The subset of a style probe that decides which colour paints the glyphs. */
@@ -517,6 +736,8 @@ interface GlyphPaintProbe {
   textFillColor: string;
   isSvg: boolean;
   fill: string;
+  stroke: string;
+  strokeWidth: string;
   backgroundImage: string;
 }
 
@@ -550,30 +771,44 @@ interface GlyphPaintProbe {
 function resolveGlyphPaint(
   probe: GlyphPaintProbe,
   clipsBackgroundToText: boolean
-): { property: string; value: string | null; unavailable: string | null } {
+): { property: string; value: string | null; unavailable: string | null; code: string } {
   if (probe.isSvg) {
     const fill = probe.fill.trim();
     if (fill === '' || fill === 'none') {
+      // A shape with no fill is not unpainted, it is OUTLINED, and the colour
+      // a viewer sees is the stroke. That is not a corner case: every Lucide,
+      // Feather and Heroicons outline icon is fill: none with a stroke, and on
+      // the live Acres page 26 of 117 elements are exactly this. Refusing them
+      // all is technically honest and practically useless, since the icon
+      // contrast question (1.4.11 non-text, 3:1) is precisely what a caller is
+      // asking. So the stroke is composited when it is a plain colour.
+      const stroke = probe.stroke.trim();
+      const strokeWidth = parseFloat(probe.strokeWidth);
+      if (stroke !== '' && stroke !== 'none' && !stroke.startsWith('url(') && !(strokeWidth === 0)) {
+        return { property: 'stroke', value: stroke, unavailable: null, code: '' };
+      }
       return {
         property: 'fill',
         value: fill === '' ? null : fill,
+        code: 'svgNoFill',
         unavailable:
-          'This is an SVG element and its fill is "none", so nothing is painted for it to have contrast against. ' +
-          'If the shape is outlined rather than filled, the colour that matters is stroke, which this tool does ' +
-          'not composite; read it from styles and compare it against effective.backgroundColor by hand.'
+          'This is an SVG element with fill: none and no plain stroke colour either, so nothing single-valued is ' +
+          'painted for it to have contrast against. If it is stroked from a gradient or a pattern, screenshot the ' +
+          'region and compare the worst part against its background.'
       };
     }
     if (fill.startsWith('url(')) {
       return {
         property: 'fill',
         value: fill,
+        code: 'svgPaintServerFill',
         unavailable:
           'This is an SVG element filled from a paint server (a gradient or a pattern), so it is painted in many ' +
           'colours and no single contrast ratio describes it. Screenshot the region and check the worst part of ' +
           'the gradient against its background instead.'
       };
     }
-    return { property: 'fill', value: fill, unavailable: null };
+    return { property: 'fill', value: fill, unavailable: null, code: '' };
   }
 
   const hasBackgroundImage = probe.backgroundImage !== '' && probe.backgroundImage !== 'none';
@@ -581,6 +816,7 @@ function resolveGlyphPaint(
     return {
       property: '-webkit-text-fill-color',
       value: probe.textFillColor === '' ? null : probe.textFillColor,
+      code: 'backgroundClipTextImage',
       unavailable:
         'This element uses background-clip: text with a background image, the gradient-text pattern, so the glyphs ' +
         'are painted with that image rather than with one colour and no single contrast ratio describes them. ' +
@@ -591,9 +827,9 @@ function resolveGlyphPaint(
 
   const fillColor = probe.textFillColor.trim();
   if (fillColor !== '' && fillColor !== probe.color.trim()) {
-    return { property: '-webkit-text-fill-color', value: fillColor, unavailable: null };
+    return { property: '-webkit-text-fill-color', value: fillColor, unavailable: null, code: '' };
   }
-  return { property: 'color', value: probe.color, unavailable: null };
+  return { property: 'color', value: probe.color, unavailable: null, code: '' };
 }
 
 /** One frame of a tab, with the id and the selector prefix an agent can act on. */
@@ -728,6 +964,64 @@ interface CdpNode {
   children?: CdpNode[];
   contentDocument?: CdpNode;
   shadowRoots?: CdpNode[];
+  /** "open", "closed", or "user-agent". Only present on a shadow root node. */
+  shadowRootType?: string;
+}
+
+function hasAttribute(node: CdpNode, name: string): boolean {
+  const attributes = node.attributes ?? [];
+  for (let index = 0; index < attributes.length; index += 2) {
+    if (attributes[index] === name) return true;
+  }
+  return false;
+}
+
+/** True if any node tagged with `attribute` anywhere in the pierced tree hosts a CLOSED shadow root. */
+function anyTaggedNodeHostsAClosedRoot(node: CdpNode, attribute: string): boolean {
+  const roots = node.shadowRoots ?? [];
+  for (const root of roots) {
+    if (root.shadowRootType === 'closed' && hasAttribute(node, attribute)) return true;
+  }
+  for (const root of roots) {
+    if (anyTaggedNodeHostsAClosedRoot(root, attribute)) return true;
+  }
+  for (const child of node.children ?? []) {
+    if (anyTaggedNodeHostsAClosedRoot(child, attribute)) return true;
+  }
+  if (node.contentDocument && anyTaggedNodeHostsAClosedRoot(node.contentDocument, attribute)) return true;
+  return false;
+}
+
+/**
+ * Whether any ancestor the contrast walk stepped through is really hosting a
+ * closed shadow root, answered over CDP because the page cannot answer it.
+ *
+ * Returns null when the question could not be settled at all (CDP refused, the
+ * page navigated mid-call), which the caller reports rather than swallowing:
+ * "I could not check" and "I checked and there is none" are different answers
+ * and only one of them justifies a confident ratio.
+ *
+ * Deliberately a single yes/no for the whole call rather than per element.
+ * Compositing THROUGH a closed root would mean reimplementing the flattened
+ * walk over CDP, with its own node-matching and a second CSS.getComputedStyle
+ * path, to serve a case that open shadow roots (the default mode, and what
+ * every mainstream component library emits) never reach. Refusing to quote a
+ * number is the whole point of this machinery, and it costs one CDP call.
+ */
+async function anyChainCrossesAClosedShadowRoot(page: Page): Promise<boolean | null> {
+  const cdpSession = await page.context().newCDPSession(page).catch(() => null);
+  if (cdpSession === null) return null;
+  try {
+    await cdpSession.send('DOM.enable');
+    const tree = (await cdpSession.send('DOM.getDocument', { depth: -1, pierce: true })) as unknown as {
+      root: CdpNode;
+    };
+    return anyTaggedNodeHostsAClosedRoot(tree.root, closedHostProbeAttribute);
+  } catch {
+    return null;
+  } finally {
+    await cdpSession.detach().catch(() => {});
+  }
 }
 
 /**
@@ -1349,13 +1643,9 @@ export const inspectTools = defineTools({
       'the shadow tree from there: white text slotted into a white shadow wrapper on a black page is invisible at ' +
       'a true 1.0:1, and a DOM-tree walk missed the wrapper entirely and reported 21:1 passing AA and AAA. When ' +
       'the walk crossed a slot, effective.textPaint.crossedSlot says so. ' +
-      'The one composed-tree case still out of reach is content slotted into a CLOSED shadow root: assignedSlot is ' +
-      'specified to return null there and no DOM API outside the root can see the slot, so the walk falls back to ' +
-      'the DOM parent and silently misses whatever that shadow tree paints behind the text. Closed roots are rare ' +
-      '(open is the default mode and what every mainstream component library uses) but if you are measuring one, ' +
-      'screenshot the region instead of trusting the ratio. On the rare occasion the chain cannot reach the ' +
-      'document at all (a detached element being measured mid-mutation), effective.layerChainIncomplete is true ' +
-      'and the ratio should be read as unreliable rather than final. '
+      'Content slotted into a CLOSED shadow root cannot be composited: assignedSlot is specified to return null ' +
+      'inside one, so the shadow tree that paints behind the text is invisible from the page. It is still ' +
+      'DETECTED, over CDP, which is not bound by that privacy rule, and the ratio is refused rather than guessed. '
       + 'Which colour paints the GLYPHS is resolved rather than assumed to be "color", because assuming that is ' +
       'how this tool used to certify invisible text. SVG text takes its colour from fill, not color, so an <svg> ' +
       '<text> is measured on its fill (times fill-opacity): icons and chart labels are the everyday case, and ' +
@@ -1365,14 +1655,40 @@ export const inspectTools = defineTools({
       'page behind them, so that background is taken out of the layer stack and painted under the text fill ' +
       'instead. effective.textPaint names the property the foreground actually came from whenever it is not plain ' +
       'color. ' +
-      'Where nothing single-valued is painted the ratio is REFUSED rather than estimated: contrast.ratio and ' +
-      'contrast.passes come back null with contrast.ratioUnavailable saying why. That happens for gradient text ' +
-      '(background-clip: text over a background image, where the glyphs are many colours at once), for SVG filled ' +
-      'from a paint server, and for SVG with fill: none, where the visible colour is stroke, which this does not ' +
-      'composite. In each case screenshot the region and check the worst part against its background. ' +
-      'Still NOT modelled for SVG specifically: a sibling shape painting behind the text (a <rect> under a ' +
-      '<text>, say) is not an ancestor, so it is not in the layer stack, and background-color on a non-root SVG ' +
-      'element is not painted by Chromium at all. ' +
+      'An SVG shape with fill: none is not unpainted, it is OUTLINED, so its stroke (times stroke-opacity) is ' +
+      'what gets composited. Every Lucide, Feather and Heroicons outline icon is exactly that shape. ' +
+      'background-color on a non-root SVG element is NOT composited, because Chromium never paints it: only the ' +
+      '<svg> root paints a background. Compositing it was reporting black text inside <g style="background-color: ' +
+      'black"> on a white page as 1:1 where it is really painted at 21:1. ' +
+      'REFUSING TO ANSWER is a first-class result here, and the single thing to branch on is contrast.ratio being ' +
+      'null. When it is null, contrast.passes is null too, contrast.unaccountedFor carries machine-readable codes, ' +
+      'contrast.ratioUnavailable explains them in words, and effective.layerChainIncomplete is true. Do not read a ' +
+      'prose caveat and infer this: check the field. The codes: ' +
+      'backgroundImage (a gradient or image paints behind the text with nothing opaque in between, so there is no ' +
+      'single backdrop colour); filter (a filter on the element or an ancestor recolours everything inside it); ' +
+      'backdropFilter (a filter recolours what is behind before the text goes on top); mixBlendMode (not composited ' +
+      'with source-over at all); foreignPainter (something painting the same pixels that is not an ancestor, so it ' +
+      'cannot be in the stack: a positioned sibling, an overlay, a <canvas> under a transparent container); ' +
+      'closedShadowRoot and closedShadowRootUnchecked; forcedColors (the browser replaced every author colour with ' +
+      'a system palette, so the cascade below is not what is on screen); detached (the element is not in the ' +
+      'document); wideGamutOverflow (see below); backgroundClipTextImage, svgPaintServerFill and svgNoFill (the ' +
+      'glyphs or the shape are painted in many colours, or in none). In every case screenshot the region and ' +
+      'compare the worst part against its background. ' +
+      'A background image or a backdrop-filter further out than an opaque colour is NOT reported, because it ' +
+      'cannot change the pixel behind the glyph. A filter or a blend mode is reported wherever it sits, because ' +
+      'both recolour their whole subtree no matter what is painted in between. ' +
+      'contrast.borderline marks a ratio that is within 0.25 of a threshold it is being compared against while the ' +
+      'glyph is translucent. Chromium\'s text rasteriser applies a gamma to glyph coverage that alpha compositing ' +
+      'does not model, worth up to one 8-bit step: a full-block glyph at opacity 0.532 over white paints 118 where ' +
+      'the same colour in a <div> paints 119. Close to a line that is enough to decide the verdict, so treat a ' +
+      'borderline pass or fail as undecided and read the pixels. Group opacity itself IS modelled exactly, ' +
+      'quantised to round(opacity * 255) / 255 the way Chromium renders an opacity group into an 8-bit surface. ' +
+      'HOW CLOSE the number is, measured against painted pixels rather than claimed: on fully opaque colours it ' +
+      'lands on the painted pixel exactly, and 26 of 26 elements on a live Tailwind v4 app match to within one of ' +
+      '255. Where a glyph is translucent, or several translucent layers stack, expect up to about 0.09 of a ratio ' +
+      'point of drift from the browser\'s own rounding and text gamma, and up to 0.25 in the worst case the ' +
+      'borderline flag exists for. Anything larger than that is a bug, not rounding, and every refusal code above ' +
+      'exists because the alternative was an error of whole ratio points. ' +
       'Colour syntaxes understood: rgb()/rgba() and hsl()/hsla() in both the legacy comma form and the modern ' +
       'space form with a slash alpha, hwb(), lab(), lch(), oklab(), oklch(), color() in the predefined spaces ' +
       'srgb, srgb-linear, display-p3, a98-rgb, prophoto-rgb, rec2020, xyz, xyz-d50 and xyz-d65, and the keyword ' +
@@ -1483,17 +1799,37 @@ export const inspectTools = defineTools({
         /** The SVG fill paint and its own opacity multiplier. Empty strings on an HTML element. */
         fill: string;
         fillOpacity: string;
+        /**
+         * The SVG stroke paint, its opacity and its width. An outlined shape
+         * (fill: none plus a stroke) is what every mainstream icon set emits,
+         * and the stroke is the only colour it puts on screen.
+         */
+        stroke: string;
+        strokeOpacity: string;
+        strokeWidth: string;
         /** background-clip, falling back to -webkit-background-clip. "text" moves the background onto the glyphs. */
         backgroundClip: string;
         /** The background image, if any, which is what makes gradient text unanswerable with one ratio. */
         backgroundImage: string;
         /** True when the walk crossed a <slot>, which is the case a DOM-tree walk used to miss entirely. */
         crossedSlot: boolean;
+        /** Things painting over the same pixels that the ancestor walk has no way to include. */
+        foreignPainters: ForeignPainter[];
+        /**
+         * How many ancestor steps landed on an element that MIGHT be hosting a
+         * closed shadow root. Each one is tagged in the page so the CDP pass,
+         * which can see closed roots, can settle it. Zero means the walk is
+         * provably complete on that front and no CDP call is needed.
+         */
+        ambiguousShadowHosts: number;
       }
 
       const read = (): Promise<StyleProbe[]> =>
         matches.evaluateAll(
-          (nodes, arg: { properties: string[]; pseudoElement: string | null; limit: number }) => {
+          (
+            nodes,
+            arg: { properties: string[]; pseudoElement: string | null; limit: number; shadowProbeAttribute: string }
+          ) => {
             const elements = Array.prototype.slice.call(nodes, 0, arg.limit) as ProbeElement[];
             const out: StyleProbe[] = [];
             for (const element of elements) {
@@ -1531,13 +1867,37 @@ export const inspectTools = defineTools({
               // there, and no DOM API outside the root can see the slot, so
               // the walk falls back to the DOM parent. See the tool
               // description, which says so rather than implying otherwise.
+              const svgNamespace = 'http://www.w3.org/2000/svg';
+              // Everything below is written without named inner functions on
+              // purpose. This body is serialised into the page, and the
+              // TypeScript runner the tests use injects a __name helper around
+              // any function it can infer a name for, which is not defined in
+              // the browser and throws on the first call.
+              // Every ancestor step taken through parentNode onto an element
+              // that could be hosting a CLOSED shadow root. assignedSlot is
+              // specified to return null inside one, so from the page there is
+              // no way to tell "ordinary parent" from "closed host whose slot
+              // I cannot see". These get tagged for a CDP pass that CAN see
+              // closed roots, which is the only way to settle it.
+              const shadowCapable = /^(?:[a-z]+-[a-z-]*|article|aside|blockquote|body|div|footer|h[1-6]|header|main|nav|p|section|span)$/;
+              const ambiguous: ProbeElement[] = [];
+              const chain: ProbeElement[] = [];
               while (node) {
+                chain.push(node);
                 const style = getComputedStyle(node);
                 layers.push({
                   tagName: String(node.tagName).toLowerCase(),
                   id: node.id || '',
                   backgroundColor: style.getPropertyValue('background-color'),
-                  opacity: style.getPropertyValue('opacity')
+                  opacity: style.getPropertyValue('opacity'),
+                  backgroundImage: style.getPropertyValue('background-image'),
+                  filter: style.getPropertyValue('filter'),
+                  backdropFilter:
+                    style.getPropertyValue('backdrop-filter') || style.getPropertyValue('-webkit-backdrop-filter'),
+                  mixBlendMode: style.getPropertyValue('mix-blend-mode'),
+                  // The <svg> ROOT does paint its background-color, confirmed
+                  // against pixels. Nothing inside it does.
+                  svgNonRoot: node.namespaceURI === svgNamespace && String(node.tagName).toLowerCase() !== 'svg'
                 });
                 const slot: ProbeElement | null = node.assignedSlot;
                 if (slot) {
@@ -1547,6 +1907,13 @@ export const inspectTools = defineTools({
                 }
                 const parent: ProbeElement | null = node.parentNode;
                 if (parent && parent.nodeType === 1) {
+                  // shadowRoot non-null means an OPEN root, and an unslotted
+                  // child of an open host is not rendered at all, so a rendered
+                  // node here is genuinely an ordinary child. A null shadowRoot
+                  // is the ambiguous one: no root, or a closed one.
+                  if (parent.shadowRoot == null && shadowCapable.test(String(parent.tagName).toLowerCase())) {
+                    ambiguous.push(parent);
+                  }
                   node = parent;
                   continue;
                 }
@@ -1556,14 +1923,99 @@ export const inspectTools = defineTools({
                 // Document (node type 9) is where the climb ends.
                 node = parent && parent.nodeType === 11 ? (parent.host ?? null) : null;
               }
+              for (let index = 0; index < ambiguous.length; index += 1) {
+                ambiguous[index].setAttribute(arg.shadowProbeAttribute, '1');
+              }
               layers.reverse();
               if (arg.pseudoElement) {
                 layers.push({
                   tagName: String(element.tagName).toLowerCase() + arg.pseudoElement,
                   id: element.id || '',
                   backgroundColor: own.getPropertyValue('background-color'),
-                  opacity: own.getPropertyValue('opacity')
+                  opacity: own.getPropertyValue('opacity'),
+                  backgroundImage: own.getPropertyValue('background-image'),
+                  filter: own.getPropertyValue('filter'),
+                  backdropFilter:
+                    own.getPropertyValue('backdrop-filter') || own.getPropertyValue('-webkit-backdrop-filter'),
+                  mixBlendMode: own.getPropertyValue('mix-blend-mode'),
+                  svgNonRoot:
+                    element.namespaceURI === svgNamespace && String(element.tagName).toLowerCase() !== 'svg'
                 });
+              }
+
+              // Anything painting over the same pixels that is NOT on the
+              // chain just composited. Candidates come from two places because
+              // neither alone is enough: the hit-test stack catches overlays
+              // and hit-testable content underneath, and overlapping siblings
+              // catch what pointer-events: none hides from the hit test.
+              const rect = element.getBoundingClientRect();
+              const candidates: { node: ProbeElement; where: string }[] = [];
+              const midX = rect.left + rect.width / 2;
+              const midY = rect.top + rect.height / 2;
+              if (
+                rect.width > 0 && rect.height > 0 &&
+                midX >= 0 && midY >= 0 && midX < window.innerWidth && midY < window.innerHeight
+              ) {
+                const stack = document.elementsFromPoint(midX, midY);
+                for (let hitIndex = 0; hitIndex < stack.length; hitIndex += 1) {
+                  candidates.push({ node: stack[hitIndex], where: 'over' });
+                }
+              }
+              // Siblings are walked outward and the walk stops as soon as the
+              // chain nearer the glyph is already opaque, because anything
+              // further out is hidden behind it and cannot change the pixel.
+              // Without that stop this would fire on every page with a
+              // positioned sibling anywhere, which would make it noise.
+              for (let up = chain.length - 1; up >= 1; up -= 1) {
+                const inner = chain[up - 1];
+                const innerStyle = getComputedStyle(inner);
+                const innerBg = innerStyle.getPropertyValue('background-color');
+                if (
+                  innerBg.indexOf('rgba') !== 0 &&
+                  innerBg !== 'transparent' &&
+                  innerBg !== '' &&
+                  innerStyle.getPropertyValue('opacity') === '1' &&
+                  !(inner.namespaceURI === svgNamespace && String(inner.tagName).toLowerCase() !== 'svg')
+                ) {
+                  break;
+                }
+                const siblings = chain[up].children;
+                for (let sibIndex = 0; sibIndex < siblings.length; sibIndex += 1) {
+                  const sibling = siblings[sibIndex];
+                  if (sibling === inner) continue;
+                  const box = sibling.getBoundingClientRect();
+                  if (
+                    box.width > 0 && box.height > 0 &&
+                    box.left < rect.right && box.right > rect.left &&
+                    box.top < rect.bottom && box.bottom > rect.top
+                  ) {
+                    candidates.push({ node: sibling, where: 'behind' });
+                  }
+                }
+              }
+
+              const foreign: ForeignPainter[] = [];
+              const seenForeign: string[] = [];
+              for (let candidateIndex = 0; candidateIndex < candidates.length && foreign.length < 6; candidateIndex += 1) {
+                const candidate = candidates[candidateIndex].node;
+                if (candidate === element || chain.indexOf(candidate) !== -1) continue;
+                if (element.contains(candidate) || candidate.contains(element)) continue;
+                const tag = String(candidate.tagName).toLowerCase();
+                let paints: string | null = null;
+                if (tag === 'canvas' || tag === 'img' || tag === 'video' || tag === 'svg' || tag === 'iframe') {
+                  paints = `replaced content (<${tag}>)`;
+                } else {
+                  const candidateStyle = getComputedStyle(candidate);
+                  const image = candidateStyle.getPropertyValue('background-image');
+                  const colour = candidateStyle.getPropertyValue('background-color');
+                  if (image && image !== 'none') paints = 'a background image';
+                  else if (colour && colour !== 'rgba(0, 0, 0, 0)' && colour !== 'transparent') paints = colour;
+                }
+                if (paints === null) continue;
+                const key = `${candidates[candidateIndex].where}:${tag}:${candidate.id || ''}:${paints}`;
+                if (seenForeign.indexOf(key) !== -1) continue;
+                seenForeign.push(key);
+                foreign.push({ tagName: tag, id: candidate.id || '', where: candidates[candidateIndex].where, paints });
               }
 
               const text = (element.textContent || '').replace(/\s+/g, ' ').trim();
@@ -1586,9 +2038,14 @@ export const inspectTools = defineTools({
                 isSvg,
                 fill: isSvg ? own.getPropertyValue('fill') : '',
                 fillOpacity: isSvg ? own.getPropertyValue('fill-opacity') : '',
+                stroke: isSvg ? own.getPropertyValue('stroke') : '',
+                strokeOpacity: isSvg ? own.getPropertyValue('stroke-opacity') : '',
+                strokeWidth: isSvg ? own.getPropertyValue('stroke-width') : '',
                 backgroundClip,
                 backgroundImage: own.getPropertyValue('background-image'),
                 crossedSlot,
+                foreignPainters: foreign,
+                ambiguousShadowHosts: ambiguous.length,
                 fontSizePx: parseFloat(own.getPropertyValue('font-size')),
                 fontWeight: parseFloat(own.getPropertyValue('font-weight')),
                 // isConnected follows shadow trees the way the spec requires,
@@ -1602,7 +2059,12 @@ export const inspectTools = defineTools({
             }
             return out;
           },
-          { properties, pseudoElement: args.pseudoElement ?? null, limit }
+          {
+            properties,
+            pseudoElement: args.pseudoElement ?? null,
+            limit,
+            shadowProbeAttribute: closedHostProbeAttribute
+          }
         ) as Promise<StyleProbe[]>;
 
       const probes =
@@ -1626,6 +2088,27 @@ export const inspectTools = defineTools({
       const parsedCanvas = parseCssColor(rawCanvas);
       const canvasColor: Rgba = parsedCanvas === null ? { ...opaqueWhite } : paintedSrgb(parsedCanvas);
 
+      // Only worth a CDP round trip if the walk actually stepped onto
+      // something that could be hiding a closed root. On a page with none it
+      // is skipped entirely, so the ordinary call pays nothing for this.
+      const taggedAnyPossibleClosedHost = probes.some(probe => probe.ambiguousShadowHosts > 0);
+      const closedRootOnChain = taggedAnyPossibleClosedHost ? await anyChainCrossesAClosedShadowRoot(target.page) : false;
+      if (taggedAnyPossibleClosedHost) {
+        await root
+          .evaluate((attribute: string) => {
+            const tagged = document.querySelectorAll(`[${attribute}]`);
+            for (let index = 0; index < tagged.length; index += 1) tagged[index].removeAttribute(attribute);
+          }, closedHostProbeAttribute)
+          .catch(() => {});
+      }
+
+      // forced-colors replaces every author colour with a system palette
+      // before anything is painted, so the whole cascade this composited is
+      // not what is on screen. Asked once, of the frame the elements are in.
+      const forcedColors = await root
+        .evaluate<boolean>('matchMedia("(forced-colors: active)").matches')
+        .catch(() => false);
+
       const elements = probes.map((probe, index) => {
         const unparsed: string[] = [];
         const clipped: string[] = [];
@@ -1639,15 +2122,20 @@ export const inspectTools = defineTools({
         const ownLayerIndex = probe.layers.length - 1;
         const paintLayers: PaintLayer[] = probe.layers.map((layer, layerIndex) => {
           const parsed = parseCssColor(layer.backgroundColor);
-          if (parsed === null) unparsed.push(`${layer.tagName}: ${layer.backgroundColor}`);
-          else if (parsed.outOfGamut) clipped.push(`${layer.tagName}: ${layer.backgroundColor}`);
-          const opacity = Number(layer.opacity);
+          // An SVG element that is not the <svg> root never paints its
+          // background-color, so its colour is not reported as unparseable or
+          // out of gamut either: it is simply not part of the picture.
+          if (!layer.svgNonRoot) {
+            if (parsed === null) unparsed.push(`${layer.tagName}: ${layer.backgroundColor}`);
+            else if (parsed.outOfGamut) clipped.push(`${layer.tagName}: ${layer.backgroundColor}`);
+          }
           const liftedOntoGlyphs = clipsBackgroundToText && layerIndex === ownLayerIndex;
           // paintedSrgb, not the parsed colour: a wide-gamut colour has to be
           // clipped where Chromium clips it, on the premultiplied value,
           // or a colour with alpha composites to the wrong pixel.
-          const bg = parsed === null || liftedOntoGlyphs ? { ...fullyTransparent } : paintedSrgb(parsed);
-          return { bg, opacity: Number.isFinite(opacity) ? opacity : 1 };
+          const bg =
+            parsed === null || liftedOntoGlyphs || layer.svgNonRoot ? { ...fullyTransparent } : paintedSrgb(parsed);
+          return { bg, opacity: quantisedOpacity(layer.opacity) };
         });
 
         // WHICH colour paints the glyphs. `color` answers that only for
@@ -1660,9 +2148,12 @@ export const inspectTools = defineTools({
           else if (glyphColor.outOfGamut) clipped.push(`${glyph.property}: ${glyph.value}`);
         }
 
-        // SVG fill-opacity fades the fill on its own, before the element's
-        // own `opacity` (already in the layer stack) fades the whole group.
-        const fillOpacity = probe.isSvg ? Number(probe.fillOpacity) : 1;
+        // fill-opacity and stroke-opacity fade their own paint, before the
+        // element's `opacity` (already in the layer stack) fades the group.
+        const paintOpacity = probe.isSvg
+          ? Number(glyph.property === 'stroke' ? probe.strokeOpacity : probe.fillOpacity)
+          : 1;
+        const fillOpacity = paintOpacity;
         const painted: Rgba =
           glyphColor === null
             ? { ...fullyTransparent }
@@ -1676,13 +2167,84 @@ export const inspectTools = defineTools({
         const glyphPaint: Rgba =
           ownBackground === null ? painted : over(painted, paintedSrgb(ownBackground));
 
-        const background = flattenOntoCanvas(paintLayers, { ...fullyTransparent }, canvasColor);
-        const foreground =
-          glyph.unavailable !== null ? null : flattenOntoCanvas(paintLayers, glyphPaint, canvasColor);
+        // Every reason the composited answer cannot be trusted, gathered into
+        // one list so a caller has exactly one thing to branch on. The glyph
+        // refusals below are the same kind of statement and join the list.
+        const paintReport: PaintReport = { ranPastTheCeiling: false };
+        const blockers = unaccountedFor(probe.layers, paintLayers, probe.foreignPainters);
+        if (glyph.unavailable !== null) blockers.unshift({ code: glyph.code, detail: glyph.unavailable });
+        if (probe.reachedRoot === false) {
+          blockers.unshift({
+            code: 'detached',
+            detail:
+              'The ancestor walk did not reach the document, so the element is detached from the page (removed, or ' +
+              'measured mid-mutation). There is no real canvas behind it to composite onto.'
+          });
+        }
+        if (closedRootOnChain === true) {
+          blockers.unshift({
+            code: 'closedShadowRoot',
+            detail:
+              'An ancestor of this element hosts a CLOSED shadow root, confirmed over CDP. Content slotted into one ' +
+              'is painted inside that shadow tree, and assignedSlot returns null inside a closed root, so the walk ' +
+              'cannot see what the shadow tree paints behind the text. Screenshot the region instead.'
+          });
+        }
+        if (closedRootOnChain === null) {
+          blockers.unshift({
+            code: 'closedShadowRootUnchecked',
+            detail:
+              'An ancestor of this element might host a closed shadow root, and the CDP check that would have ' +
+              'settled it could not run. "Not checked" is not "not there", so the stack below may be missing a ' +
+              'shadow tree that paints behind the text.'
+          });
+        }
+        if (forcedColors) {
+          blockers.unshift({
+            code: 'forcedColors',
+            detail:
+              'This page is rendering under forced-colors: active, so the browser replaces author colours with a ' +
+              'system palette before anything is painted. Every colour in the cascade below is the one that was ' +
+              'overridden, not the one on screen. WCAG contrast is not assessed against author colours in forced ' +
+              'colours mode at all.'
+          });
+        }
+
+        const background = flattenOntoCanvas(paintLayers, { ...fullyTransparent }, canvasColor, paintReport);
+        // Computed before the answerability check so the overflow it detects
+        // can itself make the answer unavailable.
+        const provisionalForeground = flattenOntoCanvas(paintLayers, glyphPaint, canvasColor, paintReport);
+        if (wideGamutOverflowRisk(paintReport, paintLayers)) {
+          blockers.unshift({
+            code: 'wideGamutOverflow',
+            detail:
+              'A colour in this stack falls outside sRGB and carries alpha, and it sits inside an element with ' +
+              'opacity below 1. Measured against painted pixels, Chromium wraps the overflowing channel there ' +
+              'rather than pinning it to the top of the range: color(display-p3 0 1 0 / .35) under opacity .7 over ' +
+              'white is painted rgb(193, 1, 193), a magenta, where every model of compositing gives a pale green. ' +
+              'That is a defect in an 8-bit write path rather than a colour anyone can reason about, so no ratio ' +
+              'is quoted for it. Screenshot the region and read the pixels.'
+          });
+        }
+        const answerable = blockers.length === 0;
+        const foreground = answerable ? provisionalForeground : null;
         const largeText = isLargeText(probe.fontSizePx, probe.fontWeight);
         const aaText = largeText ? 3 : 4.5;
         const aaaText = largeText ? 4.5 : 7;
         const ratio = foreground === null ? null : round(contrastRatio(foreground, background), 4);
+        // Chromium's text rasteriser applies its own gamma to glyph coverage,
+        // so a TRANSLUCENT glyph lands up to one 8-bit step off what alpha
+        // compositing alone predicts. Measured: a full-block glyph at
+        // opacity 0.532 over white paints 118 where the same colour in a <div>
+        // paints 119. One step is worth up to about 0.25 of a ratio point, so
+        // a ratio sitting inside that of a threshold cannot be called either
+        // way and says so rather than pretending to a verdict it cannot back.
+        const glyphIsTranslucent =
+          glyphPaint.a < 1 || paintLayers.some(layer => layer.opacity < 1);
+        const borderline =
+          ratio !== null &&
+          glyphIsTranslucent &&
+          [aaText, aaaText, 3].some(threshold => Math.abs(ratio - threshold) <= textGammaRatioSlack);
 
         return {
           index,
@@ -1735,24 +2297,34 @@ export const inspectTools = defineTools({
                     'rather than to the colour before compositing. That distinction is not cosmetic: clipping ' +
                     'first moves the composited pixel by up to 47 of 255 over a dark backdrop, and used to flip ' +
                     '44 of 588 WCAG threshold verdicts across a wide-gamut-with-alpha sweep. ' +
-                    'What this covers: the ratio matches what Chromium rasterises on an sRGB screen, checked ' +
-                    'against painted pixels across that sweep and agreeing to within 0.08 of a ratio point, which ' +
-                    'is 8-bit rounding rather than a modelling gap. ' +
-                    'What it does not cover: a wide-gamut display paints a colour this ratio was never computed ' +
-                    'for, so the contrast someone on a P3 screen actually experiences is a different number and ' +
-                    'this one should not be quoted as theirs; and the clip model is about background-color ' +
-                    'compositing only, so it says nothing about filters, blend modes or backdrop-filter, none of ' +
-                    'which this tool models at all.'
+                    'What this covers, and ONLY this: a wide-gamut colour composited at opacity 1, where the ratio ' +
+                    'matches what Chromium rasterises on an sRGB screen to within 0.08 of a ratio point across a ' +
+                    '588-case sweep against painted pixels, which is 8-bit rounding rather than a modelling gap. ' +
+                    'What breaks it: the same colour inside an element with opacity below 1, over a backdrop light ' +
+                    'enough to push a channel past the top of the range. Chromium WRAPS the overflow there instead ' +
+                    'of pinning it, so color(display-p3 0 1 0 / .35) under opacity .7 over white is painted ' +
+                    'rgb(193, 1, 193), a magenta, where compositing gives a pale green: a disagreement of 254 of ' +
+                    '255 on one channel and up to 8 ratio points. That combination is detected and REFUSED, with ' +
+                    'the wideGamutOverflow code, rather than answered, so it never reaches this note; if you are ' +
+                    'reading this note you are outside it. ' +
+                    'What it never covered: a wide-gamut display paints a colour this ratio was not computed for, ' +
+                    'so the contrast someone on a P3 screen experiences is a different number and this one should ' +
+                    'not be quoted as theirs; and the clip model is about background-color compositing only, so it ' +
+                    'says nothing about filters, blend modes or backdrop-filter, which are refused outright.'
                 }
               : {}),
-            ...(probe.reachedRoot === false
+            // Fires whenever the composited stack does not account for what is
+            // painted behind the glyph, which is the only thing it was ever
+            // meant to mean. It used to be driven by element.isConnected
+            // alone, and since computed_style resolves elements through
+            // Playwright locators, which only ever match the live document,
+            // nothing reachable through the tool could set it. One flag that
+            // never fired, sitting next to seven situations that should have.
+            ...(blockers.length > 0
               ? {
                   layerChainIncomplete: true,
-                  layerChainWarning:
-                    'The ancestor walk used to build this stack did not reach the document, most likely because ' +
-                    'the element is detached from the page (removed, or measured mid-mutation). There is no real ' +
-                    'canvas behind it to composite onto, so the ratio below is not reliable. Screenshot the ' +
-                    'region and read the pixels instead.'
+                  unaccountedFor: blockers.map(entry => entry.code),
+                  layerChainWarning: blockers.map(entry => entry.detail).join(' ')
                 }
               : {})
           },
@@ -1764,14 +2336,33 @@ export const inspectTools = defineTools({
             fontWeight: Number.isFinite(probe.fontWeight) ? probe.fontWeight : null,
             largeText,
             thresholds: { aaText, aaaText, nonText: 3 },
-            // null, not a number, when nothing single-valued is painted. A
-            // ratio quoted here goes straight into an accessibility report,
-            // so "I cannot answer this" has to be sayable.
+            // null, not a number, whenever the walk cannot account for what is
+            // painted. A ratio quoted here goes straight into an accessibility
+            // report, so "I cannot answer this" has to be sayable, and it has
+            // to be sayable in a field a program can branch on rather than in
+            // prose in the tool description.
             passes:
               ratio === null
                 ? null
                 : { aaText: ratio >= aaText, aaaText: ratio >= aaaText, nonText: ratio >= 3 },
-            ...(glyph.unavailable !== null ? { ratioUnavailable: glyph.unavailable } : {})
+            ...(blockers.length > 0
+              ? {
+                  ratioUnavailable: blockers.map(entry => entry.detail).join(' '),
+                  unaccountedFor: blockers.map(entry => entry.code)
+                }
+              : {}),
+            ...(borderline
+              ? {
+                  borderline: true,
+                  borderlineNote:
+                    `This ratio is within ${textGammaRatioSlack} of a threshold it is being compared against, and ` +
+                    'the glyph is translucent (its own alpha, or an opacity group above it). Chromium\'s text ' +
+                    'rasteriser applies a gamma to glyph coverage that alpha compositing does not model, worth up ' +
+                    'to one 8-bit step: a full-block glyph at opacity 0.532 over white paints 118 where the same ' +
+                    'colour in a <div> paints 119. That is enough to move a ratio across a line this close to one, ' +
+                    'so treat the pass or fail below as undecided and read the pixels instead.'
+                }
+              : {})
           }
         };
       });
