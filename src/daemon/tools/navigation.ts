@@ -340,15 +340,23 @@ export async function settleAfterNavigation(
   // has not been answered, so the tab WILL be replaced). Both are clamped by
   // the call's own deadline, so neither can be the reason a call outlives
   // the budget its caller set.
-  const tailDeadline = Date.now() + NAVIGATION_TAIL_MS;
-  const inFlightDeadline = Date.now() + NAVIGATION_INFLIGHT_TAIL_MS;
+  const tailStartedAt = Date.now();
+  let tailDeadline = tailStartedAt + NAVIGATION_TAIL_MS;
+  const inFlightDeadline = tailStartedAt + NAVIGATION_INFLIGHT_TAIL_MS;
   while (remaining() > 0) {
-    const movingRecently = Date.now() - activity.lastAt < NAVIGATION_QUIET_MS;
     const fetching = activity.inFlight.size > 0;
-    if (!movingRecently && !fetching) break;
-    if (movingRecently && Date.now() >= tailDeadline && !fetching) break;
-    if (fetching && Date.now() >= inFlightDeadline && !movingRecently) break;
-    if (Date.now() >= tailDeadline && Date.now() >= inFlightDeadline) break;
+    const movingRecently = Date.now() - activity.lastAt < NAVIGATION_QUIET_MS;
+    if (!fetching && !movingRecently) break;
+    if (fetching && Date.now() >= inFlightDeadline) break;
+    if (!fetching && Date.now() >= tailDeadline) break;
+    // The quiet tail is pushed forward for as long as a document fetch is
+    // outstanding, and that is not a detail. Without it the tail expires
+    // WHILE the fetch is being waited for, so the instant the response lands
+    // the loop breaks out with the tab mid-commit and reports "still moving"
+    // about a tab that has just arrived. Measured: a redirect answered at
+    // 1055ms came back correctly described AND carrying a pendingNavigation
+    // that contradicted it.
+    if (fetching) tailDeadline = Math.min(Date.now() + NAVIGATION_TAIL_MS, inFlightDeadline);
     await sleep(Math.max(1, Math.min(20, remaining())));
   }
 
@@ -479,7 +487,7 @@ export interface NavigationOutcome {
 }
 
 /** How "is the document on screen the one this navigation fetched?" was decided, for the branches below to key off. */
-type DocumentOwnershipBasis = 'no-response' | 'document-order' | 'unreadable' | 'url-fallback';
+type DocumentOwnershipBasis = 'no-response' | 'document-order' | 'live-document' | 'unreadable';
 
 /**
  * Is the document on screen the one THIS navigation fetched?
@@ -495,21 +503,37 @@ type DocumentOwnershipBasis = 'no-response' | 'document-order' | 'unreadable' | 
  * right answer in hand, in `settled.documentStatus` and in its own list of
  * main-frame documents, and threw it away in favour of the URL comparison.
  *
- * The honest question is about ORDER, not address: of the main-frame
- * documents this call saw, is the one we fetched the LAST one? That is
- * decided on Playwright Response identity, so it cannot be fooled by two
- * documents sharing an address, and it needs no URL comparison at all. It
- * also gets the healthy case right for free, which matters because the round
- * before this one broke exactly that: a client-side router calling
- * history.replaceState fetches nothing, so our response is still the last
- * document, and a perfectly good 200 stays a 200.
+ * Two independent pieces of evidence answer it, and NEITHER is sufficient on
+ * its own, which is why the previous versions of this each got one shape
+ * wrong.
  *
- * The two fallbacks are for when that evidence is missing, and their
- * DIRECTION is the point. If the page could not be read, that is evidence the
- * tab is moving, not evidence that it is still: an unreadable snapshot used
- * to fall through to comparing page.url() with itself and conclude "same
- * document" with confidence, which is the sharpest single defect this round
- * found.
+ * The first is ORDER, not address: of the main-frame document responses this
+ * call saw, is the one we fetched the LAST one? Decided on Playwright
+ * Response identity, so two documents sharing an address cannot collapse into
+ * one. This is the only thing that catches the same-URL replacement, and it
+ * needs no URL comparison at all.
+ *
+ * The second is the LIVE DOCUMENT's own navigation timing entry, which names
+ * the address the document on screen was actually fetched from. This is the
+ * only thing that catches a hop to somewhere that produces no response event
+ * at all: about:blank, a data: URL and a blob: never come over HTTP, so
+ * ordering alone reports our own 200 as still current while the tab sits on
+ * about:blank. Measured directly, and it is why the order check is not used
+ * alone.
+ *
+ * Both together also get the healthy case right, which matters because the
+ * round before this one broke exactly that: a client-side router calling
+ * history.replaceState fetches nothing, so our response is still the last
+ * document AND the timing entry still names the address we asked for. A
+ * perfectly good 200 stays a 200.
+ *
+ * The unreadable branch is the one whose DIRECTION was the sharpest defect
+ * this round found. A read that could not complete used to fall through to
+ * comparing page.url() with itself and conclude "same document" with
+ * confidence, which reads a navigation in flight as a tab at rest. It no
+ * longer concludes anything: the basis is reported as unreadable, no
+ * documentChanged block is fabricated from evidence nobody has, and the
+ * caller is told through pendingNavigation that the page could not be read.
  */
 function decideDocumentIsOwn(
   response: Response | null,
@@ -518,22 +542,22 @@ function decideDocumentIsOwn(
 ): { isOwn: boolean; basis: DocumentOwnershipBasis } {
   if (response === null) return { isOwn: false, basis: 'no-response' };
 
+  // Evidence 1: a main-frame document response arrived AFTER ours. Positive
+  // proof the tab was replaced, and it outranks everything else.
   const ownIndex = documents.findIndex(entry => entry.response === response);
-  if (ownIndex !== -1) return { isOwn: ownIndex === documents.length - 1, basis: 'document-order' };
+  if (ownIndex !== -1 && ownIndex !== documents.length - 1) return { isOwn: false, basis: 'document-order' };
 
-  // Our own response was never seen by the watcher, which should not happen
-  // (the watcher is installed before the navigation is issued) but is not
-  // worth crashing over.
-  if (!settled.readable) return { isOwn: false, basis: 'unreadable' };
+  // Evidence 2: the live document says it was fetched from somewhere else.
+  if (settled.readable) {
+    const landedOn = withoutHash(settled.documentUrl ?? settled.url);
+    return { isOwn: landedOn === withoutHash(response.url()), basis: 'live-document' };
+  }
 
-  // Last resort, and deliberately stricter than the URL comparison it
-  // replaces: the address has to match AND the live document's own status has
-  // to agree with the response's, so the same-address-different-document case
-  // cannot pass here either.
-  const ownUrl = withoutHash(response.url());
-  const addressMatches = withoutHash(settled.documentUrl ?? settled.url) === ownUrl;
-  const statusAgrees = settled.documentStatus === null || settled.documentStatus === response.status();
-  return { isOwn: addressMatches && statusAgrees, basis: 'url-fallback' };
+  // No evidence either way. Not a claim that the document is ours, and not a
+  // claim that it is not: "confirmed" is deliberately NOT the basis here, and
+  // every consumer below treats this case as a measurement that did not
+  // complete rather than as a finished answer.
+  return { isOwn: true, basis: 'unreadable' };
 }
 
 /**
@@ -609,19 +633,40 @@ export async function performNavigation(
   const documents = watch.activity.documents;
   const { isOwn: documentIsOwn, basis } = decideDocumentIsOwn(response, documents, settled);
 
+  // Which recorded response describes the document now on screen. Matched on
+  // the live document's own fetched address when there is one, and only then
+  // by position, because two documents at ONE address are exactly the case
+  // this round is here to fix: filtering by address and taking the LAST match
+  // picks the second of them, which is what is on screen.
   const finalKey = withoutHash(settled.documentUrl ?? settled.url);
   const finalDocument = documentIsOwn
     ? documents.find(entry => entry.response === response)
-    : basis === 'document-order' || basis === 'unreadable'
-      ? documents.at(-1)
-      : documents.filter(entry => withoutHash(entry.url) === finalKey).at(-1);
+    : settled.readable
+      ? documents.filter(entry => withoutHash(entry.url) === finalKey).at(-1)
+      : documents.at(-1);
 
-  // Playwright's own Response is preferred wherever it describes the document
-  // being reported, since it is authoritative about the status and about ok().
-  // The document's timing entry only fills in for a document goto never
-  // returned, which is exactly the redirected-to case.
+  // The document's OWN navigation timing entry is the authority once we know
+  // the document on screen is not the one we fetched, and it was in hand all
+  // along: on the same-address replacement it held 503 while the payload
+  // reported the discarded document's 200. A null from it is a real answer,
+  // not a missing one, which is why it is not backfilled from finalDocument:
+  // a tab that ended on about:blank genuinely has no HTTP status, and
+  // inheriting the previous document's would be the same false pass in a
+  // different disguise.
+  //
+  // Playwright's own Response stays the authority for the document we
+  // fetched, since it is definitive about status and about ok(), and it is
+  // still the best available answer when the page could not be read at all
+  // (basis "unreadable"), where the pendingNavigation reason carries the
+  // warning instead of a fabricated status.
   const status =
-    response === null ? null : documentIsOwn ? response.status() : (finalDocument?.status ?? settled.documentStatus ?? null);
+    response === null
+      ? null
+      : documentIsOwn
+        ? response.status()
+        : settled.readable
+          ? settled.documentStatus
+          : (finalDocument?.status ?? null);
   const ok =
     response === null
       ? null
@@ -631,7 +676,10 @@ export async function performNavigation(
           ? null
           : status >= 200 && status < 300;
 
-  const documentChanged = response !== null && !documentIsOwn;
+  // Only claimed on evidence. "unreadable" is not evidence of a change any
+  // more than it is evidence of stillness, so it produces no documentChanged
+  // block: the caller is told the page could not be read instead.
+  const documentChanged = response !== null && !documentIsOwn && basis !== 'unreadable';
 
   // An abandoned navigation that left the tab exactly where it was is the
   // page refusing to leave, which is a fact about the page and belongs in the
@@ -752,8 +800,17 @@ export function isTimeoutError(error: unknown): boolean {
 export function documentChangedNote(outcome: NavigationOutcome, what: string): string {
   const response = outcome.response;
   if (response === null) return '';
+  const landedOn = outcome.settled.documentUrl ?? outcome.settled.url;
+  // A page can replace itself at its OWN address, and describing that as "the
+  // document now on screen was fetched from <the same URL you asked for>"
+  // reads as a formatting bug rather than as the finding it is. It is worth
+  // its own sentence, because it is the shape a URL comparison cannot see and
+  // the one this tool used to report a dead document's status for.
+  const sameAddress = withoutHash(landedOn) === withoutHash(response.url());
   return (
-    `The page moved itself after the response was measured: the ${what} of ${response.url()} answered ${response.status()}, and the document now on screen was fetched from ${outcome.settled.documentUrl ?? outcome.settled.url}. That is a client-side redirect (location.assign or replace, a meta refresh, or a router bouncing an unauthenticated visitor), and "documentChanged" lists every main-frame document this call saw, in order. ` +
+    (sameAddress
+      ? `The page replaced itself AT THE SAME ADDRESS after the response was measured: the ${what} of ${response.url()} answered ${response.status()}, and the document on screen now is a DIFFERENT one fetched from that same address. location.replace(location.href), a script calling location.reload(), and a bounce away and back all do this, and the two documents can answer different statuses, which is exactly what happened here. "documentChanged" lists every main-frame document this call saw, in order. `
+      : `The page moved itself after the response was measured: the ${what} of ${response.url()} answered ${response.status()}, and the document now on screen was fetched from ${landedOn}. That is a client-side redirect (location.assign or replace, a meta refresh, or a router bouncing an unauthenticated visitor), and "documentChanged" lists every main-frame document this call saw, in order. `) +
     (outcome.status !== null
       ? `"status" and "ok" describe the document "url" and "title" describe, this last one, NOT the ${response.status()} that started the chain.`
       : 'The final document has no HTTP response of its own to report (about:blank, a data: URL or a blob:), so "status" and "ok" are null rather than carrying the earlier document\'s status.')

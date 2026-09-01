@@ -2706,13 +2706,26 @@ export const interactionTools = defineTools({
       // URL that had not changed at all, which was measured against a server
       // answering 204: the verdict (blocked, tab unmoved) was right and the
       // note beside it described something that never happened.
+      //
+      // A navigation that TIMED OUT is excluded for the same reason: nothing
+      // arrived, so nothing can be said about which document is on screen.
+      // Against a backend that accepted the connection and never answered,
+      // this used to come back "sameDocument": true beside a note promising
+      // the JS context had survived a navigation that never happened.
       const sameDocument =
-        !outcome.blocked && response === null && (before === null || settled.identity === null || before === settled.identity);
+        !outcome.blocked &&
+        !outcome.timedOut &&
+        response === null &&
+        (before === null || settled.identity === null || before === settled.identity);
 
       const notes: string[] = [];
-      if (outcome.blocked) {
-        // Nothing to say here: the blocked pending reason already explains
-        // what happened, and neither of the branches below is true.
+      if (outcome.blocked || outcome.timedOut || !settled.readable) {
+        // No confident claim about the document belongs here. Every one of
+        // these three means the measurement did not complete, and the
+        // pendingNavigation reason below says which one it was. The notes
+        // underneath are positive statements about what happened to the
+        // document, and stating one on this evidence is how a call that
+        // measured nothing came to describe a same-document navigation.
       } else if (sameDocument) {
         notes.push(
           'Same-document navigation: the URL changed but the document was NOT reloaded. The JS context, in-page state and the console buffer all survive untouched, and nothing was re-fetched, so there is no HTTP response to report a status for either: "status" and "ok" are null for that reason, not because anything failed. Call reload if you need a real page load.'
@@ -2799,7 +2812,12 @@ export const interactionTools = defineTools({
       );
 
       const notes: string[] = [];
-      if (outcome.response === null) {
+      // Guarded exactly the way navigate's notes are, and for the same
+      // reason: a reload that was blocked, that timed out, or whose page
+      // could not be read has not measured anything, and "that is what
+      // reloading about:blank looks like" is a positive claim about a
+      // measurement that did not happen.
+      if (outcome.response === null && !outcome.blocked && !outcome.timedOut && outcome.settled.readable) {
         notes.push(
           'This reload produced no HTTP response, so "status" and "ok" are null: that is what reloading about:blank or a non-HTTP scheme (for instance data:) looks like, not a failure.'
         );
