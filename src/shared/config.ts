@@ -90,7 +90,22 @@ export interface Config {
   screenshotCacheTtlMs: number;
   /** Max buffered `console` messages kept per session tab (oldest dropped first). */
   consoleBufferSize: number;
-  /** Max buffered network request/response entries kept per session tab (oldest dropped first). */
+  /**
+   * Max buffered network request/response entries kept per session (oldest
+   * dropped first).
+   *
+   * 400, raised from an original 200. Doubling it is a cheap mitigation, not
+   * the fix: a page running its own dev server can still fill any fixed ring
+   * with module-chunk requests inside the first second of a load, and no
+   * single number is right for every app. The real fix is that eviction is
+   * now visible (list_network_requests reports `dropped`) and avoidable (a
+   * session's capture filter can keep chunk noise out of the ring before it
+   * ever gets a chance to evict anything), which matters far more than this
+   * number does. It is still raised because it costs nothing real (a network
+   * entry is a handful of short fields) and buys real headroom for the
+   * common case of one plain page load before a caller needs to reach for a
+   * filter at all.
+   */
   networkBufferSize: number;
   /** Max buffered JavaScript dialogs (alert/confirm/prompt) kept per session (oldest dropped first). */
   dialogBufferSize: number;
@@ -147,7 +162,7 @@ export function loadConfig(): Config {
     screenshotCacheDir: str('HARBORAGE_SCREENSHOT_CACHE_DIR', join(stateDir, 'screenshots')),
     screenshotCacheTtlMs: num('HARBORAGE_SCREENSHOT_CACHE_TTL_MS', 4 * 60 * 60 * 1000),
     consoleBufferSize: num('HARBORAGE_CONSOLE_BUFFER_SIZE', 200),
-    networkBufferSize: num('HARBORAGE_NETWORK_BUFFER_SIZE', 200),
+    networkBufferSize: num('HARBORAGE_NETWORK_BUFFER_SIZE', 400),
     dialogBufferSize: num('HARBORAGE_DIALOG_BUFFER_SIZE', 200),
     pageErrorBufferSize: num('HARBORAGE_PAGE_ERROR_BUFFER_SIZE', 200),
     daemonReadyTimeoutMs: num('HARBORAGE_DAEMON_READY_TIMEOUT_MS', 60 * 1000),

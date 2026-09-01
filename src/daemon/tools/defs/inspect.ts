@@ -7,6 +7,7 @@ import * as z from 'zod/v4';
 
 import { sessionCacheDir } from '../../screenshotCache.js';
 import { parseCssColor, type ParsedCssColor, type Rgba } from '../color.js';
+import { compileNetworkMatch, matchesNetworkEntry } from '../../networkMatch.js';
 import type { NetworkEntry } from '../../sessions.js';
 import { defineTool, defineTools, text, type ToolResult } from '../types.js';
 import { clear, pageId, sessionId } from './common.js';
@@ -899,10 +900,16 @@ export const inspectTools = defineTools({
     description:
       'Read buffered browser console messages for a session (optionally filtered to one tab). Buffering starts at ' +
       'create_session, so this returns history, not just future messages. The buffer is bounded ' +
-      '(HARBORAGE_CONSOLE_BUFFER_SIZE, 200 by default) and drops the oldest messages once full, so a message that ' +
-      'is missing may have been evicted rather than never logged. Every result reports total (messages in the ' +
-      'buffer) next to returned (messages that matched), so you can see how much a filter hid. ' +
-      'clear: true drains the entire buffer for the session, not only the messages a filter returned.',
+      '(HARBORAGE_CONSOLE_BUFFER_SIZE, 200 by default) and drops the oldest messages once full. Every result ' +
+      'reports total (messages currently in the buffer), returned (messages this call\'s filters matched) and ' +
+      'dropped (messages the buffer has evicted since it was last fully cleared). total: 200, returned: 0, ' +
+      'dropped: 0 means the filter genuinely matched nothing that is still there; dropped > 0 means real messages ' +
+      'are already gone and no filter will bring them back, so read sooner or clear right after the action you ' +
+      'care about next time. ' +
+      'clear: true removes only the messages this call returned, per the clear field below; a call with no ' +
+      'narrowing (no pageId, no types, no textIncludes) therefore drains the whole buffer, and that specific case ' +
+      'also resets dropped to 0, since that is a fresh observation window starting. A narrowed clear leaves dropped ' +
+      'exactly as it was: those losses are still real for whatever is left unread.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -932,26 +939,45 @@ export const inspectTools = defineTools({
       // The filter is pushed into the store rather than applied to what comes
       // back, because `clear` is handled in there. Filtering on the way out
       // would drain the whole buffer while returning only the matches, silently
-      // destroying entries the caller never saw. Total is read first, without
-      // clearing, so the "0 of 200" signal survives.
-      const total = ctx.sessions.getConsoleMessages(args.sessionId, args.pageId, false).length;
-      const messages = ctx.sessions.getConsoleMessages(args.sessionId, args.pageId, args.clear ?? false, matches);
+      // destroying entries the caller never saw. total and dropped are read
+      // first, without clearing, so they describe the window this call is
+      // about to close out rather than the (possibly just-reset) state after.
+      const before = ctx.sessions.getConsoleMessages(args.sessionId, args.pageId, false);
+      const result = ctx.sessions.getConsoleMessages(args.sessionId, args.pageId, args.clear ?? false, matches);
 
-      return text({ total, returned: messages.length, messages });
+      return text({ total: before.entries.length, returned: result.entries.length, dropped: before.dropped, messages: result.entries });
     }
   }),
 
   list_network_requests: defineTool({
     description:
-      'List buffered network requests and responses for a session (optionally filtered to one tab). Buffering starts ' +
-      'at create_session, and the buffer is bounded (HARBORAGE_NETWORK_BUFFER_SIZE, 200 by default): once it is ' +
-      'full the oldest entries are dropped, so an empty result can mean "evicted", not "never happened". Every ' +
-      'result reports total (entries in the buffer) next to returned (entries that matched), so you can see how ' +
-      'much a filter hid. ' +
+      'List buffered network requests and responses for a session (optionally filtered to one tab). Buffering ' +
+      'starts at create_session, and the buffer is bounded (HARBORAGE_NETWORK_BUFFER_SIZE, 400 by default): once ' +
+      'it is full the oldest entries are dropped. Every result reports total (entries currently in the buffer), ' +
+      'returned (entries this call\'s filters matched) and dropped (entries evicted from the buffer since it was ' +
+      'last fully cleared). total: 400, returned: 0, dropped: 0 means the filter genuinely matched nothing that is ' +
+      'still there; dropped > 0 means real traffic is already gone, no filter recovers it, and the fix is capture, ' +
+      'not read: set a capture filter (see below) or clear right before the action you care about so less has to ' +
+      'fit in the ring. ' +
+      'This matters most on a page that keeps its own dev tooling open, a Vite/webpack dev server being the ' +
+      'canonical case: dozens to hundreds of module-chunk requests can fill the whole buffer in the first second ' +
+      'of a single page load, evicting the one API call an agent actually wanted before anyone gets to filter for ' +
+      'it. A high dropped count with the traffic you wanted nowhere in returned is that happening, not a bug in ' +
+      'this tool. ' +
+      'To stop it at the source rather than reading around it: create_session takes an optional ' +
+      'networkCaptureFilter, and set_network_capture_filter changes or clears one on a session that is already ' +
+      'running, which is the common case since the flood is usually only obvious after it has already happened. ' +
+      'Both take the same urlIncludes / urlMatches / method / resourceType / direction vocabulary as the filters ' +
+      'below, so whatever narrows a read here can be pasted straight into a capture filter to stop the eviction ' +
+      'instead of just working around it. ' +
       'One HTTP exchange shows up as two entries: a request entry carrying method and resourceType, and a response ' +
       'entry carrying status. No single filter spans both, so "the POST that failed" is two calls, one with ' +
       'method: "POST" and one with minStatus: 400. Filters combine with AND. ' +
-      'clear: true drains the entire buffer for the session, not only the entries a filter returned.',
+      'clear: true removes only the entries this call returned, per the clear field below; a call with no ' +
+      'narrowing (no pageId, no urlIncludes/urlMatches/method/minStatus/maxStatus/resourceType/direction) ' +
+      'therefore drains the whole buffer, and that specific case also resets dropped and filteredAtCapture to 0, ' +
+      'since that is a fresh observation window starting. A narrowed clear leaves both counters exactly as they ' +
+      'were: those losses are still real for whatever is left unread.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -996,38 +1022,32 @@ export const inspectTools = defineTools({
       direction: z.enum(['request', 'response']).optional().describe('Keep only one side of each exchange.')
     }),
     async handler(ctx, args) {
-      let pattern: RegExp | undefined;
-      if (args.urlMatches !== undefined) {
-        try {
-          pattern = new RegExp(args.urlMatches);
-        } catch (err) {
-          throw new Error(`urlMatches is not a valid regular expression: ${messageOf(err)}`);
-        }
-      }
-
-      const needle = args.urlIncludes?.toLowerCase();
-      const method = args.method?.toUpperCase();
-
-      const matches = ((entry: NetworkEntry): boolean => {
-        if (args.direction !== undefined && entry.direction !== args.direction) return false;
-        if (needle !== undefined && !entry.url.toLowerCase().includes(needle)) return false;
-        if (pattern !== undefined && !pattern.test(entry.url)) return false;
-        if (method !== undefined && entry.method?.toUpperCase() !== method) return false;
-        if (args.resourceType !== undefined && entry.resourceType !== args.resourceType) return false;
-        if (args.minStatus !== undefined && !(entry.status !== undefined && entry.status >= args.minStatus)) return false;
-        if (args.maxStatus !== undefined && !(entry.status !== undefined && entry.status <= args.maxStatus)) return false;
-        return true;
+      const criteria = compileNetworkMatch({
+        urlIncludes: args.urlIncludes,
+        urlMatches: args.urlMatches,
+        method: args.method,
+        resourceType: args.resourceType,
+        minStatus: args.minStatus,
+        maxStatus: args.maxStatus,
+        direction: args.direction
       });
+      const matches = (entry: NetworkEntry): boolean => matchesNetworkEntry(entry, criteria);
 
       // Same reasoning as read_console: the predicate goes into the store so
-      // `clear` removes exactly what was returned, never more.
-      const total = ctx.sessions.getNetworkEntries(args.sessionId, args.pageId, false).length;
-      const requests = ctx.sessions.getNetworkEntries(args.sessionId, args.pageId, args.clear ?? false, matches);
+      // `clear` removes exactly what was returned, never more, and total /
+      // dropped are read before the (possibly clearing) real read runs.
+      const before = ctx.sessions.getNetworkEntries(args.sessionId, args.pageId, false);
+      const result = ctx.sessions.getNetworkEntries(args.sessionId, args.pageId, args.clear ?? false, matches);
 
-      // total counts the buffer, returned counts the matches: an agent seeing
-      // "0 of 200" knows its filter was wrong, while "0 of 0" says the traffic
-      // genuinely was not there, or has already aged out.
-      return text({ total, returned: requests.length, requests });
+      return text({
+        total: before.entries.length,
+        returned: result.entries.length,
+        dropped: before.dropped,
+        // 0 whenever no capture filter is set, which is the common case, so
+        // this only shows up as a live number once a caller has opted in.
+        filteredAtCapture: before.filteredOut,
+        requests: result.entries
+      });
     }
   }),
 

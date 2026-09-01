@@ -1,13 +1,61 @@
 import * as z from 'zod/v4';
 
+import { compileNetworkMatch } from '../../networkMatch.js';
 import { defineTool, defineTools, text } from '../types.js';
 import { clear, pageId, sessionId } from './common.js';
+
+/**
+ * The capture-filter vocabulary, shared between create_session and
+ * set_network_capture_filter, and matched deliberately against
+ * list_network_requests' own filter fields: a caller who found the noise
+ * with a read-time filter should be able to paste the same field names into
+ * a capture filter rather than learn a second vocabulary for the same idea.
+ */
+const networkCaptureFilterShape = {
+  urlIncludes: z
+    .string()
+    .optional()
+    .describe('Only capture entries whose URL contains this substring, matched case-insensitively.'),
+  urlMatches: z
+    .string()
+    .optional()
+    .describe('Only capture entries whose URL matches this JavaScript regular expression source.'),
+  method: z
+    .string()
+    .optional()
+    .describe(
+      'Only capture request entries with this HTTP method, matched case-insensitively. This drops every response ' +
+        'entry too, since responses carry no method.'
+    ),
+  resourceType: z
+    .string()
+    .optional()
+    .describe(
+      'Only capture entries of this Playwright resource type, e.g. "xhr", "fetch", "document". Same vocabulary as ' +
+        'list_network_requests\' resourceType. Only request entries carry one.'
+    ),
+  direction: z.enum(['request', 'response']).optional().describe('Only capture one side of each exchange.')
+};
+
+const networkCaptureFilter = z
+  .object(networkCaptureFilterShape)
+  .optional()
+  .describe(
+    'What to keep in this session\'s network ring, evaluated BEFORE an entry is buffered rather than after, so ' +
+      'excluded noise can never evict traffic you do care about. Fields combine with AND, same as ' +
+      'list_network_requests\' own filters. Omit entirely to capture everything, which is the default and matches ' +
+      'every session created before this option existed. This is most useful against a page that runs its own dev ' +
+      'server, where module-chunk requests can otherwise fill the whole buffer before the page has even finished ' +
+      'loading: e.g. urlIncludes "/api/" keeps the calls an app makes to its own backend while a Vite or webpack ' +
+      'dev server\'s "/@vite/", "/@fs/" and *.tsx module-chunk traffic never enters the ring at all. ' +
+      'set_network_capture_filter changes or clears this on a session that is already running.'
+  );
 
 /** Tools that create, inspect, hand over and tear down sessions themselves. */
 export const sessionTools = defineTools({
   create_session: defineTool({
     description:
-      'Create a new isolated browser session, optionally seeded from previously exported storage state and optionally with a fixed viewport and device scale factor. Returns a sessionId.',
+      'Create a new isolated browser session, optionally seeded from previously exported storage state, optionally with a fixed viewport and device scale factor, and optionally with a network capture filter already in place. Returns a sessionId.',
     inputSchema: z.object({
       storageState: z
         .unknown()
@@ -31,13 +79,15 @@ export const sessionTools = defineTools({
         .describe(
           'Device pixel ratio for this session, e.g. 2 or 3 for retina-density screenshots (a 400x300 viewport at 2 produces an 800x600 PNG). Defaults to 1. ' +
             'This is FIXED for the life of the session: Playwright sets it when the browser context is created and nothing can change it afterwards, so resize cannot change it and CDP Emulation.setDeviceMetricsOverride silently does nothing. A different scale factor needs a new session.'
-        )
+        ),
+      networkCaptureFilter
     }),
-    async handler(ctx, { storageState, viewport, deviceScaleFactor }) {
+    async handler(ctx, { storageState, viewport, deviceScaleFactor, networkCaptureFilter: filter }) {
       const { sessionId: id, pageId: firstPageId } = await ctx.sessions.createSession({
         storageState,
         viewport,
-        deviceScaleFactor
+        deviceScaleFactor,
+        networkCaptureFilter: filter
       });
       return text({ sessionId: id, pageId: firstPageId });
     }
@@ -171,7 +221,8 @@ export const sessionTools = defineTools({
       'IMPORTANT, because it changes how you use this: harborage never leaves a dialog open. A dialog blocks its tab until something answers it, so an unanswered one would wedge the tab and every later call on it. ' +
       'The default is therefore to dismiss every dialog the moment it appears and record it here, which is what the page sees as confirm() returning false and prompt() returning null. ' +
       'That means you arm this tool BEFORE the click or navigation that raises the dialog, rather than calling it in response to one: by the time you could react, the dialog is already answered and logged. ' +
-      'Call it with no action to just read the log, which is how you find out that a click you thought did nothing actually hit a confirm().',
+      'Call it with no action to just read the log, which is how you find out that a click you thought did nothing actually hit a confirm(). ' +
+      'The dialog log is a bounded buffer (HARBORAGE_DIALOG_BUFFER_SIZE, 200 by default), same as read_console and list_network_requests, so the result reports total (dialogs currently buffered), returned (dialogs this call is handing back) and dropped (dialogs evicted since the buffer was last fully cleared). clear: true without pageId drains the whole session-wide log and also resets dropped to 0, since that is a fresh observation window starting; clear: true scoped to one pageId only removes that tab\'s dialogs and leaves dropped as it was, since the rest of the log is still unread.',
     inputSchema: z.object({
       sessionId,
       action: z
@@ -204,8 +255,15 @@ export const sessionTools = defineTools({
           appliesTo: args.appliesTo ?? 'next'
         });
       }
-      const dialogs = ctx.sessions.getDialogs(args.sessionId, args.pageId, args.clear ?? false);
-      return text({ armed: ctx.sessions.getDialogPolicy(args.sessionId) ?? null, dialogs });
+      const before = ctx.sessions.getDialogs(args.sessionId, args.pageId, false);
+      const result = ctx.sessions.getDialogs(args.sessionId, args.pageId, args.clear ?? false);
+      return text({
+        armed: ctx.sessions.getDialogPolicy(args.sessionId) ?? null,
+        total: before.entries.length,
+        returned: result.entries.length,
+        dropped: before.dropped,
+        dialogs: result.entries
+      });
     }
   }),
 
@@ -214,15 +272,22 @@ export const sessionTools = defineTools({
       'Read buffered uncaught exceptions and unhandled promise rejections for a session (optionally filtered to one tab). ' +
       'This is a different channel from read_console: a script that throws produces no console message, so an error invisible to read_console shows up here. ' +
       'Buffering starts at create_session and at every tab opening, so this returns history rather than only what happens after you ask. ' +
-      'Each entry carries the message and, where one exists, the stack. A rejection whose value is not an Error has no stack, so it carries valueType (the value\'s constructor, e.g. Event), eventType (an Event\'s own type) and detail (a JSON dump) instead, which is what makes an "[object Event]" rejection traceable.',
+      'Each entry carries the message and, where one exists, the stack. A rejection whose value is not an Error has no stack, so it carries valueType (the value\'s constructor, e.g. Event), eventType (an Event\'s own type) and detail (a JSON dump) instead, which is what makes an "[object Event]" rejection traceable. ' +
+      'This is a bounded buffer (HARBORAGE_PAGE_ERROR_BUFFER_SIZE, 200 by default), same as read_console and list_network_requests, so the result reports total (errors currently buffered), returned (errors this call is handing back) and dropped (errors evicted since the buffer was last fully cleared). clear: true without pageId drains the whole session-wide log and also resets dropped to 0, since that is a fresh observation window starting; clear: true scoped to one pageId only removes that tab\'s errors and leaves dropped as it was, since the rest of the log is still unread.',
     inputSchema: z.object({
       sessionId,
       pageId,
       clear
     }),
     async handler(ctx, args) {
-      const errors = ctx.sessions.getPageErrors(args.sessionId, args.pageId, args.clear ?? false);
-      return text({ errors });
+      const before = ctx.sessions.getPageErrors(args.sessionId, args.pageId, false);
+      const result = ctx.sessions.getPageErrors(args.sessionId, args.pageId, args.clear ?? false);
+      return text({
+        total: before.entries.length,
+        returned: result.entries.length,
+        dropped: before.dropped,
+        errors: result.entries
+      });
     }
   }),
 
@@ -243,6 +308,53 @@ export const sessionTools = defineTools({
     inputSchema: z.object({}),
     async handler(ctx) {
       return text({ sessions: ctx.sessions.listSessions() });
+    }
+  }),
+
+  set_network_capture_filter: defineTool({
+    description:
+      'Change, or remove, a session\'s network capture filter: what gets INTO the network ring in the first place, ' +
+      'as opposed to list_network_requests\' filters, which only narrow what a single read shows you out of ' +
+      'whatever survived. Most agents only discover the flood after it has already happened (list_network_requests ' +
+      'came back with a big dropped count and none of the traffic they wanted), so this exists to fix it on the ' +
+      'session that is already running rather than requiring a fresh create_session with networkCaptureFilter set ' +
+      'up front. ' +
+      'Same vocabulary as list_network_requests\' own filters: urlIncludes, urlMatches, method, resourceType, ' +
+      'direction, ANDed together. Call with none of them set to remove the filter and go back to capturing ' +
+      'everything, which is also the default for a session that never called this at all. ' +
+      'Takes effect immediately for every tab in the session and for tabs opened later, but does not retroactively ' +
+      'touch what is already buffered: entries already in the ring stay there until read, cleared, or aged out by ' +
+      'the ring filling up, whichever comes first. It also does not affect what has already been filtered out or ' +
+      'dropped; those counters keep accumulating and only reset on an unfiltered list_network_requests clear.',
+    inputSchema: z.object({
+      sessionId,
+      ...networkCaptureFilterShape
+    }),
+    async handler(ctx, args) {
+      const hasFilter =
+        args.urlIncludes !== undefined ||
+        args.urlMatches !== undefined ||
+        args.method !== undefined ||
+        args.resourceType !== undefined ||
+        args.direction !== undefined;
+
+      const raw = hasFilter
+        ? {
+            ...(args.urlIncludes !== undefined ? { urlIncludes: args.urlIncludes } : {}),
+            ...(args.urlMatches !== undefined ? { urlMatches: args.urlMatches } : {}),
+            ...(args.method !== undefined ? { method: args.method } : {}),
+            ...(args.resourceType !== undefined ? { resourceType: args.resourceType } : {}),
+            ...(args.direction !== undefined ? { direction: args.direction } : {})
+          }
+        : undefined;
+
+      ctx.sessions.setNetworkCaptureFilter(args.sessionId, raw !== undefined ? compileNetworkMatch(raw) : undefined);
+
+      return text({
+        sessionId: args.sessionId,
+        capturing: hasFilter ? 'filtered' : 'everything',
+        filter: raw ?? null
+      });
     }
   })
 });

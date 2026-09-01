@@ -127,21 +127,24 @@ So, across the surface:
 
 ## What a subagent gets
 
-**58 MCP tools.** Every tool takes a `sessionId`. Most take an optional
+**59 MCP tools.** Every tool takes a `sessionId`. Most take an optional
 `pageId` and default to the session's active tab.
 
 <details>
-<summary><strong>Sessions and tabs (11)</strong></summary>
+<summary><strong>Sessions and tabs (12)</strong></summary>
 
 `create_session` (optionally seeded from exported storage state, with an
-optional viewport and `deviceScaleFactor`), `release_session`,
-`list_sessions` (every active session machine-wide, discoverable without
-already knowing a sessionId), `list_tabs`, `new_tab`, `close_tab`,
-`select_tab`, `export_state`, `handle_dialog` (policy for `alert` /
-`confirm` / `prompt`, plus what actually appeared), `read_page_errors`
-(uncaught exceptions and unhandled rejections, a separate channel from
-console output), and `escalate_session`, which hands a stuck session to a
-*human* through a real Chrome DevTools WebSocket URL.
+optional viewport, `deviceScaleFactor` and `networkCaptureFilter`),
+`release_session`, `list_sessions` (every active session machine-wide,
+discoverable without already knowing a sessionId), `list_tabs`, `new_tab`,
+`close_tab`, `select_tab`, `export_state`, `handle_dialog` (policy for
+`alert` / `confirm` / `prompt`, plus what actually appeared),
+`read_page_errors` (uncaught exceptions and unhandled rejections, a
+separate channel from console output), `escalate_session`, which hands a
+stuck session to a *human* through a real Chrome DevTools WebSocket URL,
+and `set_network_capture_filter`, which changes or removes a session's
+network capture filter while it is already running, for the common case of
+only discovering a flood of noise after it has already happened.
 
 </details>
 
@@ -234,10 +237,10 @@ are read once at startup by both the daemon and the client wrapper.
 |---|---|---|
 | `HARBORAGE_SCREENSHOT_CACHE_DIR` | `$STATE_DIR/screenshots` | Where `screenshot`'s `mode: 'cached'` writes PNGs, in a per-session subdirectory. |
 | `HARBORAGE_SCREENSHOT_CACHE_TTL_MS` | `14400000` (4h) | A cached screenshot older than this gets deleted by the same sweep that reaps idle sessions. |
-| `HARBORAGE_CONSOLE_BUFFER_SIZE` | `200` | Max buffered `console` messages per session (oldest dropped first). |
-| `HARBORAGE_NETWORK_BUFFER_SIZE` | `200` | Max buffered network request and response entries per session. |
-| `HARBORAGE_DIALOG_BUFFER_SIZE` | `200` | Max buffered JavaScript dialog records per session. |
-| `HARBORAGE_PAGE_ERROR_BUFFER_SIZE` | `200` | Max buffered uncaught exceptions and unhandled rejections per session. |
+| `HARBORAGE_CONSOLE_BUFFER_SIZE` | `200` | Max buffered `console` messages per session (oldest dropped first; `read_console` reports how many were dropped). |
+| `HARBORAGE_NETWORK_BUFFER_SIZE` | `400` | Max buffered network request and response entries per session (oldest dropped first; `list_network_requests` reports how many were dropped, and a session capture filter keeps noise out of the ring in the first place). |
+| `HARBORAGE_DIALOG_BUFFER_SIZE` | `200` | Max buffered JavaScript dialog records per session (oldest dropped first; `handle_dialog` reports how many were dropped). |
+| `HARBORAGE_PAGE_ERROR_BUFFER_SIZE` | `200` | Max buffered uncaught exceptions and unhandled rejections per session (oldest dropped first; `read_page_errors` reports how many were dropped). |
 
 Running a second, isolated instance, for developing harborage itself without
 touching a daemon that is serving real work, means overriding the port, the
