@@ -112,6 +112,47 @@ const META3_HTML = `<!doctype html>
 <html><head><title>Meta three</title></head><body>meta three</body></html>`;
 
 /**
+ * A route that behaves on its first load and starts bouncing on every load
+ * after it. Reloading is the only way to reach the redirecting version, which
+ * is what makes it a reload fixture rather than a navigate one, and it is the
+ * ordinary shape of a session that expired between the first visit and the
+ * refresh: the shell still answers 200, and it throws you at an error page.
+ */
+const FLAKY_FIRST_HTML = `<!doctype html>
+<html><head><title>Flaky ok</title></head><body>first load is fine</body></html>`;
+const FLAKY_SHELL_HTML = `<!doctype html>
+<html><head><title>Loading dashboard</title></head><body>
+<script>location.replace('/broken');</script>
+</body></html>`;
+
+/** The same shape, but bouncing somewhere with no HTTP response of its own. */
+const FLAKY_BLANK_SHELL_HTML = `<!doctype html>
+<html><head><title>Loading</title></head><body>
+<script>location.replace('about:blank');</script>
+</body></html>`;
+
+/**
+ * A forward-trapping SPA: the mirror of the back guard below. Its popstate
+ * handler is armed by the test right before the forward step, and traverses
+ * two entries BACK, so a forward step leaves the tab one entry LOWER than it
+ * started and on a URL it was never on. The URL really changes, and that is
+ * what used to make it read as a clean forward step.
+ */
+const FORWARD_GUARD_BACKWARD_HTML = `<!doctype html>
+<html><head><title>Forward guarded</title></head><body>
+<script>
+  window.__guard = false;
+  window.__bounced = 0;
+  window.addEventListener('popstate', function () {
+    if (!window.__guard) return;
+    window.__guard = false;
+    window.__bounced++;
+    history.go(-2);
+  });
+</script>
+</body></html>`;
+
+/**
  * A back-trapping SPA that does not merely block the step: its popstate
  * handler pushes TWICE, so a back step leaves the tab one entry FURTHER
  * FORWARD than it started, on a URL it was never on before. This is what a
@@ -163,8 +204,12 @@ const PAGES: Record<string, { html: string; status?: number }> = {
   '/meta3': { html: META3_HTML },
   '/guarded': { html: FORWARD_GUARD_HTML },
   '/trap': { html: SAME_URL_TRAP_HTML },
-  '/plain': { html: PLAIN_HTML }
+  '/plain': { html: PLAIN_HTML },
+  '/fwdguard': { html: FORWARD_GUARD_BACKWARD_HTML }
 };
+
+/** How many times each stateful route has been asked for, so a reload can differ from the first visit. */
+const loadCounts: Record<string, number> = {};
 
 /** The server's own log: the independent oracle for what status each document really carried. */
 const served: { path: string; status: number }[] = [];
@@ -178,6 +223,17 @@ let handlers: ToolHandlers;
 before(async () => {
   server = createServer((req, res) => {
     const path = (req.url ?? '/').split('?')[0]!.split('#')[0]!;
+    // The stateful reload routes: fine on the first load, bouncing on every
+    // load after it.
+    if (path === '/flaky' || path === '/flakyblank') {
+      const count = (loadCounts[path] = (loadCounts[path] ?? 0) + 1);
+      served.push({ path, status: 200 });
+      res.statusCode = 200;
+      res.setHeader('cache-control', 'no-store');
+      res.setHeader('content-type', 'text/html; charset=utf-8');
+      res.end(count === 1 ? FLAKY_FIRST_HTML : path === '/flaky' ? FLAKY_SHELL_HTML : FLAKY_BLANK_SHELL_HTML);
+      return;
+    }
     // A genuine server-side redirect, which navigate must keep reporting as
     // one ordinary document rather than as a page that moved itself.
     if (path === '/moved') {
@@ -516,6 +572,97 @@ test('navigate through a shell that redirects to about:blank reports a null stat
 });
 
 // ---------------------------------------------------------------------------
+// Finding 8, ported: reload had the identical defect and the identical fix.
+// ---------------------------------------------------------------------------
+
+test('reload of a shell that has started redirecting to a 500 reports the 500, not the shell\'s 200', async () => {
+  const sessionId = await sessionOn('/flaky');
+  // First load is the well-behaved version, so the tab is genuinely sitting
+  // on the shell when the reload happens. That is what makes this a reload
+  // case: navigate could never land here.
+  assert.equal(await evaluate<string>(sessionId, 'document.title'), 'Flaky ok');
+
+  const body = payload(await handlers.reload({ sessionId }));
+
+  // Oracle 1: the live document, read from the page.
+  const liveUrl = await evaluate<string>(sessionId, 'location.href');
+  const liveTitle = await evaluate<string>(sessionId, 'document.title');
+  assert.equal(liveUrl, `${baseUrl}/broken`, 'the reload must really have bounced');
+  assert.equal(liveTitle, 'Server error');
+
+  // Oracle 2: what the server actually served for that path.
+  assert.equal(
+    served.filter(entry => entry.path === '/broken').at(-1)?.status,
+    500,
+    'the server must really have answered 500 for the document now on screen'
+  );
+
+  assert.equal(body.url, liveUrl, 'the payload must describe the document that is actually there');
+  assert.equal(body.title, liveTitle);
+  assert.equal(
+    body.status,
+    500,
+    `status must describe the document url and title describe. Got ${JSON.stringify({ status: body.status, url: body.url, title: body.title })}`
+  );
+  assert.equal(body.ok, false, 'ok: true beside a 500 error page is the exact wrong conclusion this fix exists to prevent');
+  assert.ok(body.documentChanged, 'the payload must say plainly that the page moved itself after the response was measured');
+  assert.equal(body.documentChanged.from.url, `${baseUrl}/flaky`);
+  assert.equal(body.documentChanged.from.status, 200);
+  assert.equal(body.documentChanged.to.url, `${baseUrl}/broken`);
+  assert.equal(typeof body.note, 'string');
+  assert.match(String(body.note), /reload/i, 'the note must be worded for the tool the caller actually called');
+
+  await sessions.releaseSession(sessionId);
+});
+
+test('reload that lands on about:blank reports a null status rather than the shell\'s 200', async () => {
+  const sessionId = await sessionOn('/flakyblank');
+  assert.equal(await evaluate<string>(sessionId, 'document.title'), 'Flaky ok');
+
+  const body = payload(await handlers.reload({ sessionId }));
+
+  const liveUrl = await evaluate<string>(sessionId, 'location.href');
+  assert.equal(liveUrl, 'about:blank', 'the reload must really have landed on about:blank');
+
+  assert.equal(body.url, 'about:blank');
+  assert.equal(body.status, null, 'about:blank has no HTTP response, so it must not inherit the shell\'s 200');
+  assert.equal(body.ok, null);
+  assert.ok(body.documentChanged, 'the page moved itself, and that must be stated');
+  assert.equal(body.documentChanged.from.status, 200);
+  assert.equal(body.documentChanged.to.status, null);
+
+  await sessions.releaseSession(sessionId);
+});
+
+test('an ordinary reload still reports a clean 200 with no documentChanged noise', async () => {
+  const sessionId = await sessionOn('/plain');
+  const body = payload(await handlers.reload({ sessionId }));
+  assert.equal(body.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.url, `${baseUrl}/plain`);
+  assert.equal(body.title, 'Plain');
+  assert.equal(body.documentChanged, undefined, 'a reload that stayed put must not claim the document changed');
+  assert.equal(body.note, undefined);
+
+  await sessions.releaseSession(sessionId);
+});
+
+test('reload of a real 500 still reports the 500 (no regression on the status reporting reload already had)', async () => {
+  const sessionId = await sessionOn('/broken');
+  const body = payload(await handlers.reload({ sessionId }));
+  assert.equal(
+    served.filter(entry => entry.path === '/broken').at(-1)?.status,
+    500,
+    'the server must really have answered 500'
+  );
+  assert.equal(body.status, 500);
+  assert.equal(body.ok, false);
+  assert.equal(body.documentChanged, undefined, 'the server answered 500 directly, so nothing moved itself');
+
+  await sessions.releaseSession(sessionId);
+});
+
+// ---------------------------------------------------------------------------
 // Finding 9: a back step that moves the tab forward is not a back step.
 // ---------------------------------------------------------------------------
 
@@ -604,3 +751,47 @@ test('navigate_back with nothing behind it still reports navigated: false with a
 
   await sessions.releaseSession(sessionId);
 });
+
+test('navigate_forward bounced backward by a popstate guard reports navigated: false', async () => {
+  const sessionId = await sessionOn('/fwdguard');
+  for (const hash of ['#a', '#b', '#c']) {
+    await evaluate(sessionId, `history.pushState({}, '', '${hash}')`);
+  }
+  // A clean back step first, so there is a real forward entry to step to.
+  const back = payload(await handlers.navigate_back({ sessionId }));
+  assert.equal(back.navigated, true, 'the setup back step must itself be clean, or this test proves nothing');
+  assert.equal(back.url, `${baseUrl}/fwdguard#b`);
+
+  // Arm the guard for the forward step only.
+  await evaluate(sessionId, 'window.__guard = true');
+  const before = await realHistory(sessionId);
+  const previousUrl = await evaluate<string>(sessionId, 'location.href');
+
+  const body = payload(await handlers.navigate_forward({ sessionId }));
+
+  // Oracle: Chromium's own history index through raw CDP, plus the live
+  // document. Neither comes from the tool under test.
+  const afterHistory = await realHistory(sessionId);
+  const liveUrl = await evaluate<string>(sessionId, 'location.href');
+  assert.equal(await evaluate<number>(sessionId, 'window.__bounced'), 1, 'the guard must actually have fired');
+  assert.ok(
+    afterHistory.index < before.index,
+    `the fixture must really bounce the tab backward: index went ${before.index} to ${afterHistory.index}`
+  );
+  assert.notEqual(liveUrl, previousUrl, 'the URL really did change, which is what used to make this read as a clean step');
+  assert.equal(liveUrl, `${baseUrl}/fwdguard#a`);
+
+  assert.equal(
+    body.navigated,
+    false,
+    'a forward step that moved the tab BACKWARD in Chromium\'s own history is not a successful forward step'
+  );
+  assert.equal(body.url, liveUrl, 'the payload must still say where the tab really ended up');
+  assert.equal(body.previousHistoryIndex, before.index);
+  assert.equal(body.historyIndex, afterHistory.index);
+  assert.equal(typeof body.note, 'string');
+  assert.match(String(body.note), /back|guard|intercept|blocked|wrong way/i);
+
+  await sessions.releaseSession(sessionId);
+});
+
