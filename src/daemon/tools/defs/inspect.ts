@@ -539,6 +539,47 @@ async function frameSelectorPrefix(page: Page, frame: Frame): Promise<string | u
   return segments.join('');
 }
 
+/** The positional frame id (`main`, `main/0`, `main/0/1`) of a live frame, or undefined if it has detached. */
+function frameIdOf(page: Page, frame: Frame): string | undefined {
+  return frameTree(page).find(node => node.frame === frame)?.frameId;
+}
+
+/**
+ * The frame whose document a locator's matches actually live in, asked of a
+ * resolved element rather than assumed from a `frame` argument.
+ *
+ * This is the difference between a selector that works and one that presses
+ * the wrong button. A Playwright selector can cross a frame boundary on its
+ * own, through the `>> internal:control=enter-frame >>` chunk that
+ * list_frames hands out as a selectorPrefix, so which document a match
+ * resolves in is a property of the SELECTOR, not of the `frame` argument.
+ * Two shapes defeat any guard that reads the argument alone: a prefix passed
+ * inside the selector with no `frame` argument at all, and a selector that
+ * steps one or more frames deeper than the `frame` argument reaches. Both
+ * were probed on a real page, and both used to come back certified against
+ * one document and then run by the caller against another.
+ *
+ * Chromium resolves one enter-frame chain to exactly one frame (an ambiguous
+ * `iframe >> internal:control=enter-frame` silently takes the first iframe
+ * rather than fanning out across all of them), so one resolved element
+ * settles it for the whole match set. `fallback` is used when nothing
+ * matched, or when no element handle could be taken.
+ */
+async function locatorResolutionFrame(matches: Locator, fallback: Frame): Promise<Frame> {
+  const handle = await matches
+    .first()
+    .elementHandle({ timeout: 1000 })
+    .catch(() => null);
+  if (handle === null) return fallback;
+  try {
+    return (await handle.ownerFrame()) ?? fallback;
+  } catch {
+    return fallback;
+  } finally {
+    await handle.dispose().catch(() => {});
+  }
+}
+
 interface CdpNode {
   nodeId: number;
   attributes?: string[];
@@ -1636,6 +1677,13 @@ export const inspectTools = defineTools({
       'stored, because harborage keeps no per-session state. The consequence is worth planning around: they ' +
       'shift when the page adds or removes an iframe, so read them again after a navigation rather than caching ' +
       'one. ' +
+      'A prefix is safe to paste in front of a selector you pass to find as well, and find will tell you where it ' +
+      'landed: its "resolvedFrame" is read back off the matched element rather than assumed, and the selectors it ' +
+      'returns are re-qualified from the main document, so they already carry the whole chain and must NOT be ' +
+      'prefixed a second time. Two prefixes in a row try to enter a frame twice and match nothing. ' +
+      'One trap worth knowing about the raw prefix form: "iframe >> internal:control=enter-frame" with several ' +
+      'iframes in the document silently enters the FIRST one rather than complaining, which is why the prefixes ' +
+      'here always pin an explicit "nth=". Keep the nth when you paste one. ' +
       'What it does NOT do: it does not reach into shadow DOM (Playwright selectors already pierce open shadow ' +
       'roots on their own, so no prefix is needed there), and a frame that is still loading may report ' +
       'about:blank. A cross-origin frame is listed and reachable the same way as a same-origin one, but its ' +
@@ -1678,10 +1726,22 @@ export const inspectTools = defineTools({
       'resolvesToTarget (whether one of them is the element described here) and unique (both, exactly once). ' +
       'READ resolvesToTarget BEFORE USING A SELECTOR: false means it points somewhere else, or nowhere. That ' +
       'happens for an element inside a shadow root, which Playwright finds but a CSS path cannot reach, and the ' +
-      'result carries a note whenever it does. When frame is set and the owning iframe element itself could not ' +
-      'be read (for instance because the iframe sits inside a shadow root), no working selector can be composed ' +
-      'at all: every result comes back with selector null and a top-level frameSelectorUnavailable explaining why, ' +
-      'rather than a selector that looks fine but actually runs in the wrong document. Search by ' +
+      'result carries a note whenever it does. ' +
+      'FRAMES: every selector returned is absolute from the MAIN document, already carrying whatever ' +
+      '">> internal:control=enter-frame >>" chain is needed to reach the element, so hand it to click or fill as ' +
+      'it is and never prefix it a second time. How the search reached the frame does not matter: the frame ' +
+      'argument, a selectorPrefix from list_frames pasted inside the selector, or a selector that steps several ' +
+      'frames deeper than either. "resolvedFrame" reports the frame id the matches ACTUALLY resolved in, read ' +
+      'back off the element itself rather than assumed from the frame argument, and a "frameNote" appears ' +
+      'whenever that is not the frame you asked about, which is what a selector crossing a boundary of its own ' +
+      'looks like. This matters because resolvesToTarget is checked in the document the matches resolved in, so a ' +
+      'selector certified in one document and run by the caller in another certifies nothing: that is how a ' +
+      '"Confirm payment" button inside an iframe used to come back as a bare path that pressed "Delete account" ' +
+      'in the page behind it. When the owning iframe element cannot be read at all (for instance because the ' +
+      'iframe sits inside a shadow root), no working selector can be composed: every result comes back with ' +
+      'selector null and a top-level frameSelectorUnavailable explaining why, rather than a selector that looks ' +
+      'fine but actually runs in the wrong document. Reach those elements with evaluate, snapshot, computed_style ' +
+      'or element_box and a frame id instead. Search by ' +
       'visible text, by ARIA role and accessible name, by test id, or by a raw selector, and combine a raw ' +
       'selector with the others to scope the search to part of the page. ' +
       'Each result also carries the element\'s tag, trimmed text, key attributes, box, and whether it is visible ' +
@@ -1699,8 +1759,10 @@ export const inspectTools = defineTools({
         .string()
         .optional()
         .describe(
-          'Frame id from list_frames to search inside. Returned selectors come back already carrying that ' +
-            'frame\'s prefix, so they work with click and fill as they are.'
+          'Frame id from list_frames to search inside. Returned selectors come back already carrying the prefix ' +
+            'for whichever frame the matches really landed in, so they work with click and fill as they are. ' +
+            'Optional even for a frame: a selectorPrefix pasted inside "selector" reaches the same place, and ' +
+            'either way "resolvedFrame" reports where the search actually ended up.'
         ),
       selector: z
         .string()
@@ -1751,25 +1813,6 @@ export const inspectTools = defineTools({
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
       const frame = resolveFrame(target.page, args.frame);
       const root: Page | Frame = frame ?? target.page;
-      // frameSelectorPrefix returns undefined when the owning iframe element
-      // could not be addressed (list_frames hits the same case, and reports
-      // it as selectorPrefixUnavailable rather than guessing). The most
-      // common cause is an iframe living inside a shadow root: the segment
-      // builder indexes it with document.getElementsByTagName, which does
-      // not pierce shadow roots. Falling back to '' here used to be silent:
-      // a selector meant to enter a frame would come back with no prefix at
-      // all, and click would then run it against the MAIN document instead.
-      // Probed with a shadow-hosted iframe holding "Confirm payment" and the
-      // main page holding "Delete account": find returned a bare
-      // "html > body > button" with resolvesToTarget true (that flag was
-      // only ever checked inside the frame's own document), and clicking it
-      // pressed Delete account. resolvesToTarget must never certify a
-      // selector that was verified in a different document from the one it
-      // will actually run in, so when the prefix is unavailable no usable
-      // selector is emitted at all: see frameSelectorUnavailable below.
-      const framePrefix = frame ? await frameSelectorPrefix(target.page, frame) : '';
-      const frameSelectorUnavailable = frame !== undefined && framePrefix === undefined;
-      const prefix = framePrefix ?? '';
       const limit = args.limit ?? defaultMatchLimit;
       const exact = args.exact ?? false;
 
@@ -1789,6 +1832,51 @@ export const inspectTools = defineTools({
       if (args.visibleOnly !== false) matches = matches.filter({ visible: true });
 
       const matched = await matches.count();
+
+      // WHICH DOCUMENT WILL THE RETURNED SELECTOR RUN IN? Everything below
+      // hangs off answering that honestly, because resolvesToTarget is
+      // computed by evaluateAll, which runs in whichever document the matches
+      // resolved in, while the selector it certifies is run by the caller
+      // wherever the emitted prefix points. When those two documents are not
+      // the same, resolvesToTarget certifies nothing.
+      //
+      // The `frame` ARGUMENT is not a safe answer to that question. A
+      // Playwright selector crosses frames on its own through
+      // ">> internal:control=enter-frame >>", which is exactly what
+      // list_frames tells agents to paste in front of a selector, so the
+      // matches can end up one or more frames away from wherever the argument
+      // pointed. Probed on a real page: `find` with the prefix inside the
+      // selector and no `frame` argument returned a bare
+      // "html > body > button", certified inside the iframe, and the
+      // follow-up click pressed "Delete account" in the main document. The
+      // same thing happened with `frame` set and the selector reaching one
+      // frame deeper than the prefix. So the frame is read back off a
+      // resolved element instead, and the prefix is rebuilt from THAT frame,
+      // which makes the emitted selector absolute from the main document and
+      // unambiguous (an ambiguous "iframe >> internal:control=enter-frame"
+      // silently takes the first iframe; the rebuilt prefix pins the index).
+      const searchRoot = frame ?? target.page.mainFrame();
+      const resolutionFrame = matched === 0 ? searchRoot : await locatorResolutionFrame(matches, searchRoot);
+      const resolvedFrame = frameIdOf(target.page, resolutionFrame);
+      // frameSelectorPrefix returns undefined when the owning iframe element
+      // could not be addressed (list_frames hits the same case, and reports
+      // it as selectorPrefixUnavailable rather than guessing). The most
+      // common cause is an iframe living inside a shadow root: the segment
+      // builder indexes it with document.getElementsByTagName, which does
+      // not pierce shadow roots. Falling back to '' here used to be silent:
+      // a selector meant to enter a frame came back with no prefix at all,
+      // and click then ran it against the MAIN document instead. When the
+      // prefix is unavailable no usable selector is emitted at all: see
+      // frameSelectorUnavailable below.
+      const framePrefix = await frameSelectorPrefix(target.page, resolutionFrame);
+      const frameSelectorUnavailable = framePrefix === undefined;
+      const prefix = framePrefix ?? '';
+      // The matches came from a different frame than the caller asked about,
+      // which is worth saying out loud: the caller's own selector took them
+      // there, and the selectors handed back are re-qualified from the main
+      // document rather than being the caller's prefix plus a path.
+      const crossedFrame = resolvedFrame !== (args.frame ?? 'main');
+
       const elements =
         matched === 0
           ? []
@@ -1935,25 +2023,35 @@ export const inspectTools = defineTools({
         return text({
           pageId: target.pageId,
           ...(args.frame !== undefined ? { frame: args.frame } : {}),
+          ...(resolvedFrame !== undefined ? { resolvedFrame } : {}),
           matched,
           returned: elements.length,
           frameSelectorUnavailable:
-            'the owning iframe element for this frame could not be read (often because it sits inside a shadow ' +
-            'root), so no selector can be built that reaches into it from outside. Every selector below is null ' +
-            'for that reason: do not substitute a bare or empty prefix, since that would resolve in the main ' +
-            'document instead of this frame and click would press whatever it happens to hit there. Use evaluate, ' +
-            'snapshot, computed_style or element_box with frame set to this id instead, which take a frame id ' +
-            'directly and need no prefix.',
+            `these elements resolved inside frame ${JSON.stringify(resolvedFrame ?? 'unknown')}, and the owning ` +
+            'iframe element for it could not be read (often because it sits inside a shadow root), so no selector ' +
+            'can be built that reaches into it from outside. Every selector below is null for that reason: do not ' +
+            'substitute a bare or empty prefix, since that would resolve in the main document instead of this ' +
+            'frame and click would press whatever it happens to hit there. Use evaluate, snapshot, computed_style ' +
+            'or element_box with frame set to this id instead, which take a frame id directly and need no prefix.',
           elements: elements.map(element => ({ ...element, selector: null, resolvesToTarget: false }))
         });
       }
 
       const unusable = elements.filter(element => !element.resolvesToTarget);
+      const crossedFrameNote = crossedFrame
+        ? `These elements resolved inside frame ${JSON.stringify(resolvedFrame ?? 'unknown')}, not ` +
+          `${JSON.stringify(args.frame ?? 'main')}: the selector you passed crossed a frame boundary of its own ` +
+          '(that is what ">> internal:control=enter-frame >>" does). Every selector below has been re-qualified ' +
+          'from the MAIN document to reach that frame, so hand them to click or fill as they are rather than ' +
+          'prefixing them again, which would try to enter a frame twice.'
+        : undefined;
       return text({
         pageId: target.pageId,
         ...(args.frame !== undefined ? { frame: args.frame } : {}),
+        ...(resolvedFrame !== undefined ? { resolvedFrame } : {}),
         matched,
         returned: elements.length,
+        ...(crossedFrameNote !== undefined ? { frameNote: crossedFrameNote } : {}),
         ...(unusable.length > 0
           ? {
               note:
