@@ -258,11 +258,43 @@ HARBORAGE_PORT=4699 HARBORAGE_DEBUG_PORT=4700 HARBORAGE_STATE_DIR=/tmp/harborage
   session is live. Both counts matter: checking only the registry used to let
   the daemon exit during a parallel fan-out and take every in-flight session
   with it.
+- **A daemon can be tied to another process** with `HARBORAGE_OWNER_PID`, in
+  which case it shuts down once that process is gone, live sessions and all.
+  Nothing sets this in normal use, and the client wrapper explicitly strips it
+  before spawning the shared daemon: the shared daemon has to outlive the
+  wrapper that started it. It exists for tests, which own the daemons they
+  start, and where an `after()` hook that never runs used to leave a daemon
+  holding a Chromium for the full fifteen-minute idle timeout.
 - **The daemon log** (`~/.harborage/daemon.log`) carries one timestamped,
   structured line per event: daemon start and stop, session create, release
   and reap with ids and remaining counts, and every shutdown decision
   including the ones that decline, with both counts. When a subagent reports
   a dead session, this is where the answer is.
+
+## Finding and clearing what harborage left behind
+
+```sh
+harborage gc          # report only, changes nothing
+harborage gc --kill   # also reap the orphans, then verify by PID that they are gone
+```
+
+`gc` answers the question you have when a machine is unexpectedly hot: which
+of these processes are harborage's, and which of those should not still be
+running? It reports the daemon serving the port, the browser processes under
+it, and anything harborage started whose daemon has since died.
+
+Only the last group is ever killed. What makes that safe is where the
+knowledge comes from: the daemon writes what it starts into
+`~/.harborage/owned-processes.json`, recording each PID together with the
+process start time it had at the moment it was recorded. Every PID is checked
+against both before anything is acted on, so a number the OS has since handed
+to something else is dropped rather than signalled.
+
+`gc` never matches on process names or command lines. A headless Chromium
+whose command line looks like harborage's is far more likely to be your own
+Playwright run, and killing it because it looked similar would be worse than
+any leak. It also never touches a daemon that is answering `/health`, because
+that daemon is in use, quite possibly by someone else's agents.
 
 ## Picking up changes to harborage itself
 

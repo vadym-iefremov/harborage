@@ -3,7 +3,7 @@ import { after, test } from 'node:test';
 
 import { getProcessStartTime } from '../src/shared/processInfo.js';
 import { readRegistry, registerSelf } from '../src/shared/registry.js';
-import { isDaemonHealthy, makeTestConfig, cleanupTempDirs, spawnDaemonProcess, spawnInertProcess, waitFor, type SpawnedProcess } from './helpers.js';
+import { isDaemonHealthy, killSpawnedProcesses, makeTestConfig, cleanupTempDirs, spawnDaemonProcess, spawnInertProcess, waitFor, type SpawnedProcess } from './helpers.js';
 
 const liveProcs: SpawnedProcess[] = [];
 function track(p: SpawnedProcess): SpawnedProcess {
@@ -15,6 +15,12 @@ after(async () => {
   for (const p of liveProcs.splice(0)) {
     p.kill();
   }
+  // Belt and braces over the loop above: kills anything this file spawned and
+  // did not hand to `track`, including a fixture an assertion failure jumped
+  // over. That exact gap is what left inert fixtures running under PID 1 for
+  // forty minutes at a time, and it is not a gap a reader can see by looking
+  // at any single test.
+  killSpawnedProcesses();
   cleanupTempDirs();
 });
 
@@ -50,7 +56,7 @@ test('a stale registry entry (dead PID) gets pruned, and the daemon shuts down o
   const config = await makeTestConfig({ sweepIntervalMs: 150, shutdownGraceMs: 100 });
 
   // Register a client whose process is already dead before the daemon ever starts.
-  const ghost = spawnInertProcess();
+  const ghost = track(spawnInertProcess());
   const ghostStartedAt = await getProcessStartTime(ghost.pid);
   assert.ok(ghostStartedAt);
   ghost.kill();
@@ -79,7 +85,7 @@ test('a live, correctly-registered client keeps the daemon alive; removing it le
   // inside the daemon's 150ms sweep interval, and losing that race exits the
   // daemon on an empty registry, which shows up here as the assertion below
   // failing for a reason that has nothing to do with what it is testing.
-  const client = spawnInertProcess();
+  const client = track(spawnInertProcess());
   const startedAt = await getProcessStartTime(client.pid);
   assert.ok(startedAt);
   await registerSelf(config.registryPath, client.pid, startedAt!);

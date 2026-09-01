@@ -170,18 +170,86 @@ whole command, not part of it. Two details are load-bearing:
   afterwards. Never `pkill -f`: a pattern matches other people's processes,
   which is the exact accident the file exists to prevent.
 
-Two failure modes worth recognising rather than rediscovering:
+A suite that hangs rather than fails used to be the confusing case here: a
+run whose Chromium never came up sat at 0% CPU indefinitely, with no browser
+children and no timeout ever firing, so it looked identical to a slow run.
+Two runs reached fifty-five minutes that way. `--test-timeout` and
+`--test-force-exit` in the `test` script now bound it, so a hang surfaces as
+a failure instead. If you ever see an unbounded hang again, check those flags
+are still there before looking anywhere else.
 
-- **A suite that loses its browser never times out.** A run whose Chromium
-  never comes up sits at 0% CPU indefinitely with no browser children and no
-  timeout ever firing, so it looks identical to a slow run. If a suite has
-  been going for minutes rather than seconds, check for a process at 0% CPU
-  and kill it by PID.
-- **The git stash stack is shared by every worktree**, because they share one
-  `.git`. A bare `git stash pop` in one worktree can pop another worktree's
-  work into your tree, and the symptom looks like a bad merge rather than a
-  stash collision. For before-and-after comparisons prefer
-  `git diff -- src > /tmp/patch`, then `git checkout`, then `git apply`.
+### Anything a test spawns must be able to clean up after itself
+
+The suite starts real OS processes: daemons, browsers, and inert stand-in
+clients. Spawn them through `spawnDaemonProcess` and `spawnInertProcess` in
+`test/helpers.ts` and nothing else. Those helpers track what they start and
+kill it from a `process.on('exit')` handler, so cleanup no longer depends on
+an `after()` hook that a thrown assertion may never reach.
+
+That is not a hypothetical. Two fixtures once sat between a spawn and a kill
+with load-sensitive health checks in between. On a loaded machine those checks
+lost, the kill was skipped, and the surviving child's handle held its test
+file's event loop open: the file never exited, the runner waited on it, and
+`npm test` never returned. Two runs on one machine reached fifty-five minutes
+at 0% CPU that way, and ten pinned processes plus six orphaned fixtures were
+alive at once, on a laptop that overheated twice.
+
+Three things now stop that, and each covers a case the others cannot:
+
+- **The helpers track and kill what they spawn**, so a skipped `kill()` costs
+  nothing.
+- **The inert fixture watches its own parent** and exits when it is gone. This
+  is the only one that survives the parent being SIGKILLed, where no cleanup
+  code in the parent runs at all.
+- **`--test-force-exit` and `--test-timeout` in the `test` script.**
+  `--test-timeout` bounds a test that never returns; `--test-force-exit`
+  bounds a run whose tests have all finished but whose event loop will not
+  drain, which no timeout can catch because at that point no test is running.
+  Do not remove either. `test/self-reaping.test.ts` fails if you do.
+
+If a test genuinely needs a daemon to outlive it, say so explicitly with
+`HARBORAGE_OWNER_PID: ''`, rather than by not cleaning up.
+
+### Before removing a git worktree, check nothing is running inside it
+
+This has already gone wrong once here: two worktrees were deleted while test
+suites were still running inside them, which left those runs unrecoverable and
+their processes stranded. `git worktree list` does not tell you this, and
+neither does the branch being merged.
+
+```sh
+lsof -a -d cwd -- "$WORKTREE" 2>/dev/null   # anything whose working directory is in there
+pgrep -fl "$WORKTREE"                       # anything launched from a path inside it
+```
+
+Only remove the worktree if both come back empty. Never kill what they find in
+order to clear the way, and never use a broad `pkill`: those are somebody
+else's running tests.
+
+### Every worktree shares one `.git`, so treat git state as shared too
+
+Worktrees give you a private working directory. They do not give you a private
+stash stack, index or set of refs. All of that lives in the one `.git` and is
+visible to, and writable by, every worktree at once.
+
+The stash is the sharp edge. `git stash pop` and `git stash apply` take
+whatever is on TOP of the shared stack, which may be a different worktree's
+work in progress. This was caught live here, not theorised: after a tool
+timeout stashed one agent's changes, `git stash list` showed another branch's
+entry sitting above it, and a bare pop would have dropped that other branch's
+work into an unrelated tree.
+
+- **Prefer not to stash.** `git diff > /tmp/my.patch` and `git apply`, or a
+  work-in-progress commit, are private to you. A checkpoint commit on your own
+  branch costs nothing and can be amended or squashed later.
+- **If you must stash, never pop bare.** Run `git stash list`, find your own
+  entry by its branch label, and pop it by explicit index.
+- **Leave entries that are not yours alone**, and say so in your report.
+
+The rule generalises: address shared state explicitly and by identity, never
+by "the most recent one" or "the top of the stack". It is the same discipline
+as reaping a process by its exact PID rather than by a name that matches, and
+it fails the same way when ignored.
 
 ## Pull requests
 

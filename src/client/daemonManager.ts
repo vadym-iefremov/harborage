@@ -21,14 +21,27 @@ export async function checkHealth(config: Config, timeoutMs = 1500): Promise<boo
   }
 }
 
-/** Spawns the daemon as a detached background process, its own stdio redirected to the daemon log file. */
+/**
+ * Spawns the daemon as a detached background process, its own stdio
+ * redirected to the daemon log file.
+ *
+ * `HARBORAGE_OWNER_PID` is deliberately stripped from the environment handed
+ * on. A daemon started this way is the shared, machine-wide one and it must
+ * outlive the wrapper that happened to start it: wrappers come and go with
+ * each Claude Code session while browser sessions do not, and that
+ * independence is the point of the pool. Passing the variable through would
+ * tie this daemon's life to whichever wrapper won the race to spawn it, and
+ * take every other agent's live session down with that wrapper. See
+ * `ownerPid` in `src/shared/config.ts`.
+ */
 export function spawnDaemon(config: Config): void {
   mkdirSync(config.stateDir, { recursive: true });
   const logFd = openSync(config.daemonLogPath, 'a');
+  const { HARBORAGE_OWNER_PID: _ownerPid, ...daemonEnv } = process.env;
   const child = spawn(process.execPath, [DAEMON_ENTRY], {
     detached: true,
     stdio: ['ignore', logFd, logFd],
-    env: process.env
+    env: daemonEnv
   });
   child.unref();
 }

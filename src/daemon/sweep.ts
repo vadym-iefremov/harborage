@@ -1,7 +1,23 @@
 import { errorFields, type Logger } from '../shared/logger.js';
+import { getProcessStartTime } from '../shared/processInfo.js';
 import { pruneRegistryFile, type RegistryEntry } from '../shared/registry.js';
 import { cleanScreenshotCache } from './screenshotCache.js';
 import type { SessionStore } from './sessions.js';
+
+/**
+ * A process whose death should take the daemon down with it, identified by
+ * PID and by the `ps -o lstart=` value that PID had when the daemon started.
+ *
+ * Both halves are required, for the reason the client registry documents at
+ * length: a PID is not an identity. Watching a bare PID would mean that once
+ * the owner died and the OS handed its number out again, the daemon would see
+ * a live process there and conclude its owner had come back, staying up
+ * forever. That is exactly the failure the watch exists to prevent.
+ */
+export interface DaemonOwner {
+  pid: number;
+  startedAt: string;
+}
 
 export interface SweepDeps {
   sessions: SessionStore;
@@ -19,6 +35,17 @@ export interface SweepDeps {
    * past the grace period AND no browser sessions are left to lose.
    */
   onEmptyRegistryShutdown: () => Promise<void>;
+  /**
+   * The process this daemon belongs to, if any. Absent (the production
+   * default) means the daemon's lifetime is nobody's but its own and this
+   * whole check is skipped. See `ownerPid` in `src/shared/config.ts`.
+   */
+  owner?: DaemonOwner | null;
+  /**
+   * Called (and awaited) once, the moment `owner` is proven gone. Optional
+   * only so that a caller passing no `owner` does not have to invent one.
+   */
+  onOwnerGoneShutdown?: () => Promise<void>;
   /** Where this pass records what it did. Required: an unobservable sweep is what made finding 1 invisible. */
   logger: Logger;
 }
@@ -39,6 +66,11 @@ export interface SweepOutcome {
   liveSessions: number;
   removedScreenshots: string[];
   triggeredShutdown: boolean;
+  /**
+   * Which gate ended the daemon, when one did. `owner-gone` short-circuits
+   * the pass, so its outcome carries no reaping or pruning results.
+   */
+  shutdownReason?: 'registry-empty' | 'owner-gone';
 }
 
 /**
@@ -79,6 +111,45 @@ export interface SweepOutcome {
  * PNG could not be deleted. It is caught and logged instead.
  */
 export async function runSweepOnce(deps: SweepDeps): Promise<SweepOutcome> {
+  // First, and short-circuiting, because it is the one condition under which
+  // none of the rest of the pass has a point. If the process this daemon
+  // belongs to is gone, there is nobody left to reap sessions on behalf of,
+  // and a live session must NOT veto this shutdown the way it rightly vetoes
+  // the registry-empty one. That distinction is the whole reason the check is
+  // here rather than folded into the gate below: a live session means work
+  // somebody is still waiting for, and when the owner is dead nobody is.
+  // Skipping it left a stranded test daemon sitting on a Chromium for the full
+  // fifteen-minute idle timeout.
+  if (deps.owner) {
+    const liveStartedAt = await getProcessStartTime(deps.owner.pid);
+    if (liveStartedAt === null || liveStartedAt !== deps.owner.startedAt) {
+      deps.logger.log('sweep.shutdown', {
+        reason: 'owner-gone',
+        ownerPid: deps.owner.pid,
+        // Says which of the two ways the owner can be gone actually happened,
+        // because they mean different things to whoever reads this line: the
+        // process exited, or its PID now belongs to something else entirely.
+        detail: liveStartedAt === null ? 'process-exited' : 'pid-reused',
+        sessions: deps.sessions.liveOrPendingCount()
+      });
+      await deps.onOwnerGoneShutdown?.();
+      return {
+        reapedSessions: [],
+        prunedClients: [],
+        remainingClients: 0,
+        // Zero because this path short-circuits BEFORE the registry is read,
+        // so no client's liveness was checked, let alone left unresolved. It
+        // is the honest value here rather than a placeholder: an unresolved
+        // count above zero would claim a check that never ran.
+        unresolvedClients: 0,
+        liveSessions: 0,
+        removedScreenshots: [],
+        triggeredShutdown: true,
+        shutdownReason: 'owner-gone'
+      };
+    }
+  }
+
   const reapedSessions = await deps.sessions.reapIdle(deps.idleTimeoutMs);
 
   // Contained on purpose. This is the least important of the three jobs and
@@ -161,7 +232,8 @@ export async function runSweepOnce(deps: SweepDeps): Promise<SweepOutcome> {
     unresolvedClients: unresolved.length,
     liveSessions,
     removedScreenshots,
-    triggeredShutdown
+    triggeredShutdown,
+    ...(triggeredShutdown ? { shutdownReason: 'registry-empty' as const } : {})
   };
 }
 
