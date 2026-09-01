@@ -155,11 +155,31 @@ function createDaemonConnection(config: Config): DaemonConnection {
 }
 
 /**
- * The MCP SDK's own default (`DEFAULT_REQUEST_TIMEOUT_MSEC`), kept as an
- * explicit floor: a tool with no `timeoutMs`, or one under a minute, is
- * timed exactly as it always was, unaffected by anything below.
+ * The floor and ceiling `requestTimeoutFor` clamps a derived transport
+ * timeout between. Bundled into one type because the two are only ever
+ * threaded together, from `Config` down through `runWrapper`,
+ * `buildStdioServer` and `registerForwardingTool` to `forwardTool`.
  */
-export const minRequestTimeoutMs = 60_000;
+export interface RequestTimeoutBounds {
+  /**
+   * The MCP SDK's own default (`DEFAULT_REQUEST_TIMEOUT_MSEC`), kept as the
+   * floor's own default so a tool with no `timeoutMs`, or one under a
+   * minute, is timed exactly as it always was: an ordinary call must not
+   * get a tighter transport bound than it used to have. Configurable
+   * (`HARBORAGE_REQUEST_TIMEOUT_FLOOR_MS`, see `src/shared/config.ts`)
+   * purely so a test can shrink it, and with it the point where
+   * `requestTimeoutFor` switches from "the floor" to "timeoutMs plus
+   * margin", without genuinely waiting past 60 real seconds to observe the
+   * switch.
+   */
+  floorMs: number;
+  /**
+   * The longest a forwarded call may run before the wrapper gives up on the
+   * daemon regardless of `timeoutMs`. See `requestTimeoutCeilingMs` in
+   * `src/shared/config.ts` for why it defaults to `maxInFlightAgeMs`.
+   */
+  ceilingMs: number;
+}
 
 /**
  * Headroom given to a request beyond the `timeoutMs` a caller passed, so the
@@ -192,13 +212,13 @@ export const requestTimeoutMarginMs = 10_000;
  * description in `src/daemon/tools/defs/inspect.ts`), which the wrapper
  * cannot honor literally without risking pinning its one connection to the
  * daemon indefinitely on a single wedged call, so "forever" here means "for
- * as long as `ceilingMs` allows" rather than truly unbounded.
+ * as long as `bounds.ceilingMs` allows" rather than truly unbounded.
  */
-export function requestTimeoutFor(args: Record<string, unknown>, ceilingMs: number): number {
+export function requestTimeoutFor(args: Record<string, unknown>, bounds: RequestTimeoutBounds): number {
   const requested = typeof args.timeoutMs === 'number' ? args.timeoutMs : undefined;
-  if (requested === undefined) return minRequestTimeoutMs;
-  if (requested === 0) return ceilingMs;
-  return Math.min(Math.max(requested + requestTimeoutMarginMs, minRequestTimeoutMs), ceilingMs);
+  if (requested === undefined) return bounds.floorMs;
+  if (requested === 0) return bounds.ceilingMs;
+  return Math.min(Math.max(requested + requestTimeoutMarginMs, bounds.floorMs), bounds.ceilingMs);
 }
 
 /**
@@ -221,11 +241,11 @@ export function requestTimeoutFor(args: Record<string, unknown>, ceilingMs: numb
 function forwardTool<T extends ToolName>(
   name: T,
   ensureReady: () => Promise<Client>,
-  requestTimeoutCeilingMs: number,
+  requestTimeoutBounds: RequestTimeoutBounds,
   invalidate?: (stale: Client) => void
 ) {
   return async (args: Record<string, unknown>) => {
-    const timeout = requestTimeoutFor(args, requestTimeoutCeilingMs);
+    const timeout = requestTimeoutFor(args, requestTimeoutBounds);
     const client = await ensureReady();
     try {
       return (await client.callTool({ name, arguments: args }, { timeout })) as never;
@@ -265,13 +285,13 @@ function registerForwardingTool(
   name: ToolName,
   def: ToolDef,
   ensureReady: () => Promise<Client>,
-  requestTimeoutCeilingMs: number,
+  requestTimeoutBounds: RequestTimeoutBounds,
   invalidate?: (stale: Client) => void
 ): void {
   server.registerTool(
     name,
     { description: def.description, inputSchema: def.inputSchema },
-    forwardTool(name, ensureReady, requestTimeoutCeilingMs, invalidate)
+    forwardTool(name, ensureReady, requestTimeoutBounds, invalidate)
   );
 }
 
@@ -286,13 +306,13 @@ function registerForwardingTool(
  */
 export function buildStdioServer(
   ensureReady: () => Promise<Client>,
-  requestTimeoutCeilingMs: number = 10 * 60 * 1000,
+  requestTimeoutBounds: RequestTimeoutBounds = { floorMs: 60_000, ceilingMs: 10 * 60 * 1000 },
   invalidate?: (stale: Client) => void
 ): McpServer {
   const server = new McpServer({ name: 'harborage', version: '0.2.0' });
 
   for (const name of toolNames) {
-    registerForwardingTool(server, name, toolDefs[name], ensureReady, requestTimeoutCeilingMs, invalidate);
+    registerForwardingTool(server, name, toolDefs[name], ensureReady, requestTimeoutBounds, invalidate);
   }
 
   return server;
@@ -308,7 +328,11 @@ export async function runWrapper(): Promise<void> {
     console.error('[harborage] background daemon readiness check failed (will retry on next tool call):', err);
   });
 
-  serveStdio(() => buildStdioServer(ensureReady, config.requestTimeoutCeilingMs, invalidate));
+  const requestTimeoutBounds: RequestTimeoutBounds = {
+    floorMs: config.requestTimeoutFloorMs,
+    ceilingMs: config.requestTimeoutCeilingMs
+  };
+  serveStdio(() => buildStdioServer(ensureReady, requestTimeoutBounds, invalidate));
   console.error(`[harborage] client wrapper up (pid ${process.pid}), talking to daemon at http://${config.host}:${config.port}`);
 
   let cleaningUp = false;

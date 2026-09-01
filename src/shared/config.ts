@@ -83,6 +83,20 @@ export interface Config {
    * transport side has nothing left to wait for anyway.
    */
   requestTimeoutCeilingMs: number;
+  /**
+   * The shortest transport timeout the client wrapper will ever give a
+   * forwarded call, matching the MCP SDK's own `DEFAULT_REQUEST_TIMEOUT_MSEC`
+   * by default so an ordinary call (no `timeoutMs`, or one under a minute)
+   * gets exactly the bound it always had, not a tighter one.
+   *
+   * Configurable purely for testing: proving that a `timeoutMs` above the
+   * floor gets `timeoutMs` plus a margin, rather than being clamped down to
+   * the floor, otherwise means a test genuinely waiting past sixty real
+   * seconds to observe the switch. Shrink this and the switch happens at a
+   * shrunk point too, so the same assertion holds in under two seconds. Never
+   * touched in production, where the default is the whole point.
+   */
+  requestTimeoutFloorMs: number;
   /** How often the daemon's single in-process timer sweeps sessions + registry. */
   sweepIntervalMs: number;
   /**
@@ -166,6 +180,7 @@ export function loadConfig(): Config {
     escalatedIdleTimeoutMs: num('HARBORAGE_ESCALATED_IDLE_TIMEOUT_MS', 60 * 60 * 1000),
     maxInFlightAgeMs: num('HARBORAGE_MAX_IN_FLIGHT_AGE_MS', 10 * 60 * 1000),
     requestTimeoutCeilingMs: num('HARBORAGE_REQUEST_TIMEOUT_CEILING_MS', 10 * 60 * 1000),
+    requestTimeoutFloorMs: num('HARBORAGE_REQUEST_TIMEOUT_FLOOR_MS', 60 * 1000),
     sweepIntervalMs: num('HARBORAGE_SWEEP_INTERVAL_MS', 60 * 1000),
     shutdownGraceMs: num('HARBORAGE_SHUTDOWN_GRACE_MS', 10 * 1000),
     stateDir,
