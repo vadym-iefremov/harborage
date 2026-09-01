@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import type { CDPSession, Page, Route } from 'playwright';
 import * as z from 'zod/v4';
 
+import { compileUrlPattern } from '../../networkMatch.js';
 import type { ResolvedTarget } from '../../sessions.js';
 import { defineTool, defineTools, text, type ToolContext } from '../types.js';
 import { sessionId } from './common.js';
@@ -49,7 +50,13 @@ const urlMatches = z
   .optional()
   .describe(
     'Intercept URLs matching this JavaScript regular expression source, e.g. "/api/.*/save$". Same meaning as ' +
-      'list_network_requests\' urlMatches. Mutually exclusive with urlGlob and urlIncludes.'
+      'list_network_requests\' urlMatches. Mutually exclusive with urlGlob and urlIncludes. ' +
+      'A pattern that repeats something already repeatable, such as "(a+)+" or "(a|a)*", is REFUSED with an error ' +
+      'naming this field. Such a pattern can take time exponential in the URL length (measured: "^(a+)+$" is 1ms ' +
+      'against 18 characters and over two minutes against 34), and the match runs uninterruptibly on the event ' +
+      'loop of a daemon every agent on this machine shares. The check is not complete: a pattern it accepts can ' +
+      'still be slow against a URL shaped unlike anything it was probed with, so prefer urlIncludes or urlGlob ' +
+      'when a plain substring or glob will do.'
   );
 
 /** Playwright's own abort reasons. Anything outside this set is rejected by Chromium. */
@@ -545,11 +552,14 @@ export const networkTools = defineTools({
       } else {
         const source = args.urlMatches as string;
         matcher = { kind: 'matches', source };
-        try {
-          pattern = new RegExp(source);
-        } catch (err) {
-          throw new Error(`urlMatches is not a valid regular expression: ${messageOf(err)}`);
-        }
+        // Through the same guard the network FILTERS use, not a bare
+        // `new RegExp`. A route pattern is matched by Playwright's own route
+        // handler, which runs in THIS process on every intercepted request, so
+        // a runaway pattern here stalls the shared daemon exactly the way one
+        // in a capture filter does. compileUrlPattern also reports a source
+        // that does not parse, so the try/catch that used to live here has
+        // moved inside it and the message is unchanged.
+        pattern = compileUrlPattern(source, 'urlMatches');
       }
 
       const detail: Record<string, unknown> =

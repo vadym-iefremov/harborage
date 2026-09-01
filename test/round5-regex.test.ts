@@ -114,6 +114,26 @@ test('the guard does not refuse the URL patterns callers actually write', () => 
   }
 });
 
+test('the guard also refuses the shapes with no nested quantifier at all', () => {
+  // These get past the structural rule entirely and are caught only by the
+  // compile-time probe. Measured unguarded: (a|a)+$ is 76ms at 20 characters,
+  // and (ab|ba|a|b)+c$ is 380ms at 36 characters and 17.2 SECONDS at 44.
+  for (const source of ['(a|a)+$', '(ab|ba|a|b)+c$', 'a*a*a*a*a*a*a*a*a*a*$']) {
+    assert.throws(() => compileNetworkMatch({ urlMatches: source }), /runaway/, `accepted ${source}`);
+  }
+});
+
+test('a documented hole in the guard, recorded rather than implied away', () => {
+  // The probe feeds the pattern one and two character cycles only, so a
+  // pattern whose ambiguity needs a longer cycle passes it. Measured on this
+  // machine: (abc|cab|bca|a|b|c)+z$ takes 16ms against 37 characters of
+  // repeating "abc" and 534ms against 46, and it is ACCEPTED. This test exists
+  // so the limitation is a recorded fact rather than something a reader has to
+  // infer from the absence of a test. If a future guard closes this hole, this
+  // test is the thing that says so out loud, and flipping it is the point.
+  assert.doesNotThrow(() => compileNetworkMatch({ urlMatches: '(abc|cab|bca|a|b|c)+z$' }));
+});
+
 test('a regex that does not parse is still reported as a parse error, not as a runaway', () => {
   assert.throws(() => compileNetworkMatch({ urlMatches: '(' }), /not a valid regular expression/);
 });
