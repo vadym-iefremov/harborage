@@ -210,12 +210,22 @@ function storageBase(
 // ---------------------------------------------------------------------------
 
 /** Identity of one cookie in the jar, which is the triple the browser keys on. */
-function cookieKeyOf(name: string, domain: string, path: string): string {
-  return `${name} ${domain} ${path}`;
+/**
+ * The full identity of a cookie in the jar.
+ *
+ * The partition is part of it, not decoration: a partitioned cookie and an
+ * unpartitioned one sharing a name, domain and path are two different
+ * cookies that the browser sends in different situations. Leaving it out of
+ * the key is the same false pass matching on name alone used to be, one
+ * level further in: installing a partitioned cookie would find the
+ * unpartitioned one already in the jar and report the write as successful.
+ */
+function cookieKeyOf(name: string, domain: string, path: string, partitionKey?: string): string {
+  return `${name} ${domain} ${path} ${partitionKey ?? ''}`;
 }
 
 function cookieKey(cookie: Cookie): string {
-  return cookieKeyOf(cookie.name, cookie.domain, cookie.path);
+  return cookieKeyOf(cookie.name, cookie.domain, cookie.path, (cookie as { partitionKey?: string }).partitionKey);
 }
 
 /**
@@ -233,14 +243,20 @@ function cookieKey(cookie: Cookie): string {
  * domain rejected could be reported present because a same-named cookie for
  * an unrelated domain already sat in the jar.
  */
-function requestedCookieKey(cookie: { name: string; domain?: string; path?: string; url?: string }): string {
+function requestedCookieKey(cookie: {
+  name: string;
+  domain?: string;
+  path?: string;
+  url?: string;
+  partitionKey?: string;
+}): string {
   if (cookie.domain !== undefined && cookie.path !== undefined) {
-    return cookieKeyOf(cookie.name, cookie.domain, cookie.path);
+    return cookieKeyOf(cookie.name, cookie.domain, cookie.path, cookie.partitionKey);
   }
   const parsed = new URL(cookie.url as string);
   const lastSlash = parsed.pathname.lastIndexOf('/');
   const path = lastSlash === -1 ? '/' : parsed.pathname.slice(0, lastSlash + 1) || '/';
-  return cookieKeyOf(cookie.name, parsed.hostname, path);
+  return cookieKeyOf(cookie.name, parsed.hostname, path, cookie.partitionKey);
 }
 
 /**
@@ -352,7 +368,12 @@ export const storageTools = defineTools({
       'reports the cookies as they now exist in the jar, read back, not the request echoed. The read-back matches ' +
       'each requested cookie by its FULL identity, name, domain and path together, not by name alone: cookie names ' +
       'like "session" or "sid" collide across domains constantly, and matching by name alone would report a cookie ' +
-      'as installed just because a same-named cookie for a different domain already sat in the jar.',
+      'as installed just because a same-named cookie for a different domain already sat in the jar. The partition ' +
+      '(partitionKey) is part of that identity too, since a partitioned cookie is a different cookie from an ' +
+      'unpartitioned one with the same name, domain and path. ' +
+      'Whatever get_cookies gives you can be handed straight back here: partitionKey and Chromium\'s companion ' +
+      '_crHasCrossSiteAncestor are both accepted and passed through to the browser unchanged. They used to be ' +
+      'silently stripped, which installed a partitioned cookie as an unpartitioned one and reported success.',
     inputSchema: z.object({
       sessionId,
       cookies: z
@@ -390,7 +411,26 @@ export const storageTools = defineTools({
             sameSite: z
               .enum(['Strict', 'Lax', 'None'])
               .optional()
-              .describe('SameSite policy. "None" requires secure: true, or the browser drops the cookie outright.')
+              .describe('SameSite policy. "None" requires secure: true, or the browser drops the cookie outright.'),
+            partitionKey: z
+              .string()
+              .optional()
+              .describe(
+                'Partition (CHIPS) this cookie belongs to, as the top-level site that was in the address bar when ' +
+                  'it was set, e.g. "https://top.example.com" for a cookie an embedded third party stored while ' +
+                  'that site was open. A partitioned cookie is a DIFFERENT cookie from an unpartitioned one with ' +
+                  'the same name, domain and path, and is only ever sent back under the same top-level site. ' +
+                  'get_cookies reports this, so it is here to make that output installable again.'
+              ),
+            _crHasCrossSiteAncestor: z
+              .boolean()
+              .optional()
+              .describe(
+                'Chromium\'s own companion flag to partitionKey, reported by get_cookies and passed straight back ' +
+                  'to the browser. Named with a leading underscore because it is Chromium\'s field, not a stable ' +
+                  'part of any cookie standard: accepted so a get_cookies result round-trips verbatim, rather than ' +
+                  'because it is worth setting by hand.'
+              )
           })
         )
         .min(1)
