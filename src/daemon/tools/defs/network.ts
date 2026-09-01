@@ -355,7 +355,7 @@ async function attachThrottleToPage(state: SessionNetState, target: ResolvedTarg
 
 /**
  * Pushes the session's current offline and throttle state to every tab, and
- * returns the tabs it reached.
+ * reports which tabs it actually reached.
  *
  * The CDP sessions are held open rather than detached after each call, which
  * is not an optimisation: the override is dropped the moment its CDP session
@@ -363,8 +363,12 @@ async function attachThrottleToPage(state: SessionNetState, target: ResolvedTarg
  * the session held and 5ms after detaching). That is also why send_cdp_command
  * cannot be used for throttling: it detaches after every call.
  */
-async function syncConditions(state: SessionNetState, target: ResolvedTarget): Promise<string[]> {
+async function syncConditions(
+  state: SessionNetState,
+  target: ResolvedTarget
+): Promise<{ applied: string[]; failed: string[] }> {
   const applied: string[] = [];
+  const failed: string[] = [];
 
   for (const [pageId, page] of target.session.pages) {
     if (page.isClosed()) continue;
@@ -378,8 +382,18 @@ async function syncConditions(state: SessionNetState, target: ResolvedTarget): P
       state.cdp.set(page, cdp);
       hookClose(state, page);
     }
-    await cdp.send('Network.emulateNetworkConditions', conditionsFor(state)).catch(() => {});
-    applied.push(pageId);
+    try {
+      await cdp.send('Network.emulateNetworkConditions', conditionsFor(state));
+      applied.push(pageId);
+    } catch {
+      // A tab whose CDP session has gone stale between being stored and being
+      // used again (the tab crashed, or is mid-navigation into a fresh
+      // process) must not be reported as reached. Swallowing this used to
+      // push the pageId onto "applied" regardless, so a tab the emulation
+      // never touched came back looking exactly like one that was really
+      // throttled or taken offline.
+      failed.push(pageId);
+    }
   }
 
   // With no throttle left and the session online, the held sessions have no
@@ -393,7 +407,7 @@ async function syncConditions(state: SessionNetState, target: ResolvedTarget): P
     }
   }
 
-  return applied;
+  return { applied, failed };
 }
 
 /** What the browser itself says, rather than what was asked for. */
@@ -683,7 +697,12 @@ export const networkTools = defineTools({
       'offline while that layer is active would otherwise flip navigator.onLine to false while every request kept ' +
       'succeeding. harborage re-applies the throttle profile with a matching offline flag to prevent that, so the ' +
       'flag and the real behaviour agree. Between the two switches, offline always wins: an offline session blocks ' +
-      'everything, whatever the bandwidth numbers say.',
+      'everything, whatever the bandwidth numbers say. ' +
+      'appliedToPageIds lists only the tabs the CDP call genuinely reached: a tab it could not reach (crashed, or ' +
+      'mid-navigation into a fresh process) is listed in failedPageIds instead, and offline is NOT in effect there ' +
+      'whatever the session-level "offline" flag says. And if navigator.onLine itself could not be read back, that ' +
+      'is a separate failure from the switch: navigatorOnLine comes back null rather than a guess, and the note ' +
+      'says so, rather than the field silently vanishing and this looking like a verified pass.',
     inputSchema: z.object({
       sessionId,
       offline: z.boolean().describe('true to go offline, false to come back online.')
@@ -692,22 +711,45 @@ export const networkTools = defineTools({
       const { state, target } = stateFor(ctx, args.sessionId);
       state.offline = args.offline;
       await target.session.context.setOffline(args.offline);
-      const appliedToPageIds = await syncConditions(state, target);
-      const navigatorOnLine = await readOnLine(target);
+      const { applied: appliedToPageIds, failed: failedPageIds } = await syncConditions(state, target);
+      const navigatorOnLineRaw = await readOnLine(target);
+      const navigatorOnLine = navigatorOnLineRaw ?? null;
+
+      // Collected rather than a single ternary: the CDP push and the
+      // readback can each fail on their own, and a caller needs to know
+      // which one, not just that something about this call is not fully
+      // trustworthy.
+      const notes: string[] = [];
+      if (failedPageIds.length > 0) {
+        notes.push(
+          `${failedPageIds.length} tab(s) did not accept this change (${failedPageIds.join(', ')}): treat offline ` +
+            'as NOT in effect on those tabs, whatever "offline" says about the session as a whole. Call set_offline ' +
+            'again, and if the same tab keeps failing, it is likely crashed or mid-navigation.'
+        );
+      }
+      if (navigatorOnLineRaw === undefined) {
+        notes.push(
+          'navigator.onLine could not be read back out of the page, most likely because the tab has no document ' +
+            'loaded yet or is mid-navigation. This is separate from whether the offline switch itself took: ' +
+            '"navigatorOnLine" is null rather than a real answer, so do not read this result as a verified switch. ' +
+            'Check the tab again once it has settled.'
+        );
+      } else if (navigatorOnLineRaw === args.offline) {
+        notes.push(
+          'navigator.onLine does not agree with the state that was requested. Treat the offline switch as NOT ' +
+            'in effect and check the page directly rather than trusting this call.'
+        );
+      }
+
       return text({
         sessionId: args.sessionId,
         offline: state.offline,
         navigatorOnLine,
         throttling: state.throttle !== null,
         appliedToPageIds,
+        ...(failedPageIds.length > 0 ? { failedPageIds } : {}),
         scope: 'context: every tab in this session, including tabs opened later',
-        ...(navigatorOnLine === args.offline
-          ? {
-              note:
-                'navigator.onLine does not agree with the state that was requested. Treat the offline switch as NOT ' +
-                'in effect and check the page directly rather than trusting this call.'
-            }
-          : {})
+        ...(notes.length > 0 ? { note: notes.join(' ') } : {})
       });
     }
   }),
@@ -731,7 +773,12 @@ export const networkTools = defineTools({
       'rendering or JavaScript, and it does not touch anything served from cache. ' +
       'Interaction with set_offline: offline is a separate switch and it wins. Both mechanisms carry an offline ' +
       'flag, and harborage keeps the two in agreement, so turning throttling on or off never quietly changes ' +
-      'whether the session is offline. Both states come back in every result.',
+      'whether the session is offline. Both states come back in every result. ' +
+      'appliedToPageIds lists only the tabs the CDP call genuinely reached: a tab it could not reach (crashed, or ' +
+      'mid-navigation into a fresh process) is listed in failedPageIds instead, and is NOT throttled to these ' +
+      'numbers whatever the rest of the result says. navigatorOnLine can also fail to read back on its own, ' +
+      'separately from the throttle push: when it does, it comes back null rather than a guess, with the note ' +
+      'saying so.',
     inputSchema: z.object({
       sessionId,
       preset: z
@@ -790,8 +837,35 @@ export const networkTools = defineTools({
         };
       }
 
-      const appliedToPageIds = await syncConditions(state, target);
-      const navigatorOnLine = await readOnLine(target);
+      const { applied: appliedToPageIds, failed: failedPageIds } = await syncConditions(state, target);
+      const navigatorOnLineRaw = await readOnLine(target);
+      const navigatorOnLine = navigatorOnLineRaw ?? null;
+
+      const notes: string[] = [
+        state.throttle === null
+          ? 'Throttling removed. Bandwidth and latency are back to whatever the machine really has.'
+          : 'Throttling is in effect for the tabs listed in appliedToPageIds, and for tabs opened from now on. A ' +
+            'tab\'s very first requests can start before harborage has attached to it.'
+      ];
+      if (state.offline) {
+        notes.push(
+          state.throttle === null
+            ? 'This session is still OFFLINE: call set_offline to bring it back online.'
+            : 'This session is also OFFLINE, which wins: every request fails regardless of these numbers.'
+        );
+      }
+      if (failedPageIds.length > 0) {
+        notes.push(
+          `${failedPageIds.length} tab(s) did not accept this change (${failedPageIds.join(', ')}): they are still ` +
+            'running whatever conditions they had before this call, not the ones reported here.'
+        );
+      }
+      if (navigatorOnLineRaw === undefined) {
+        notes.push(
+          'navigator.onLine could not be read back out of the page, so "navigatorOnLine" is null rather than a ' +
+            'real answer. This is separate from the throttle numbers above, which were still verified.'
+        );
+      }
 
       return text({
         sessionId: args.sessionId,
@@ -803,15 +877,8 @@ export const networkTools = defineTools({
         offline: state.offline,
         navigatorOnLine,
         appliedToPageIds,
-        note:
-          state.throttle === null
-            ? 'Throttling removed. Bandwidth and latency are back to whatever the machine really has.' +
-              (state.offline ? ' This session is still OFFLINE: call set_offline to bring it back online.' : '')
-            : 'Throttling is in effect for the tabs listed in appliedToPageIds, and for tabs opened from now on. A ' +
-              'tab\'s very first requests can start before harborage has attached to it.' +
-              (state.offline
-                ? ' This session is also OFFLINE, which wins: every request fails regardless of these numbers.'
-                : '')
+        ...(failedPageIds.length > 0 ? { failedPageIds } : {}),
+        note: notes.join(' ')
       });
     }
   })
