@@ -708,6 +708,14 @@ function inspectTarget(page: Page, locator: Locator | null): Promise<TextTargetI
  * editing host scopes it to itself, which is safe and is exactly what the
  * caller named. Anything else scopes it to something larger than the caller
  * named, or to the document, and must be refused.
+ *
+ * One thing this function is NOT responsible for, because the symptoms point
+ * here and the cause is elsewhere: clicking a widget inside a contenteditable
+ * region focuses the REGION, not the widget, so on that path this returns
+ * true correctly and the caret really is on an element that owns its region.
+ * What makes a no-selector clear dangerous there is that nothing named the
+ * region, which is handled in `type`'s own guard. See the long comment on it
+ * before concluding this function has a hole.
  */
 function canReceiveText(report: TextTargetReport): boolean {
   if (report.tag === 'TEXTAREA') return true;
@@ -2118,20 +2126,36 @@ export const interactionTools = defineTools({
 
         // A no-selector CLEAR on an editing host is refused even though the
         // host can genuinely receive text, and this is the case that looks
-        // safe and is not. Clicking a widget inside a contenteditable region
-        // does not focus the widget: Chromium focuses the REGION, so
-        // document.activeElement is the editing host and clearing it empties
-        // everything in it. Measured on a page whose canvas sat inside one:
-        // three nodes and 91 characters before the call, one node and 14
-        // after, reported as matched: true.
+        // safe and is not.
         //
-        // The rule that decides this is the same one fill uses, applied where
-        // there is no selector: a deletion may only be aimed at a region the
-        // caller actually named, and with no selector the caller named
+        // READ THIS BEFORE CHANGING THE GUARD, because the evidence points at
+        // the wrong cause and two rounds of review derived it wrongly from
+        // exactly these symptoms. Clicking a widget inside a contenteditable
+        // region does NOT focus the widget, even one carrying tabindex="0".
+        // Chromium focuses the REGION, so document.activeElement is the
+        // editing host itself. That means canReceiveText was answering
+        // correctly here: the caret really was on an element that owns its own
+        // editing region. The isContentEditable-is-inherited bug is real, it
+        // is fixed, and it is a DIFFERENT bug: it is what let a write aimed at
+        // a widget by SELECTOR destroy the surrounding region. It is not what
+        // made this no-selector path destructive.
+        //
+        // What makes this path destructive is narrower and has nothing to do
+        // with which element got focus: with no selector, nothing named the
+        // region about to be emptied. Measured on a page whose canvas sat
+        // inside one: three nodes and 91 characters before the call, one node
+        // and 14 after, reported as matched: true.
+        //
+        // So the rule that decides this is the same one fill uses, applied
+        // where there is no selector: a deletion may only be aimed at a region
+        // the caller actually named, and with no selector the caller named
         // nothing while the region can be an entire document. A focused input
         // or textarea is exempt because its region is its own value, which is
         // bounded and is what "the focused field" plainly means. The message
-        // names the host, so the retry is one argument away.
+        // names the host, so the retry is one argument away. Do not try to
+        // narrow this by asking whether the region "looks large", or holds
+        // other focusable widgets, or is body: that is the same fudge factor
+        // the level budget was, and it failed for the same reason.
         if (args.clear && !formControlTags.includes(holder.tag) && holder.isEditingHost) {
           throw new Error(
             `type will not clear ${describeTextTarget(holder)} without being told to: it is a contenteditable ` +
@@ -2271,7 +2295,8 @@ export const interactionTools = defineTools({
   press_key: defineTool({
     serializesInput: true,
     description:
-      'Press a key in a session\'s tab, dispatching a real trusted key event. This is the only way to establish keyboard modality, which matters for accessibility checks: Chrome will not set :focus-visible on a button a script focused with .focus(), so a focus ring measured after a programmatic focus reports absent even when it is perfectly fine for a real user pressing Tab. Key syntax is Playwright\'s: Tab, Enter, Escape, ArrowDown, Backspace, a, Control+A, Shift+Tab. With no selector the key goes to whatever currently has focus. Returns where focus ended up and whether that element matches :focus-visible, descending into open shadow roots to get there: document.activeElement retargets to the shadow HOST, so a key press into an editor inside a shadow root would otherwise be reported as focus sitting on a plain host div with no text. "inShadowRoot" says when the walk had to cross a boundary to find it.',
+      'Press a key in a session\'s tab, dispatching a real trusted key event. This is the only way to establish keyboard modality, which matters for accessibility checks: Chrome will not set :focus-visible on a button a script focused with .focus(), so a focus ring measured after a programmatic focus reports absent even when it is perfectly fine for a real user pressing Tab. Key syntax is Playwright\'s: Tab, Enter, Escape, ArrowDown, Backspace, a, Control+A, Shift+Tab. With no selector the key goes to whatever currently has focus. Returns where focus ended up and whether that element matches :focus-visible, descending into OPEN shadow roots to get there: document.activeElement retargets to the shadow HOST, so a key press into an editor inside a shadow root would otherwise be reported as focus sitting on a plain host div with no text. "inShadowRoot" is true when the walk crossed a boundary to find the element. ' +
+      'One limit worth knowing, because it is the single case this field can be wrong: focus inside a CLOSED shadow root reports the HOST, not the element that actually received the key, and "inShadowRoot" reads false. A closed root is invisible to page JavaScript, and a host holding focus itself is indistinguishable from a host whose closed root holds it, so the case cannot be flagged rather than misreported. Read "inShadowRoot": false as "no open shadow boundary was crossed", not as "focus is not in a shadow root". If a page uses closed roots and it matters which element took the key, send_cdp_command can see inside them: DOM.getDocument with pierce: true, or Accessibility.getFullAXTree, whose nodes carry a "focused" property and a backendDOMNodeId to resolve with DOM.describeNode. That is deliberately not done here, because it costs an accessibility-tree query on every press, measured at about 10ms against 2ms for this call as it stands, on a field that reports where focus is rather than making a claim about text.',
     inputSchema: z.object({
       sessionId,
       pageId,

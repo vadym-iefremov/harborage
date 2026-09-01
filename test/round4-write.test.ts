@@ -125,6 +125,18 @@ const PAGES: Record<string, string> = {
   r2.innerHTML = '<div id="inner2" contenteditable="true">seedce</div>';
 </script></body></html>`,
 
+  // A CLOSED shadow root, focused by the page itself, which is the only way
+  // in: nothing outside the page can reach a closed root to focus it, which is
+  // why an earlier probe of this never actually got focus inside one.
+  '/closed': `<!doctype html><html><body>
+<div id="closedHost"></div>
+<script>
+  var c = document.getElementById('closedHost').attachShadow({ mode: 'closed' });
+  c.innerHTML = '<input id="closedInput" value="">';
+  window.__focusClosed = function () { c.getElementById('closedInput').focus(); };
+  window.__closedValue = function () { return c.getElementById('closedInput').value; };
+</script></body></html>`,
+
   '/locked': `<!doctype html><html><body>
 <input id="ro" value="locked" readonly>
 <input id="off" value="off" disabled>
@@ -590,6 +602,41 @@ test('type with no selector says readonly plainly when the focused control is on
   const message = await rejection(() => handlers.type({ sessionId, text: 'x', clear: true }));
   assert.match(String(message), /it is readonly/i);
   assert.equal(await evaluate<string>(sessionId, "document.getElementById('ro').value"), 'locked');
+
+  await sessions.releaseSession(sessionId);
+});
+
+// ---------------------------------------------------------------------------
+// The one thing press_key's focus report cannot know
+// ---------------------------------------------------------------------------
+
+test('press_key names the host when focus is inside a CLOSED shadow root, which is the documented limit', async () => {
+  const sessionId = await freshSession('/closed');
+
+  // The page focuses into its own closed root. From outside, and from page
+  // JavaScript generally, that root does not exist: shadowRoot is null and a
+  // host holding focus itself is indistinguishable from a host whose closed
+  // root holds it. So this test pins a KNOWN-WRONG report rather than a
+  // correct one, deliberately, so the limit is visible in the suite instead of
+  // latent. If someone later resolves focus through CDP (DOM.getDocument with
+  // pierce: true, or Accessibility.getFullAXTree, both of which do see closed
+  // roots), this test is the one that should fail and be rewritten.
+  await evaluate(sessionId, 'window.__focusClosed()');
+  assert.equal(await evaluate<string>(sessionId, 'document.activeElement.id'), 'closedHost');
+  assert.equal(
+    await evaluate<string>(sessionId, "String(document.getElementById('closedHost').shadowRoot)"),
+    'null',
+    'page JavaScript cannot see a closed root at all, which is what makes this undetectable'
+  );
+
+  const body = payload(await handlers.press_key({ sessionId, key: 'a' }));
+  const active = body.activeElement as Record<string, unknown>;
+
+  // The oracle: the input inside the closed root really did take the key.
+  assert.equal(await evaluate<string>(sessionId, 'window.__closedValue()'), 'a');
+
+  assert.equal(active.id, 'closedHost', 'the report names the host, not the element that received the key');
+  assert.equal(active.inShadowRoot, false, 'and false here means "no OPEN boundary was crossed", nothing stronger');
 
   await sessions.releaseSession(sessionId);
 });
