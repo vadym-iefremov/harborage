@@ -113,6 +113,45 @@ For a bug fix, write the test that fails first, then fix it. Several tests in
 the suite exist because a QA agent recorded a false pass, and each one is
 named after the lie it caught.
 
+### Running more than one suite at a time: use `./suitelock.sh`
+
+```sh
+./suitelock.sh npm test
+./suitelock.sh npx tsx --test test/some-probe.ts
+```
+
+Every suite starts its own daemon and a fleet of real Chromium processes, so
+two running at once is not twice the load, it is a machine that thermally
+throttles and then produces failures that look like timing regressions and
+are not. This actually happened: concurrent runs reached 56 Chromium
+processes and a load average above 20, and the suite failures that followed
+sent people hunting for races that did not exist.
+
+`suitelock.sh` serialises anything that spawns browsers or a daemon. Wrap the
+whole command, not part of it. Two details are load-bearing:
+
+- The lock is a **directory**, because `mkdir` is atomic everywhere and macOS
+  has no `flock(1)`. A stale lock is cleared only after `kill -0` says the
+  recorded PID is genuinely gone, so a crashed holder does not block the
+  machine forever and a live one is never evicted.
+- The child and its descendants are killed **by PID**, walked through
+  `pgrep -P` from the PID this script started, and each one is verified dead
+  afterwards. Never `pkill -f`: a pattern matches other people's processes,
+  which is the exact accident the file exists to prevent.
+
+Two failure modes worth recognising rather than rediscovering:
+
+- **A suite that loses its browser never times out.** A run whose Chromium
+  never comes up sits at 0% CPU indefinitely with no browser children and no
+  timeout ever firing, so it looks identical to a slow run. If a suite has
+  been going for minutes rather than seconds, check for a process at 0% CPU
+  and kill it by PID.
+- **The git stash stack is shared by every worktree**, because they share one
+  `.git`. A bare `git stash pop` in one worktree can pop another worktree's
+  work into your tree, and the symptom looks like a bad merge rather than a
+  stash collision. For before-and-after comparisons prefer
+  `git diff -- src > /tmp/patch`, then `git checkout`, then `git apply`.
+
 ## Pull requests
 
 - Branch from `main`.
