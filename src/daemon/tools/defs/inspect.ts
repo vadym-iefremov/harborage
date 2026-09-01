@@ -921,7 +921,12 @@ export const inspectTools = defineTools({
       'clear: true removes only the messages this call returned, per the clear field below; a call with no ' +
       'narrowing (no pageId, no types, no textIncludes) therefore drains the whole buffer, and that specific case ' +
       'also resets dropped to 0, since that is a fresh observation window starting. A narrowed clear leaves dropped ' +
-      'exactly as it was: those losses are still real for whatever is left unread.',
+      'exactly as it was, EVEN IF its filter happened to match every message currently buffered: those losses are ' +
+      'still real for whatever is left unread, and what resets the counter is that the call narrowed nothing, not ' +
+      'that the buffer came out empty. ' +
+      'dropped is scoped the same way the read is: with a pageId it counts only messages evicted from THAT tab, and ' +
+      'droppedInSession comes back alongside it with the session-wide total, because the buffer is shared across ' +
+      'every tab and a count that is mostly other tabs\' losses is not something a caller can act on.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -942,11 +947,20 @@ export const inspectTools = defineTools({
       const wanted = args.types !== undefined ? new Set(args.types.map(t => t.toLowerCase())) : undefined;
       const needle = args.textIncludes?.toLowerCase();
 
-      const matches = (entry: { type: string; text: string }): boolean => {
-        if (wanted !== undefined && !wanted.has(entry.type.toLowerCase())) return false;
-        if (needle !== undefined && !entry.text.toLowerCase().includes(needle)) return false;
-        return true;
-      };
+      // Undefined, not an always-true closure, when the caller narrowed
+      // nothing. The store decides whether a `clear` starts a fresh
+      // observation window by asking whether a predicate was given at all,
+      // and handing it a closure that accepts everything is indistinguishable
+      // from handing it a real filter that happened to match everything. That
+      // is exactly how a narrowed clear used to reset dropped to 0.
+      const matches =
+        wanted === undefined && needle === undefined
+          ? undefined
+          : (entry: { type: string; text: string }): boolean => {
+              if (wanted !== undefined && !wanted.has(entry.type.toLowerCase())) return false;
+              if (needle !== undefined && !entry.text.toLowerCase().includes(needle)) return false;
+              return true;
+            };
 
       // The filter is pushed into the store rather than applied to what comes
       // back, because `clear` is handled in there. Filtering on the way out
@@ -957,7 +971,15 @@ export const inspectTools = defineTools({
       const before = ctx.sessions.getConsoleMessages(args.sessionId, args.pageId, false);
       const result = ctx.sessions.getConsoleMessages(args.sessionId, args.pageId, args.clear ?? false, matches);
 
-      return text({ total: before.entries.length, returned: result.entries.length, dropped: before.dropped, messages: result.entries });
+      return text({
+        total: before.entries.length,
+        returned: result.entries.length,
+        dropped: before.droppedInScope,
+        // Only meaningful next to a scoped read: without a pageId it is the
+        // same number as `dropped`, and repeating it would just be noise.
+        ...(args.pageId !== undefined ? { droppedInSession: before.droppedInSession } : {}),
+        messages: result.entries
+      });
     }
   }),
 
@@ -989,7 +1011,29 @@ export const inspectTools = defineTools({
       'narrowing (no pageId, no urlIncludes/urlMatches/method/minStatus/maxStatus/resourceType/direction) ' +
       'therefore drains the whole buffer, and that specific case also resets dropped and filteredAtCapture to 0, ' +
       'since that is a fresh observation window starting. A narrowed clear leaves both counters exactly as they ' +
-      'were: those losses are still real for whatever is left unread.',
+      'were, EVEN IF its filter happened to match every entry currently buffered: what resets them is that the ' +
+      'call narrowed nothing, not that the ring came out empty, and those losses are still real for whatever is ' +
+      'left unread. ' +
+      'dropped and filteredAtCapture are scoped the same way the read is: with a pageId they count only that ' +
+      'tab\'s losses, and droppedInSession / filteredAtCaptureInSession come back alongside them with the ' +
+      'session-wide totals. The ring is shared by every tab in the session, so a per-tab read reporting the ' +
+      'session-wide number was reporting mostly other tabs\' traffic. ' +
+      'A request entry carrying "responseFilteredOut": true was ANSWERED, and its response was excluded by the ' +
+      'capture filter (either the filter was replaced mid-flight, or it excludes responses wholesale, e.g. ' +
+      'direction "request" or a method filter). Without that flag, a request entry with no matching response entry ' +
+      'is a request the server never answered, which is the opposite conclusion. ' +
+      'WebSockets are NOT in requests: a socket is not a request/response pair and none of the filters above apply ' +
+      'to one. They come back in their own "websockets" array instead, one entry per connection, with url, ' +
+      'openedAt, closedAt (absent while still open) and frame COUNTS in each direction, never frame contents (a ' +
+      'realtime app can push thousands a minute and buffering them would evict the HTTP traffic this ring is for). ' +
+      'Counts are enough to tell "the socket is open and carrying traffic" from "the socket connected and nothing ' +
+      'has flowed", which is the question an empty request list used to answer wrongly by omission. The capture ' +
+      'filter does not apply to them, and neither does clear. ' +
+      'Server-Sent Events are a different case and DO appear in requests, verified against a real EventSource: the ' +
+      'connection is one ordinary HTTP request, so it shows up as a request entry with resourceType "eventsource" ' +
+      'and a response entry with its status. The events streamed over it afterwards do not, so an SSE stream ' +
+      'delivering nothing looks exactly like one delivering thousands of events. Requests a service worker makes ' +
+      'on its own behalf are still not visible on any channel here.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -1034,7 +1078,7 @@ export const inspectTools = defineTools({
       direction: z.enum(['request', 'response']).optional().describe('Keep only one side of each exchange.')
     }),
     async handler(ctx, args) {
-      const criteria = compileNetworkMatch({
+      const filter = {
         urlIncludes: args.urlIncludes,
         urlMatches: args.urlMatches,
         method: args.method,
@@ -1042,23 +1086,46 @@ export const inspectTools = defineTools({
         minStatus: args.minStatus,
         maxStatus: args.maxStatus,
         direction: args.direction
-      });
-      const matches = (entry: NetworkEntry): boolean => matchesNetworkEntry(entry, criteria);
+      };
+      // Undefined, not a predicate that accepts everything, when the caller
+      // set no filters at all. See read_console's handler: the store cannot
+      // tell an always-true closure from a real filter that matched
+      // everything, and treating the second as the first is what let a
+      // narrowed clear reset dropped and filteredAtCapture to 0.
+      const narrowed = Object.values(filter).some(value => value !== undefined);
+      const criteria = compileNetworkMatch(filter);
+      const matches = narrowed ? (entry: NetworkEntry): boolean => matchesNetworkEntry(entry, criteria) : undefined;
 
       // Same reasoning as read_console: the predicate goes into the store so
       // `clear` removes exactly what was returned, never more, and total /
       // dropped are read before the (possibly clearing) real read runs.
       const before = ctx.sessions.getNetworkEntries(args.sessionId, args.pageId, false);
       const result = ctx.sessions.getNetworkEntries(args.sessionId, args.pageId, args.clear ?? false, matches);
+      const websockets = ctx.sessions.getWebSockets(args.sessionId, args.pageId);
 
       return text({
         total: before.entries.length,
         returned: result.entries.length,
-        dropped: before.dropped,
+        dropped: before.droppedInScope,
         // 0 whenever no capture filter is set, which is the common case, so
         // this only shows up as a live number once a caller has opted in.
-        filteredAtCapture: before.filteredOut,
-        requests: result.entries
+        filteredAtCapture: before.filteredOutInScope,
+        // Only alongside a scoped read: without a pageId these are the same
+        // numbers as the two above.
+        ...(args.pageId !== undefined
+          ? {
+              droppedInSession: before.droppedInSession,
+              filteredAtCaptureInSession: before.filteredOutInSession
+            }
+          : {}),
+        requests: result.entries,
+        // Always present, even empty, so "no sockets" is a stated fact rather
+        // than a field a caller has to know to miss. Before this, WebSocket
+        // traffic was invisible with nothing at all to say so, and an empty
+        // request list read as "nothing is happening" on a page whose whole
+        // conversation was over a socket.
+        websockets: websockets.sockets,
+        ...(websockets.dropped > 0 ? { websocketsDropped: websockets.dropped } : {})
       });
     }
   }),
