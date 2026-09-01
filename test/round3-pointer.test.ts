@@ -183,14 +183,19 @@ let handlers: ReturnType<typeof createToolHandlers>;
 before(async () => {
   server = createServer((req, res) => {
     const path = (req.url ?? '/').split('?')[0];
-    const body =
-      path === '/body-scrim'
-        ? BODY_SCRIM_HTML
-        : path === '/multi'
-          ? MULTI_MATCH_HTML
-          : path === '/offscreen'
-            ? OFFSCREEN_HTML
-            : FIXTURE_HTML;
+    const routes: Record<string, string> = {
+      '/body-scrim': BODY_SCRIM_HTML,
+      '/multi': MULTI_MATCH_HTML,
+      '/offscreen': OFFSCREEN_HTML,
+      '/deep': DEEP_HTML,
+      '/frame-inner': FRAME_INNER_HTML,
+      '/frame-outer': FRAME_OUTER_HTML,
+      '/frame-covered': FRAME_COVERED_HTML,
+      '/far-apart': FAR_APART_HTML,
+      '/scrim-pair': SCRIM_PAIR_HTML,
+      '/wheel-listener': WHEEL_LISTENER_HTML
+    };
+    const body = routes[path] ?? FIXTURE_HTML;
     res.setHeader('content-type', 'text/html; charset=utf-8');
     res.end(body);
   });
@@ -327,7 +332,12 @@ test('drag: an open shadow host is a clean hit, and the closed one it is a contr
   const open = await dragVerdictVsOracle(sessionId, { selector: '#openHost' }, 'openHost');
   assert.equal(open.fired, true, 'the host really does receive the press: it is on the composed path of its own shadow content');
   assert.equal(open.verdict, true, 'an open shadow host must not be reported as occluded by its own shadow content');
-  assert.equal(open.body.sourceHit.elementAtPoint, null);
+  assert.equal(
+    open.body.sourceHit.elementAtPoint.id,
+    'openInner',
+    'the shadow content really is what is topmost, and saying so on a match costs nothing and explains the verdict'
+  );
+  assert.equal(open.body.sourceHit.elementAtPoint.containsTarget, false, 'the shadow content is below the host, not above it');
 
   const closed = await dragVerdictVsOracle(sessionId, { selector: '#closedHost' }, 'closedHost');
   assert.equal(closed.fired, true);
@@ -558,6 +568,329 @@ test('wheel still reports a clean hit and a real scroll for an unoccluded contai
   assert.equal(body.matched, true);
   assert.equal(body.moved, true);
   assert.ok(await evaluate<number>(sessionId, "document.getElementById('scrollBox').scrollTop") > 0, 'the box really scrolled');
+
+  await sessions.releaseSession(sessionId);
+});
+
+// ---------------------------------------------------------------------------
+// Round 3, second pass. Four defects an independent adversarial tester found in
+// the fixes above, three of them introduced by them, each graded here against
+// the same kind of oracle: a real capturing pointerdown listener on the element
+// the caller named, which a real press either fires or does not.
+// ---------------------------------------------------------------------------
+
+/** 200 intervening levels between #deepRoot and the leaf that actually paints at the point. */
+const DEEP_HTML = `<!doctype html>
+<html><body style="margin:0">
+<div id="deepRoot" style="position:absolute;left:10px;top:10px;width:200px;height:60px;background:rgb(220,220,220)"></div>
+<script>
+  window.__hbFired = {};
+  var cur = document.getElementById('deepRoot');
+  for (var i = 0; i < 200; i += 1) {
+    var d = document.createElement('div');
+    d.style.cssText = 'position:absolute;left:0;top:0;width:100%;height:100%';
+    cur.appendChild(d);
+    cur = d;
+  }
+  cur.style.background = 'rgb(120,160,240)';
+  document.getElementById('deepRoot').addEventListener('pointerdown', function () { window.__hbFired.deepRoot = true; }, true);
+</script>
+</body></html>`;
+
+/** The page an iframe fixture loads INSIDE the frame. */
+const FRAME_INNER_HTML = `<!doctype html>
+<html><body style="margin:0;background:rgb(238,238,255)">
+  <div id="frameTarget" style="position:absolute;left:10px;top:10px;width:300px;height:300px;background:rgb(140,200,255)"></div>
+  <div id="frameCover" style="position:absolute;left:120px;top:120px;width:70px;height:70px;background:rgb(255,68,68);z-index:5"></div>
+  <!-- Small and near the frame's own origin on purpose: its centre sits at inner (370,30), so the
+       main-frame coordinate for it, (440,80), falls well OUTSIDE it. Handing that number to the
+       frame's own elementFromPoint, which is what the tool used to do, therefore lands on the
+       frame's <html> and produces a confident MISS for an element nothing is covering. A large
+       target cannot show this direction: the mis-mapped point stays inside it by accident. -->
+  <div id="frameSmall" style="position:absolute;left:330px;top:10px;width:80px;height:40px;background:rgb(140,220,160)"></div>
+<script>
+  window.__hbFired = {};
+  ['frameTarget', 'frameCover', 'frameSmall'].forEach(function (id) {
+    document.getElementById(id).addEventListener('pointerdown', function () { window.__hbFired[id] = true; }, true);
+  });
+</script>
+</body></html>`;
+
+/** The same frame, offset from the origin in both axes, and with a border and padding on top. */
+const FRAME_OUTER_HTML = `<!doctype html>
+<html><body style="margin:0">
+  <iframe id="theFrame" src="/frame-inner" style="position:absolute;left:60px;top:40px;width:500px;height:500px;border:4px solid rgb(0,0,0);padding:6px"></iframe>
+</body></html>`;
+
+/** The same frame again, this time buried under a modal that lives in the PARENT document. */
+const FRAME_COVERED_HTML = `<!doctype html>
+<html><body style="margin:0">
+  <iframe id="theFrame" src="/frame-inner" style="position:absolute;left:20px;top:30px;width:400px;height:400px;border:0"></iframe>
+  <div id="parentModal" style="position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:99"></div>
+</body></html>`;
+
+/** A page tall enough that scrolling one endpoint into view moves the other one off screen. */
+const FAR_APART_HTML = `<!doctype html>
+<html><body style="margin:0;height:4000px">
+  <div id="nearTop" style="position:absolute;left:20px;top:20px;width:140px;height:60px;background:rgb(120,200,140)"></div>
+  <div id="farDown" style="position:absolute;left:20px;top:3000px;width:140px;height:60px;background:rgb(200,140,120)"></div>
+<script>
+  window.__hbFired = {};
+  ['nearTop', 'farDown'].forEach(function (id) {
+    document.getElementById(id).addEventListener('pointerdown', function () { window.__hbFired[id] = true; }, true);
+  });
+</script>
+</body></html>`;
+
+/** A button under its wrapper's ::after scrim, once in a shadow root and once in the light DOM. */
+const SCRIM_PAIR_HTML = `<!doctype html>
+<html><head><style>
+  body { margin: 0 }
+  #shadowScrimWrap::after { content: ''; position: absolute; inset: 0; background: rgba(0,0,0,0.2) }
+  #lightScrimWrap::after { content: ''; position: absolute; inset: 0; background: rgba(0,0,0,0.2) }
+</style></head><body>
+  <div id="shadowScrimWrap" style="position:absolute;left:10px;top:10px;width:200px;height:60px;background:rgb(238,238,238)">
+    <div id="scrimHost" style="position:absolute;left:20px;top:10px;width:120px;height:40px"></div>
+  </div>
+  <div id="lightScrimWrap" style="position:absolute;left:10px;top:100px;width:200px;height:60px;background:rgb(238,238,238)">
+    <button id="lightScrimBtn" style="position:absolute;left:20px;top:10px;width:120px;height:40px"></button>
+  </div>
+<script>
+  window.__hbFired = {};
+  var root = document.getElementById('scrimHost').attachShadow({ mode: 'open' });
+  root.innerHTML = '<button id="shadowScrimBtn" style="position:absolute;left:0;top:0;width:120px;height:40px"></button>';
+  root.getElementById('shadowScrimBtn').addEventListener('pointerdown', function () { window.__hbFired.shadowScrimBtn = true; }, true);
+  document.getElementById('lightScrimBtn').addEventListener('pointerdown', function () { window.__hbFired.lightScrimBtn = true; }, true);
+</script>
+</body></html>`;
+
+/** A wheel target with a listener of its own, for proving the event was delivered before the readback. */
+const WHEEL_LISTENER_HTML = `<!doctype html>
+<html><body style="margin:0">
+  <div id="wheelPad" style="position:absolute;left:20px;top:20px;width:300px;height:200px;background:rgb(200,220,240)"></div>
+<script>
+  window.__wheels = 0;
+  document.getElementById('wheelPad').addEventListener('wheel', function () { window.__wheels += 1; }, { passive: true });
+</script>
+</body></html>`;
+
+const FRAME_PREFIX = 'iframe >> internal:control=enter-frame >> ';
+
+/** Reads the oracle inside a subframe rather than the main document. */
+async function oracleFiredInFrame(sessionId: string, id: string): Promise<boolean> {
+  const frames = payload(await handlers.list_frames({ sessionId })).frames;
+  const frame = frames.find((entry: any) => entry.frameId !== 'main').frameId;
+  const result = await handlers.evaluate({ sessionId, frame, expression: `!!window.__hbFired[${JSON.stringify(id)}]` });
+  return payload(result).result as boolean;
+}
+
+async function resetOracleInFrame(sessionId: string): Promise<void> {
+  const frames = payload(await handlers.list_frames({ sessionId })).frames;
+  const frame = frames.find((entry: any) => entry.frameId !== 'main').frameId;
+  await handlers.evaluate({ sessionId, frame, expression: 'window.__hbFired = {}, "ok"' });
+}
+
+// --- Defect: an iframe not at the origin desynchronises the hit test ---------
+
+test('drag: an element in an offset iframe with nothing on it is a clean hit, not a fabricated ancestor miss', async () => {
+  const sessionId = await sessionOn('/frame-outer');
+  await resetOracleInFrame(sessionId);
+
+  // The mouse goes to a MAIN-frame coordinate; the hit test used to hand that same number to
+  // the FRAME's own elementFromPoint, which measures from the frame's own origin. With the
+  // frame at (60,40) plus a 4px border and 6px padding, the two spaces differ by 70x50, and
+  // the tool reported a confident miss naming the frame's <html> with the whole ancestor
+  // remedy attached, for a press that really did reach the element.
+  const body = payload(
+    await handlers.drag({ sessionId, source: { selector: `${FRAME_PREFIX}#frameSmall` }, target: { x: 900, y: 20 }, steps: 3 })
+  );
+  const fired = await oracleFiredInFrame(sessionId, 'frameSmall');
+
+  assert.equal(fired, true, 'the fixture is wrong if a real press at these coordinates did NOT reach the element');
+  assert.equal(body.sourceHit.matchesTarget, true, 'the press provably reached the element, so the tool must not call it a miss');
+  assert.equal(body.sourceHit.elementAtPoint, null, 'nothing is on top of it, so there is nothing to name');
+  assert.equal(body.matched, true);
+  assert.ok(!('note' in body), 'and a clean hit in a frame earns no note, least of all the ancestor remedy');
+
+  await sessions.releaseSession(sessionId);
+});
+
+test('drag: an element in an offset iframe covered at its own centre is a miss, not a false pass', async () => {
+  const sessionId = await sessionOn('/frame-outer');
+  await resetOracleInFrame(sessionId);
+
+  // The mirror of the case above, and the dangerous one. #frameTarget is 300x300, so the
+  // mis-mapped point still landed inside it, on a part nothing covers, while the real press
+  // went to #frameCover at the true centre. The tool reported a clean hit with no note at all.
+  const body = payload(
+    await handlers.drag({ sessionId, source: { selector: `${FRAME_PREFIX}#frameTarget` }, target: { x: 900, y: 20 }, steps: 3 })
+  );
+  const targetFired = await oracleFiredInFrame(sessionId, 'frameTarget');
+  const coverFired = await oracleFiredInFrame(sessionId, 'frameCover');
+
+  assert.equal(coverFired, true, 'the fixture is wrong if the cover did not take the press');
+  assert.equal(targetFired, false, 'the fixture is wrong if the press reached the target through the cover');
+  assert.equal(body.sourceHit.matchesTarget, false, 'the element never saw the press, so this must not read as a clean hit');
+  assert.equal(body.sourceHit.elementAtPoint.id, 'frameCover', 'and what really took it has to be named');
+  assert.equal(body.matched, false);
+
+  await sessions.releaseSession(sessionId);
+});
+
+test('wheel: the same offset iframe, the same verdict', async () => {
+  const sessionId = await sessionOn('/frame-outer');
+  const body = payload(await handlers.wheel({ sessionId, point: { selector: `${FRAME_PREFIX}#frameTarget` }, deltaY: 60 }));
+
+  assert.equal(body.pointHit.matchesTarget, false, 'wheel resolves its point the same way drag does and must reach the same answer');
+  assert.equal(body.pointHit.elementAtPoint.id, 'frameCover');
+  assert.equal(body.matched, false);
+
+  await sessions.releaseSession(sessionId);
+});
+
+test('a modal in the parent document is caught by BOTH call sites, since a pointer event cannot cross a frame boundary', async () => {
+  const sessionId = await sessionOn('/frame-covered');
+  await resetOracleInFrame(sessionId);
+
+  const body = payload(
+    await handlers.drag({ sessionId, source: { selector: `${FRAME_PREFIX}#frameTarget` }, target: { x: 900, y: 20 }, steps: 3 })
+  );
+  const fired = await oracleFiredInFrame(sessionId, 'frameTarget');
+  const el = payload(await handlers.element_box({ sessionId, selectors: [`${FRAME_PREFIX}#frameTarget`] })).results[0].elements[0];
+
+  assert.equal(fired, false, 'the fixture is wrong if the press got through a full-screen parent-document modal');
+  assert.equal(body.sourceHit.matchesTarget, false, 'drag has to see one document out');
+  assert.equal(body.sourceHit.elementAtPoint.id, 'parentModal');
+  assert.equal(body.sourceHit.elementAtPoint.inAncestorFrame, true, 'the remedy differs: nothing inside the frame can fix this');
+  assert.match(String(body.note), /ANCESTOR FRAME/, 'and the note has to say so rather than blaming a z-index inside the frame');
+
+  assert.equal(el.topmostAtCentre, false, 'element_box measures inside the frame, but the answer it gives is about a real click');
+  assert.equal(el.occludedBy.id, 'parentModal');
+  assert.equal(el.occludedBy.inAncestorFrame, true);
+
+  await sessions.releaseSession(sessionId);
+});
+
+// --- Defect: the walk cap was a silent cliff --------------------------------
+
+test('a target 200 levels above the node that paints at the point is not reported as occluded', async () => {
+  const sessionId = await sessionOn('/deep');
+
+  await resetOracle(sessionId);
+  const body = payload(await handlers.drag({ sessionId, source: { selector: '#deepRoot' }, target: { x: 600, y: 20 }, steps: 3 }));
+  const fired = await oracleFired(sessionId, 'deepRoot');
+  const el = payload(await handlers.element_box({ sessionId, selectors: ['#deepRoot'] })).results[0].elements[0];
+
+  assert.equal(fired, true, 'the press really does reach #deepRoot: it is on the composed path of the leaf');
+  assert.equal(body.sourceHit.matchesTarget, true, 'a cap of 200 made this a confident miss naming the leaf, with the ancestor remedy attached');
+  assert.equal(body.matched, true);
+  assert.equal(el.topmostAtCentre, true, 'and element_box carried the identical cliff');
+  assert.equal(el.occludedBy, null);
+
+  await sessions.releaseSession(sessionId);
+});
+
+// --- Defect: containsTarget did not cross a shadow boundary -----------------
+
+test('a scrim over an ancestor gets the same diagnosis whether or not a shadow root is in the way', async () => {
+  const sessionId = await sessionOn('/scrim-pair');
+
+  await resetOracle(sessionId);
+  const shadow = payload(
+    await handlers.drag({ sessionId, source: { selector: '#shadowScrimBtn' }, target: { x: 600, y: 400 }, steps: 3 })
+  );
+  const light = payload(
+    await handlers.drag({ sessionId, source: { selector: '#lightScrimBtn' }, target: { x: 600, y: 400 }, steps: 3 })
+  );
+  assert.equal(await oracleFired(sessionId, 'shadowScrimBtn'), false, 'the scrim really does swallow the press in both shapes');
+  assert.equal(await oracleFired(sessionId, 'lightScrimBtn'), false);
+
+  // The verdict was already right in both. What flipped was the DIAGNOSIS, and only because
+  // Node.contains() does not cross a shadow boundary: the shadow shape got the overlay remedy
+  // and sent the caller hunting for a z-index that does not exist.
+  assert.equal(shadow.sourceHit.matchesTarget, false);
+  assert.equal(light.sourceHit.matchesTarget, false);
+  assert.equal(shadow.sourceHit.elementAtPoint.containsTarget, true, 'the wrapper IS an ancestor of the shadow button in the flattened tree');
+  assert.equal(light.sourceHit.elementAtPoint.containsTarget, true);
+  assert.match(String(shadow.note), /ANCESTOR/);
+
+  const boxes = payload(await handlers.element_box({ sessionId, selectors: ['#shadowScrimBtn', '#lightScrimBtn'] })).results;
+  assert.equal(boxes[0].elements[0].occludedBy.containsTarget, true, 'element_box shared the same contains() bug and needs the same mirror walk');
+  assert.equal(boxes[1].elements[0].occludedBy.containsTarget, true);
+
+  await sessions.releaseSession(sessionId);
+});
+
+// --- Defect: drag's own target scroll invalidated its source point ----------
+
+test('drag does not press at coordinates its own target scroll invalidated', async () => {
+  const sessionId = await sessionOn('/far-apart');
+  await resetOracle(sessionId);
+
+  // Resolving #farDown scrolls the page ~3000px, which moves #nearTop off screen. drag used to
+  // measure the source BEFORE that scroll and then press at the stale coordinate, landing on
+  // <html> and reporting an ancestor miss that blamed a scrim. Both endpoints are prepared
+  // before either is measured now, so the numbers are consistent, and the case that remains
+  // genuinely impossible (two points that cannot be on screen together) is named as itself.
+  const body = payload(
+    await handlers.drag({ sessionId, source: { selector: '#nearTop' }, target: { selector: '#farDown' }, steps: 3 })
+  );
+
+  assert.ok(
+    !/scrim|z-index/i.test(String(body.note ?? '')) || /cannot be on screen at the same time/.test(String(body.note)),
+    `the note must name the real cause rather than blaming an overlay: ${JSON.stringify(body.note ?? null)}`
+  );
+  assert.match(
+    String(body.note),
+    /outside the viewport|cannot be on screen at the same time/,
+    'the actual cause is that the two endpoints do not fit on screen together, and that has to be said'
+  );
+
+  await sessions.releaseSession(sessionId);
+});
+
+// --- Defect: elementAtPoint was hidden on a match --------------------------
+
+test('a body-anchored point is never less informative than the same coordinates passed raw', async () => {
+  const sessionId = await sessionOn();
+
+  // "body" is on the composed path of every point, correctly, so this IS a match. Blanking
+  // elementAtPoint on a match meant the selector form reported strictly less about the same
+  // point than the raw form did, for no reason.
+  const anchored = payload(
+    await handlers.drag({ sessionId, source: { selector: 'body', x: 240, y: 585 }, target: { x: 700, y: 20 }, steps: 3 })
+  );
+  const raw = payload(await handlers.drag({ sessionId, source: { x: 240, y: 585 }, target: { x: 700, y: 20 }, steps: 3 }));
+
+  assert.equal(anchored.sourceHit.matchesTarget, true, 'a press anywhere really does run body\'s listeners');
+  assert.ok(anchored.sourceHit.elementAtPoint, 'and what is really topmost there must still be reported');
+  assert.equal(
+    anchored.sourceHit.elementAtPoint.id,
+    raw.sourceHit.elementAtPoint.id,
+    'the two forms name the same point, so they must name the same element'
+  );
+
+  await sessions.releaseSession(sessionId);
+});
+
+// --- Defect: wheel returned before the renderer had run the listener --------
+
+test('wheel has delivered its event to the page by the time it returns, even when nothing scrolls', async () => {
+  const sessionId = await sessionOn('/wheel-listener');
+
+  // Nothing on this page is scrollable, which is exactly the shape that used to leave the
+  // readback unguarded: readSettledScrollState's first two reads agree immediately, so it
+  // returns without ever sleeping, and the only thing standing between the CDP dispatch and
+  // the read was luck. Measured unfired in 2 of 20 trials at idle before the fix.
+  for (let trial = 0; trial < 12; trial += 1) {
+    await evaluate(sessionId, 'window.__wheels = 0, "ok"');
+    await handlers.wheel({ sessionId, point: { selector: '#wheelPad' }, deltaY: 40 });
+    assert.equal(
+      await evaluate<number>(sessionId, 'window.__wheels'),
+      1,
+      `the page must have seen the wheel event by the time the call returned (trial ${trial})`
+    );
+  }
 
   await sessions.releaseSession(sessionId);
 });
