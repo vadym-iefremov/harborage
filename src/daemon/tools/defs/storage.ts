@@ -416,11 +416,13 @@ export const storageTools = defineTools({
       'tool does NOT reload the page: a page already open keeps whatever it read into memory, so reload afterwards ' +
       'to see the app behave as logged out. The result lists exactly which cookies went, worked out by comparing the ' +
       'jar before and after, so a filter that matched nothing is obvious rather than looking like a success.',
-    // Strict on purpose, and the only strict schema in the registry.
-    // Playwright 1.62's clearCookies ignores a key it does not recognise, so
-    // clearCookies({ nmae: 'sid' }) empties the entire jar and reports
-    // success. Nothing downstream can tell that apart from a deliberate full
-    // clear, so the typo has to die here.
+    // Strict on purpose (every tool's schema now is, via defineTool's
+    // rejectUnknownKeys, but this one was strict first and for a sharper
+    // reason). Playwright 1.62's clearCookies ignores a key it does not
+    // recognise, so clearCookies({ nmae: 'sid' }) empties the entire jar and
+    // reports success. Nothing downstream can tell that apart from a
+    // deliberate full clear, so the typo has to die here, not just get a
+    // generic "unrecognized parameter" message.
     inputSchema: z.strictObject({
       sessionId,
       name: cookieFilter('name', '"session-id"'),
