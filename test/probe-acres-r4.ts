@@ -1,3 +1,19 @@
+/**
+ * ONE-OFF EVIDENCE, NOT A RE-RUNNABLE CHECK. Bound to live Acres state that no
+ * longer exists: the workbook and node ids below were created during the round
+ * this probe documents and have since been deleted, so every click here now
+ * times out on a selector for a node that is not there.
+ *
+ * A failure from this file is NOT a defect in harborage. It was checked rather
+ * than assumed, because earlier in the same round three tests were written off
+ * as flaky and one of them was reporting a real bug the whole time. The live
+ * verification that replaced it was run against a freshly created scratch flow
+ * and was clean.
+ *
+ * Kept because it records what was actually exercised. Re-point the ids at a
+ * flow that exists before running it, or write a new probe that creates its own
+ * scratch flow and deletes it afterwards, which is what the later ones do.
+ */
 import { after, before, test } from 'node:test';
 
 import { BrowserManager } from '../src/daemon/browserManager.js';
