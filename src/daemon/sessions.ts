@@ -633,13 +633,26 @@ export class SessionStore {
     return record;
   }
 
-  /** Resolves a sessionId (+ optional pageId) to a concrete session + page, touching lastActivity. */
+  /**
+   * Resolves a sessionId (+ optional pageId) to a concrete session + page,
+   * touching lastActivity.
+   *
+   * Deliberately does NOT change which tab omitting pageId targets next.
+   * That used to be a side effect of this call: passing an explicit pageId
+   * once, for a single screenshot or a single read of another tab's
+   * console, silently re-pointed the session's default target at that tab
+   * for every later call that left pageId out, with no error and nothing in
+   * the response to say so. select_tab is the documented way to switch the
+   * active tab; a call that names its own tab explicitly should not have
+   * that same effect as a side channel. Only select_tab, new_tab, a page the
+   * session opens itself (window.open, a target="_blank" link) and closeTab
+   * reassigning away from a tab it just closed change activePageId.
+   */
   resolve(sessionId: string, pageId?: string): ResolvedTarget {
     const session = this.getRecord(sessionId);
     const targetPageId = pageId ?? session.activePageId;
     const page = session.pages.get(targetPageId);
     if (!page) throw new PageNotFoundError(sessionId, targetPageId);
-    session.activePageId = targetPageId;
     return { session, page, pageId: targetPageId };
   }
 

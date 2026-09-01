@@ -135,7 +135,11 @@ export const sessionTools = defineTools({
 
   select_tab: defineTool({
     description:
-      'Make one tab the session\'s active tab, so later calls that omit pageId target it. Use after list_tabs to switch between tabs without passing pageId to every single call.',
+      'Make one tab the session\'s active tab, so later calls that omit pageId target it. Use after list_tabs to ' +
+      'switch between tabs without passing pageId to every single call. This is the ONLY way to change what an ' +
+      'omitted pageId targets: passing an explicit pageId to some other tool (a screenshot, a read of another ' +
+      'tab\'s console) affects that one call and nothing after it, so a one-off look at a background tab never ' +
+      'quietly becomes the new default.',
     inputSchema: z.object({
       sessionId,
       pageId: z.string().describe('Tab id from list_tabs to make active.')
