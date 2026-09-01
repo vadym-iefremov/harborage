@@ -1172,7 +1172,9 @@ export const interactionTools = defineTools({
   hover: defineTool({
     serializesInput: true,
     description:
-      'Hover the mouse over an element in a session\'s tab, moving the real pointer to it. Synthetic pointerover/mouseover events dispatched from a script only exercise the page\'s own listeners: they cannot satisfy a CSS-only :hover rule, and they cannot open a tooltip that depends on real pointer geometry. This can. Pass x and y together to hover a specific offset from the element\'s top-left corner. Returns whether the element matches :hover afterwards.',
+      'Hover the mouse over an element in a session\'s tab, moving the real pointer to it. Synthetic pointerover/mouseover events dispatched from a script only exercise the page\'s own listeners: they cannot satisfy a CSS-only :hover rule, and they cannot open a tooltip that depends on real pointer geometry. This can. Pass x and y together to hover a specific offset from the element\'s top-left corner. ' +
+      'This does NOT require the selector to be unique: like click, when it matches several elements the FIRST one is hovered, and no error is raised. The result carries "matchedElements" for that reason, with a note whenever it is more than one, because Playwright selectors pierce open shadow roots and a positional path can match far more of the page than it appears to. Read it before concluding the right thing was hovered. ' +
+      'Returns whether the element matches :hover afterwards as "hovering", read back against the exact element that was hovered rather than the bare selector, because reading a multi-match selector through evaluate is strict mode where hovering it is not: without that, hovering a selector matching several elements used to come back as "hovering": false, the opposite of what really happened, since the readback threw on the ambiguity and the failure was swallowed into a false negative. On the rare occasion the readback genuinely cannot run at all, for instance because the hover triggered something that removed the element from the DOM, "hovering" is null rather than false, with a note explaining why, so a readback that could not run is never mistaken for a confirmed "not hovering".',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -1187,16 +1189,53 @@ export const interactionTools = defineTools({
       }
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
       const position = args.x !== undefined && args.y !== undefined ? { x: args.x, y: args.y } : undefined;
+      // Counted before the hover, the same reason click counts before its own
+      // act: page.hover is not strict either, so with a selector matching
+      // several elements it silently hovers the FIRST one and reports the
+      // same result either way.
+      const matchedElements = await target.page.locator(args.selector).count().catch(() => undefined);
       await target.page.hover(args.selector, position ? { position } : undefined);
+      // Read back against .first(), not the bare locator. locator.evaluate IS
+      // strict mode, so on a selector matching several elements it used to
+      // throw where page.hover just silently acted on the first one, and the
+      // .catch below turned that throw into "hovering": false: a hover that
+      // genuinely landed reported as though it had done nothing at all.
+      // .first() targets the exact element page.hover already acted on, so
+      // the readback can no longer disagree with the act on that account.
+      // A .catch still guards a readback failing for a real reason, such as
+      // the hover itself removing the element from the DOM, and that is
+      // reported as "hovering": null, not false, so it is never misread as a
+      // confirmed "not hovering".
       const hovering = await target.page
         .locator(args.selector)
+        .first()
         .evaluate((el: PageElement) => el.matches(':hover'))
-        .catch(() => false);
+        .catch(() => null);
+
+      const notes: string[] = [];
+      if (matchedElements !== undefined && matchedElements > 1) {
+        notes.push(
+          `This selector matched ${matchedElements} elements and the FIRST one was hovered. Playwright's ` +
+            'selectors pierce open shadow roots, so a positional path can match more of the page than it looks ' +
+            'like it does. Narrow the selector, or confirm with find which element you meant, before trusting ' +
+            'that the right thing was hovered.'
+        );
+      }
+      if (hovering === null) {
+        notes.push(
+          'The hover itself completed, but the readback that checks :hover afterwards could not run, most likely ' +
+            'because the hover triggered something that removed the element from the DOM. "hovering" is null for ' +
+            'that reason, not false: a real "not hovering" only comes from a readback that actually ran.'
+        );
+      }
+
       return text({
         pageId: target.pageId,
         selector: args.selector,
         hovering,
-        ...(position ? { position } : {})
+        ...(position ? { position } : {}),
+        ...(matchedElements !== undefined ? { matchedElements } : {}),
+        ...(notes.length ? { note: notes.join(' ') } : {})
       });
     }
   }),
