@@ -1190,13 +1190,25 @@ interface FenceTarget {
 }
 
 /**
- * The two members the no-selector clear needs off a handle to the focused
- * element. Structural rather than Playwright's own ElementHandle<T>, whose
- * default type parameter is `Node`: this file's tsconfig has no "dom" lib, so
- * naming it does not compile.
+ * A form control that has to be emptied, reached either by a selector or by a
+ * handle to whatever holds focus. Structural rather than Playwright's own
+ * Locator or ElementHandle<T>, whose default type parameter is `Node`: this
+ * file's tsconfig has no "dom" lib, so naming either does not compile.
+ *
+ * `selectText` is on here because it is how a control gets emptied without a
+ * key. Measured on a text input, a number input, an email input, a date input
+ * and a textarea: selectText dispatches no events at all and leaves the
+ * control's own text selected, and the insertText that follows replaces
+ * exactly that.
  */
-interface FocusedFieldHandle extends FenceTarget {
+interface ClearableField extends FenceTarget {
   fill(value: string): Promise<void>;
+  selectText(): Promise<void>;
+  // Both shapes of Playwright's own overloaded evaluate: the fence passes an
+  // argument, the readback does not. Declared here rather than widened on
+  // FenceTarget so nothing else in this file loses the argument's type.
+  evaluate(fn: (el: PageElement, guardSelection: boolean) => boolean, arg: boolean): Promise<boolean>;
+  evaluate(fn: (el: PageElement) => string): Promise<string>;
 }
 
 interface FenceElement extends PageElement {
@@ -1205,19 +1217,24 @@ interface FenceElement extends PageElement {
 }
 
 /**
- * Bounds the keystrokes a replacement sends, so a write goes to the element
- * the caller named and does not also fire the application's own shortcuts.
+ * Keeps a write inside the element the caller named, at the moment the write
+ * is actually dispatched rather than one round trip earlier.
  *
- * This is the defect the Range did not fix, and the distinction is worth being
- * precise about. Scoping the SELECTION bounds what the browser's default
- * deletion touches, and that part works. It does nothing about the fact that a
- * literal Delete key is still pressed, and that key event BUBBLES to every
- * ancestor. Measured: filling an inline contenteditable label inside a canvas
- * node deleted the whole node, because the canvas listens for Delete and
- * removes whatever is focused. The selection was scoped correctly and the
- * sibling content survived. The keystroke did the damage, not the deletion.
+ * Read this together with the change that made it small. Rounds two and three
+ * fought the scope of the deletion, and got that right: a Range over the
+ * target's own contents bounds what the browser's default deletion touches.
+ * Neither addressed the DELIVERY. A literal Delete key was still pressed, and
+ * a key event reaches every ancestor. Measured: filling an inline
+ * contenteditable label inside a canvas node deleted the whole node, because
+ * the canvas listens for Delete and removes whatever is focused. The selection
+ * was scoped correctly and the sibling content survived. The keystroke did the
+ * damage, not the deletion.
  *
- * Two listeners, each doing one job:
+ * That keystroke is gone now. Every write path replaces text with
+ * keyboard.insertText over a live selection, which dispatches no key event at
+ * all, so an ancestor's Delete handler has nothing to hear in either phase.
+ * See setFieldValue for the measurements. What is left for this fence to do is
+ * narrower and still real:
  *
  * A capture listener on `document` runs before anything else in the page (only
  * a window-level capture listener could precede it) and answers the question
@@ -1225,34 +1242,32 @@ interface FenceElement extends PageElement {
  * inside the target at the moment the event is dispatched? A page that moves
  * the selection on `selectionchange` fires after the evaluate that placed and
  * verified the Range has already returned, so verifying in one round trip and
- * pressing in the next is a real window however small it is. Checking inside
+ * writing in the next is a real window however small it is. Checking inside
  * the dispatch is not a smaller window, it is no window: if the selection has
  * moved, the event is cancelled and stopped dead before any handler, the
- * editor's included, can act on it.
+ * editor's included, can act on it. `beforeinput` is cancelable, so the check
+ * covers the insert as well as a key.
  *
- * A bubble listener on the target stops the event going any further UP. The
- * editor's own handlers sit at or below the target and have already run by
- * then, which was verified rather than assumed: with the fence installed, a
- * handler registered on the host at page load still fires, and an ancestor's
- * bubble handler no longer does.
- *
- * What this cannot do, and it is a DOM invariant rather than an oversight: an
- * ancestor's CAPTURE-phase handler runs before the event reaches the target at
- * all, so nothing installed at or below the target can prevent it. Blocking it
- * would mean stopping the event above the target, which would also stop the
- * editor from seeing it. Measured: with the fence installed, an ancestor's
- * capture handler still fires while its bubble handler does not.
- *
- * `beforeinput` is guarded but not stopped. keyboard.insertText fires no key
- * events at all (measured: an insertText produced an empty listener log), so
- * the insert cannot trigger a shortcut, but it CAN land somewhere else if the
- * selection moved after the delete. beforeinput is cancelable, so the same
- * dispatch-time check covers it. It is not stopped from bubbling because a
+ * `beforeinput` is guarded but not stopped from bubbling, because a
  * text-change notification reaching the application is legitimate: the caller
  * did ask for the text to change.
  *
- * Not used for a form control, which never presses a key: `locator.fill` sets
- * the value atomically and fires only input and change.
+ * The keydown half of the guard, and the bubble listeners that stop a key
+ * going further up from the target, are kept even though nothing here presses
+ * a key any more. They are there for exactly the failure that produced
+ * Finding 2: `locator.fill('')` dispatched a real Delete that none of this
+ * code pressed, on a path nobody had enumerated. If a future Playwright
+ * reintroduces a keystroke into a path that reaches this fence, the key is
+ * bounded rather than loose, and round4-write's key-log tests fail loudly
+ * rather than the behaviour changing quietly.
+ *
+ * One thing it still cannot do, and it is a DOM invariant rather than an
+ * oversight: an ancestor's CAPTURE-phase handler runs before the event reaches
+ * the target at all, so nothing installed at or below the target can prevent
+ * it. Blocking it would mean stopping the event above the target, which would
+ * also stop the editor from seeing it. That matters only where a key is still
+ * pressed, which after this change is `type`'s own characters and whatever
+ * `press_key` is told to press, and never a Delete.
  */
 async function installWriteFence(target: FenceTarget, guardSelection: boolean): Promise<boolean> {
   return target
@@ -1345,11 +1360,9 @@ async function removeWriteFence(page: Page): Promise<boolean> {
  * A Range placed over the element's own contents cannot do either. It is
  * scoped structurally rather than by whatever happens to be focused, and it is
  * set in the same round trip that verifies it, so there is no window between
- * deciding and acting. The Delete after it is still a real key press, because
- * an editor with its own document model has to see a real one: CodeMirror 6 on
- * the live Acres app was checked directly through the editor's own
- * state.doc.toString() to confirm the deletion reaches the model, not just the
- * DOM.
+ * deciding and acting. What follows it is an insertText over that Range and no
+ * key at all: see setFieldValue for why the Delete that used to follow is gone
+ * and what was measured on the live CodeMirror 6 in Acres to retire it.
  */
 async function selectElementContents(locator: Locator): Promise<boolean> {
   return locator.evaluate((el: PageElement) => {
@@ -1368,15 +1381,96 @@ async function selectElementContents(locator: Locator): Promise<boolean> {
 }
 
 /**
+ * Sets a form control's value without letting a Delete key out.
+ *
+ * This exists because of Finding 2, which is a fact about Playwright rather
+ * than about this code. Measured on a text input and on a textarea:
+ * `locator.fill('X')` dispatches beforeinput/textInput/input with inputType
+ * insertText and NO key event, while `locator.fill('')` dispatches a real
+ * `keydown: Delete`. So clearing an inline rename input inside a canvas node
+ * deleted the node, while the identical call with a non-empty value was
+ * harmless, through a key none of this code pressed. The 30 seconds Playwright
+ * then spent waiting for the element it had just caused to be removed is how
+ * the report came back as a timeout blaming the selector.
+ *
+ * A non-empty value keeps `locator.fill`, which is already keyless. An empty
+ * one selects the control's own text with `selectText`, which was measured to
+ * dispatch nothing at all, and empties it with `keyboard.insertText('')`,
+ * which was measured to dispatch beforeinput/input with inputType insertText
+ * and no key, on a text input, a number input, an email input and a textarea.
+ *
+ * insertText is inert on the inputs the browser renders as a picker rather
+ * than as text: on `<input type="date">` it dispatched nothing and left the
+ * value alone. So the result is READ BACK and the old `fill('')` is used as a
+ * fallback when it did not take. That fallback is not a hole: Playwright sets
+ * a date, time, colour or range input's value directly, and it was measured
+ * dispatching only input and change on a date input, no key. The keystroke is
+ * confined to the text-like controls, which are exactly the ones insertText
+ * handles, so the fallback is never the destructive path.
+ */
+async function clearOrFillFormControl(
+  page: Page,
+  field: ClearableField,
+  value: string,
+  toolName: string
+): Promise<void> {
+  const fenced = await installWriteFence(field, false);
+  try {
+    if (!fenced) {
+      throw new Error(
+        `${toolName} could not install the guard that keeps a write's keystrokes inside the target element, so it ` +
+          'stopped rather than writing unguarded. Nothing was written.'
+      );
+    }
+    if (value.length > 0) {
+      await field.fill(value);
+      return;
+    }
+    await field.selectText();
+    await page.keyboard.insertText('');
+    const after = await field.evaluate((el: PageElement) => el.value ?? '').catch(() => '');
+    if (after !== '') {
+      // Reached only by a picker-style input, which Playwright empties by
+      // assignment rather than by a key. See the note above.
+      await field.fill('');
+    }
+  } finally {
+    await removeWriteFence(page);
+  }
+}
+
+/**
  * Replaces a field's contents for real.
  *
- * A contenteditable goes through real keyboard events rather than a plain
- * insertion, because CodeMirror and Monaco keep their own document model and
- * treat an insertion as an insert at their own cursor. That is how filling
- * `{{ $json.mode }}` over `result` produced `{{ $json.mode }}result`: the
- * editor never saw the old text go away. Deleting with a key press is what a
- * human does, so the editor handles it the way it handles a human. What is NOT
- * done the way a human does it is the selecting: see selectElementContents.
+ * A contenteditable is replaced by placing a Range over its own contents and
+ * writing over it with `keyboard.insertText`, which dispatches no key event of
+ * any kind. Two earlier attempts are worth recording, because the difference
+ * between them is the whole point of this path.
+ *
+ * Setting the text programmatically does not work. CodeMirror and Monaco keep
+ * their own document model and treat a DOM edit as something other than an
+ * edit: `document.execCommand('delete')` over a correctly placed Range on the
+ * live CodeMirror 6 in Acres reported success and left the old text in the
+ * model, so the insert that followed produced `{{ $json.mode }}1` out of `1`.
+ *
+ * Pressing Delete does work, and it is what this path used to do, and it is
+ * what destroyed user data: the key reaches every ancestor, so a canvas that
+ * treats Delete as "remove the selected node" removed one.
+ *
+ * insertText is the third answer and it is both. Measured on the live
+ * CodeMirror 6 in Acres, through the editor's own `state.doc.toString()`, with
+ * a Range over the whole content and no key pressed at all: a doc of
+ * `{{ $json.mode }}` became `1`, which is the case the Delete was kept for,
+ * and the case execCommand failed. Measured with a page-wide capture listener
+ * at the same time: the only event dispatched was `beforeinput: insertText`.
+ * An empty value goes the same way, verified on the same editor: `ABCDEF`
+ * became the empty string under `insertText('')`, again with no key. And the
+ * replacement stays inside the selection rather than taking the editing host:
+ * on `<span>AAA</span><span>BBB</span><span>CCC</span>` with only the middle
+ * span selected, the host read back `AAAZZZCCC`.
+ *
+ * What is NOT done the way a human does it is the selecting: see
+ * selectElementContents.
  *
  * Before any of that it asks whether the named element can hold typed text and
  * owns the region a deletion would clear, which is a different question from
@@ -1434,32 +1528,7 @@ async function setFieldValue(page: Page, locator: Locator, value: string): Promi
   }
 
   if (formControlTags.includes(target.tag)) {
-    // Fenced, even though this presses no key of OUR making, because
-    // Playwright's own fill does. Measured directly: fill("X") on an input
-    // dispatches no key event at all, and fill("") dispatches a real Delete,
-    // on both an input and a textarea. That is how clearing an inline rename
-    // input inside a canvas node deleted the node while the identical call
-    // with a non-empty value was harmless.
-    //
-    // The selection guard is NOT applied here, and that is deliberate rather
-    // than an omission: a form control keeps its selection in selectionStart
-    // and selectionEnd, not in the document selection, and while an input has
-    // focus document.getSelection() reports a range that is not inside the
-    // input at all. Measured. A guard asking whether the document selection
-    // sits inside the control would refuse every clear. Bounding the keystroke
-    // is the part that applies, and it is applied.
-    const fenced = await installWriteFence(locator as unknown as FenceTarget, false);
-    try {
-      if (!fenced) {
-        throw new Error(
-          'fill could not install the guard that keeps a write\'s keystrokes inside the target element, so it ' +
-            'stopped rather than writing unguarded. Nothing was written.'
-        );
-      }
-      await locator.fill(value);
-    } finally {
-      await removeWriteFence(page);
-    }
+    await clearOrFillFormControl(page, locator as unknown as ClearableField, value, 'fill');
     return;
   }
 
@@ -1485,46 +1554,39 @@ async function setFieldValue(page: Page, locator: Locator, value: string): Promi
   const selected = await selectElementContents(locator);
   if (!selected) {
     throw new Error(
-      'fill could not place a selection over the target element\'s own contents, so it stopped rather than pressing ' +
-        'Delete against whatever else happened to be selected. The element may be inside a widget that manages its ' +
-        'own selection. Nothing was written.'
+      'fill could not place a selection over the target element\'s own contents, so it stopped rather than writing ' +
+        'over whatever else happened to be selected. The element may be inside a widget that manages its own ' +
+        'selection. Nothing was written.'
     );
   }
 
-  // The Delete below is a real key press because it has to be: an editor with
-  // its own document model treats a programmatic deletion as something other
-  // than a deletion. Measured on the live CodeMirror 6 in Acres,
-  // document.execCommand('delete') over a correctly placed Range reported
-  // success and left the old text in the model, so the insert that followed
-  // produced "{{ $json.mode }}1" out of "1", which is exactly the append this
-  // whole path exists to prevent. So the key stays, and the fence bounds it.
+  // One insertText over the live selection, and no key. See this function's
+  // note for what was measured on the live CodeMirror 6 in Acres, for both an
+  // empty and a non-empty value.
   const fenced = await installWriteFence(locator as unknown as FenceTarget, true);
   let blocked = false;
   try {
     if (!fenced) {
       throw new Error(
-        'fill could not install the guard that keeps a replacement\'s keystrokes inside the target element, so it ' +
-          'stopped rather than pressing Delete unguarded. Nothing was written.'
+        'fill could not install the guard that keeps a replacement inside the target element, so it stopped rather ' +
+          'than writing unguarded. Nothing was written.'
       );
     }
-    await page.keyboard.press('Delete');
-    if (value.length > 0) {
-      await page.keyboard.insertText(value);
-    }
+    await page.keyboard.insertText(value);
   } finally {
     blocked = await removeWriteFence(page);
   }
 
   // The fence cancels rather than lets through, so this is a report of
   // something that did NOT happen: the selection had moved out of the target
-  // between being placed and the key being dispatched, and the keystroke was
+  // between being placed and the write being dispatched, and the write was
   // stopped before any handler saw it.
   if (blocked) {
     throw new Error(
-      'fill placed a selection over the target element and the page moved it somewhere else before the keystroke ' +
-        'landed, so the keystroke was cancelled rather than allowed to delete whatever was selected by then. This ' +
-        'is what a page that reasserts its own selection on selectionchange does. The element was not written to, ' +
-        'and nothing else was deleted either. Try again, or set the value through evaluate if the page will not ' +
+      'fill placed a selection over the target element and the page moved it somewhere else before the write ' +
+        'landed, so the write was cancelled rather than allowed to replace whatever was selected by then. This is ' +
+        'what a page that reasserts its own selection on selectionchange does. The element was not written to, and ' +
+        'nothing else was overwritten either. Try again, or set the value through evaluate if the page will not ' +
         'leave a selection alone.'
     );
   }
@@ -3126,20 +3188,19 @@ export const interactionTools = defineTools({
           if (locator) {
             await setFieldValue(target.page, locator, '');
           } else {
-            // No key is pressed here, and that is the point. The guard above
-            // has already refused everything except a focused form control, so
-            // the only thing left to clear is one control's own value, and
-            // Playwright's fill sets that atomically while firing input and
-            // change and no key event at all.
+            // No key is pressed here, and that is the point. This path used to
+            // press Delete itself, which made it destructive while the SAME
+            // clear on the SAME element was safe with a selector. Measured on
+            // a canvas whose nodes hold an inline rename input, with an
+            // ordinary canvas-level Delete handler: the node was removed, and
+            // the result carried previousValue "two" and the whole page's text
+            // as "value", blaming the page for rewriting the input.
             //
-            // Pressing Delete instead is what made this path destructive while
-            // the SAME clear on the SAME element was safe with a selector,
-            // which is the asymmetry that gave it away: the selector path
-            // reaches locator.fill and presses nothing. Measured on a canvas
-            // whose nodes hold an inline rename input, with an ordinary
-            // canvas-level Delete handler: the node was removed, and the
-            // result carried previousValue "two" and the whole page's text as
-            // "value", blaming the page for rewriting the input.
+            // Handing it to Playwright's fill was not the answer either, and
+            // that is Finding 2: fill('') dispatches a real Delete of its own.
+            // It goes through the same select-then-insertText clear the
+            // selector path uses, which was measured to dispatch no key at
+            // all. See clearOrFillFormControl.
             //
             // The handle comes from the same shadow-piercing descent
             // readFieldValue uses, so a control inside an open shadow root is
@@ -3157,7 +3218,7 @@ export const interactionTools = defineTools({
             // return type, which is this file's hand-rolled element interface
             // rather than a real Element, so asElement() cannot narrow to
             // anything useful on its own.
-            const focusedElement = focusedHandle.asElement() as unknown as FocusedFieldHandle | null;
+            const focusedElement = focusedHandle.asElement() as unknown as ClearableField | null;
             try {
               if (!focusedElement) {
                 throw new Error(
@@ -3165,21 +3226,7 @@ export const interactionTools = defineTools({
                     'something it could not identify. Nothing was typed and nothing was cleared.'
                 );
               }
-              // Fenced for the same reason the selector path is: Playwright's
-              // fill dispatches a real Delete when the value is empty, which
-              // is exactly the case a clear always is.
-              const fenced = await installWriteFence(focusedElement, false);
-              try {
-                if (!fenced) {
-                  throw new Error(
-                    'type could not install the guard that keeps a clear\'s keystrokes inside the focused element, ' +
-                      'so it stopped rather than clearing unguarded. Nothing was typed and nothing was cleared.'
-                  );
-                }
-                await focusedElement.fill('');
-              } finally {
-                await removeWriteFence(target.page);
-              }
+              await clearOrFillFormControl(target.page, focusedElement, '', 'type');
             } finally {
               await focusedHandle.dispose();
             }
