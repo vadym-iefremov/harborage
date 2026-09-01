@@ -1225,6 +1225,46 @@ type WriteFenceMode = 'none' | 'inside' | 'covering';
 
 interface FenceTarget {
   evaluate(fn: (el: PageElement, mode: string) => boolean, arg: string): Promise<boolean>;
+  // How the frame the element actually lives in is reached. A Locator offers
+  // elementHandle(), an ElementHandle offers ownerFrame() directly, and both
+  // are optional here because a given target only has one of them.
+  elementHandle?(): Promise<FenceHandle | null>;
+  ownerFrame?(): Promise<FenceFrame | null>;
+}
+
+/** An ElementHandle, in the two members resolving a frame needs. */
+interface FenceHandle {
+  ownerFrame(): Promise<FenceFrame | null>;
+  dispose(): Promise<void>;
+}
+
+/** A Frame, in the one member taking the fence down needs. */
+interface FenceFrame {
+  evaluate(fn: () => boolean): Promise<boolean>;
+}
+
+/**
+ * An installed fence, which knows the frame it went up in.
+ *
+ * It has to. The listeners land on the ELEMENT's frame, because that is where
+ * `evaluate` on a locator runs, while the old teardown took a `Page` and ran on
+ * the MAIN frame. Through a frame-prefixed selector, which `list_frames` tells
+ * agents to build and which `fill` and `type` both accept, the two are
+ * different documents: the teardown cleared a fence that was never there and
+ * read a `blocked` flag off a `window` that had none, while the real fence
+ * stayed installed in the iframe for the life of that document.
+ *
+ * That is not a leak of memory, it is a leak of BEHAVIOUR. The guard is a
+ * capture-phase keydown listener that cancels a keystroke whose selection is
+ * not inside the element it was installed for, so every later write into that
+ * frame was silently suppressed. Measured on a same-origin iframe: after one
+ * contenteditable fill through a frame-prefixed selector, a later `type` into
+ * an input in that frame reported the field's value unchanged and, read from
+ * inside the frame, the characters had never arrived.
+ */
+interface WriteFence {
+  /** Takes the fence down in the frame it went up in, and reports whether it cancelled anything. */
+  remove(): Promise<boolean>;
 }
 
 /**
@@ -1312,15 +1352,15 @@ interface FenceElement extends PageElement {
  * rather than the behaviour changing quietly.
  *
  * One thing it still cannot do, and it is a DOM invariant rather than an
- * oversight: an ancestor's CAPTURE-phase handler runs before the event reaches
+ * oversight: an ancestor\'s CAPTURE-phase handler runs before the event reaches
  * the target at all, so nothing installed at or below the target can prevent
  * it. Blocking it would mean stopping the event above the target, which would
  * also stop the editor from seeing it. That matters only where a key is still
  * pressed, which after this change is `type`'s own characters and whatever
  * `press_key` is told to press, and never a Delete.
  */
-async function installWriteFence(target: FenceTarget, mode: WriteFenceMode): Promise<boolean> {
-  return target
+async function installWriteFence(target: FenceTarget, mode: WriteFenceMode): Promise<WriteFence | null> {
+  const installed = await target
     .evaluate((raw: PageElement, fenceMode: string) => {
       const el = raw as unknown as FenceElement;
       const controller = new AbortController();
@@ -1383,18 +1423,44 @@ async function installWriteFence(target: FenceTarget, mode: WriteFenceMode): Pro
       return true;
     }, mode)
     .catch(() => false);
+  if (!installed) return null;
+
+  // Resolve the frame the listeners actually landed on, rather than assuming
+  // the main one. A Locator has to go through an ElementHandle to get there;
+  // an ElementHandle already knows.
+  let frame: FenceFrame | null = null;
+  if (target.ownerFrame) {
+    frame = await target.ownerFrame().catch(() => null);
+  } else if (target.elementHandle) {
+    const handle = await target.elementHandle().catch(() => null);
+    if (handle) {
+      frame = await handle.ownerFrame().catch(() => null);
+      await handle.dispose().catch(() => undefined);
+    }
+  }
+
+  // If the frame cannot be resolved, the fence is taken down NOW, through the
+  // target that just installed it, and the caller is told the install failed.
+  // Falling back to the page would be the original bug written down as a
+  // policy: a fence nothing can reach is worse than no fence, because it
+  // cancels keystrokes for the life of the document.
+  if (!frame) {
+    await target.evaluate(takeFenceDown as unknown as (el: PageElement, mode: string) => boolean, '').catch(() => false);
+    return null;
+  }
+  return { remove: () => frame.evaluate(takeFenceDown).catch(() => false) };
 }
 
-/** Takes the fence down and reports whether it had to cancel anything. Always safe to call. */
-async function removeWriteFence(page: Page): Promise<boolean> {
-  return page
-    .evaluate(() => {
-      const state = window.__harborageWriteFence;
-      state?.controller?.abort();
-      window.__harborageWriteFence = undefined;
-      return state?.blocked ?? false;
-    })
-    .catch(() => false);
+/**
+ * Aborts whatever fence the frame this runs in is holding, and reports whether
+ * it had cancelled anything. A no-op when there is none, so it is always safe
+ * to call, including on a path that failed before installing.
+ */
+function takeFenceDown(): boolean {
+  const state = window.__harborageWriteFence;
+  state?.controller?.abort();
+  window.__harborageWriteFence = undefined;
+  return state?.blocked ?? false;
 }
 
 /**
@@ -1509,7 +1575,7 @@ async function clearOrFillFormControl(
       await field.fill('');
     }
   } finally {
-    await removeWriteFence(page);
+    await fenced?.remove();
   }
 }
 
@@ -1661,7 +1727,7 @@ async function setFieldValue(page: Page, locator: Locator, value: string): Promi
     }
     await page.keyboard.insertText(value);
   } finally {
-    blocked = await removeWriteFence(page);
+    blocked = (await fenced?.remove()) ?? false;
   }
 
   // The fence cancels rather than lets through, so this is a report of
@@ -1767,7 +1833,7 @@ async function replaceKeylesslyOrFallBack(
     if (!deleteFenced) return;
     await page.keyboard.press('Delete');
   } finally {
-    deleteBlocked = await removeWriteFence(page);
+    deleteBlocked = (await deleteFenced?.remove()) ?? false;
   }
   if (deleteBlocked || value.length === 0) return;
 
@@ -1776,7 +1842,7 @@ async function replaceKeylesslyOrFallBack(
     if (!fenced) return;
     await page.keyboard.insertText(value);
   } finally {
-    await removeWriteFence(page);
+    await fenced?.remove();
   }
 }
 
@@ -3273,7 +3339,7 @@ export const interactionTools = defineTools({
       'Replacement also cannot reach outside the element you named: an insertText over a Range replaces exactly that Range. Verified on a contenteditable holding three spans with only the middle one selected, which read back with the outer two intact. ' +
       'The selector still has to name an element that can hold typed text AND own the region a replacement would cover, and both are checked before anything is written, because a selection is scoped by the browser: to a form control\'s own value, or to the whole contenteditable EDITING HOST, never to whatever element you happened to name. So this accepts a text-holding input, a textarea, or an element that is itself a contenteditable root. It refuses an element that merely SITS INSIDE an editable region, because isContentEditable is inherited and a replacement there can take the whole region: measured on a page whose canvas sat inside one, a clear took it from three nodes and 91 characters to one node and 14. The refusal names the host so you can decide whether you meant it. It also refuses <body> and <html> even on a contenteditable or designMode page, a <select> (use select_option), a checkbox, radio, button or file input (click, or file_upload), a readonly or disabled control (said at once rather than after the full timeout), and a selector matching several elements. A selector matching nothing is waited for the way Playwright waits for any selector and then explained, saying what it measured and when. ' +
       'A page that reasserts its own selection can still move it between the Range being placed and the write being dispatched. That window is checked inside the dispatch rather than before it, so when it happens the write is cancelled before any handler sees it and this says so, rather than writing somewhere else and reporting success. ' +
-      'Reads the field back afterwards, but that readback is DOM textContent, which two families of editor defeat in different ways. Virtualizing code editors (Monaco, CodeMirror 5 and 6, Ace) keep only the lines currently on screen in the DOM, so a long document reads back truncated, with no newlines, and can carry gutter line numbers or a hidden measurement layer along with the text. Rich-text editors (Quill, ProseMirror, TipTap, Slate, Lexical) render everything and lose every line break, and anything that is not text contributes nothing at all. An element with an EditContext attached keeps its real text outside the DOM entirely. All of these markers are looked for at the named element, above it (out through any open shadow root), and ANYWHERE in its subtree, because a selector aimed at a wrapper is the ordinary case and how far above the editor it sits is not the question: whether the text about to be read back contains an editor\'s render is. When the target is one of these the result says so plainly: "readbackReliable" is false, "matched" is not claimed either way, and "note" names the editor\'s own API to read the value through instead. For an ordinary field the result carries "value" (what the field really contains now), "matched", "readbackReliable": true, and a "note" explaining the difference when value and the request disagree.',
+      'A note on what this cannot promise. A replacement is done with insertText over a live selection, which dispatches no key event at all, so on the ordinary path nothing the page listens for as a shortcut ever fires. One narrow fallback still presses a real Delete: an editor that REFUSED the keyless insert, detected by the old content still hanging off one end of the value. There, and only there, a key is dispatched, and it is bounded by a listener on the target that stops it travelling further up the tree. That bound cannot cover an ancestor\'s CAPTURE-phase handler, because capture reaches ancestors before the target and nothing installed at or below the target can precede it. So a page whose ancestor listens for Delete in the capture phase will still see that key on that fallback. If that matters, check the result, which reads the field back either way, or set the value through evaluate. Reads the field back afterwards, but that readback is DOM textContent, which two families of editor defeat in different ways. Virtualizing code editors (Monaco, CodeMirror 5 and 6, Ace) keep only the lines currently on screen in the DOM, so a long document reads back truncated, with no newlines, and can carry gutter line numbers or a hidden measurement layer along with the text. Rich-text editors (Quill, ProseMirror, TipTap, Slate, Lexical) render everything and lose every line break, and anything that is not text contributes nothing at all. An element with an EditContext attached keeps its real text outside the DOM entirely. All of these markers are looked for at the named element, above it (out through any open shadow root), and ANYWHERE in its subtree, because a selector aimed at a wrapper is the ordinary case and how far above the editor it sits is not the question: whether the text about to be read back contains an editor\'s render is. When the target is one of these the result says so plainly: "readbackReliable" is false, "matched" is not claimed either way, and "note" names the editor\'s own API to read the value through instead. For an ordinary field the result carries "value" (what the field really contains now), "matched", "readbackReliable": true, and a "note" explaining the difference when value and the request disagree.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -3337,7 +3403,7 @@ export const interactionTools = defineTools({
       'With no selector the keystrokes go to whatever currently has focus, and this refuses unless that element can actually HOLD typed text: a text-holding input, a textarea, or a contenteditable root. Taking focus is not the same as taking text, and the difference is destructive. React Flow gives canvas nodes tabindex="0" so they can handle arrow keys, so an ordinary click on an Acres node leaves focus on a plain <div>; typing into it does not go where you meant. Reading that same <div> back returns its rendered text and inline CSS rather than any field\'s value. ' +
       'clear: true is refused outright when the caret sits in a contenteditable EDITING REGION rather than a form control, because with no selector nothing named what is about to be replaced and the region can be an entire document. Note that clicking a widget inside such a region focuses the REGION, not the widget: on a page whose canvas sat inside one this took it from three nodes and 91 characters to one node and 14. The message names the region, so passing it as "selector" is all the retry needs. Typing without clear is unaffected, since an insertion has no blast radius. The caret holder is resolved through open shadow roots, because document.activeElement reports the shadow HOST rather than the element that really has focus. A selector matching several elements is refused too, since choosing one of them would change the page, and one matching NOTHING is waited for and then explained rather than surfacing as a bare Playwright timeout. ' +
       'With a selector, this does NOT refuse a target that cannot hold text, because routing real keystrokes at a focused widget is a legitimate thing to want and press_key alone does not cover it. What it will not do is let you believe the characters went where you aimed them. Playwright focuses the located element and then types at whatever holds the caret, so when the focus attempt does not land the text goes somewhere else entirely: the caret holder is compared against the named element before a single character is sent, and when they differ the result names the element that really received the text and does not claim "matched", since reading back an element nothing was typed into answers a different question. ' +
-      'Reads the field back afterwards, but that readback is DOM textContent, which virtualizing code editors (Monaco, CodeMirror 5 and 6, Ace) defeat by rendering only what is on screen, and rich-text editors (Quill, ProseMirror, TipTap, Slate, Lexical) defeat by losing every line break and every non-text node. An element with an EditContext attached keeps its real text outside the DOM entirely. Those markers are looked for at the target, above it (out through any open shadow root) and anywhere in its subtree, so a wrapper any distance above the editor root is still recognised. When the target is one of these the result says so plainly: "readbackReliable" is false, "matched" is not claimed either way, and "note" names the editor\'s own API to read the value through instead. For an ordinary field the result carries "value" (what the field really contains now), "previousValue" (what it held BEFORE the call, clear included, so a clear cannot throw something away invisibly), "matched", "readbackReliable": true, and a "note" when what landed is not the typed text inserted into what was already there.',
+      'A note on what this cannot promise. A replacement is done with insertText over a live selection, which dispatches no key event at all, so on the ordinary path nothing the page listens for as a shortcut ever fires. One narrow fallback still presses a real Delete: an editor that REFUSED the keyless insert, detected by the old content still hanging off one end of the value. There, and only there, a key is dispatched, and it is bounded by a listener on the target that stops it travelling further up the tree. That bound cannot cover an ancestor\'s CAPTURE-phase handler, because capture reaches ancestors before the target and nothing installed at or below the target can precede it. So a page whose ancestor listens for Delete in the capture phase will still see that key on that fallback. If that matters, check the result, which reads the field back either way, or set the value through evaluate. Reads the field back afterwards, but that readback is DOM textContent, which virtualizing code editors (Monaco, CodeMirror 5 and 6, Ace) defeat by rendering only what is on screen, and rich-text editors (Quill, ProseMirror, TipTap, Slate, Lexical) defeat by losing every line break and every non-text node. An element with an EditContext attached keeps its real text outside the DOM entirely. Those markers are looked for at the target, above it (out through any open shadow root) and anywhere in its subtree, so a wrapper any distance above the editor root is still recognised. When the target is one of these the result says so plainly: "readbackReliable" is false, "matched" is not claimed either way, and "note" names the editor\'s own API to read the value through instead. For an ordinary field the result carries "value" (what the field really contains now), "previousValue" (what it held BEFORE the call, clear included, so a clear cannot throw something away invisibly), "matched", "readbackReliable": true, and a "note" when what landed is not the typed text inserted into what was already there.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -3461,6 +3527,24 @@ export const interactionTools = defineTools({
               'that looks focused. Note that clicking a widget inside such a region focuses the REGION, not the ' +
               `widget. Pass selector: ${JSON.stringify(cssPathHint(holder))} if clearing the whole region is what ` +
               'you meant, or name the specific field. Nothing was typed and nothing was cleared.'
+          );
+        }
+
+        // An IFRAME here is not an ordinary "cannot receive text": something
+        // in that frame very likely CAN. document.activeElement on the main
+        // frame reports the <iframe> ELEMENT whenever focus is inside it, the
+        // same retargeting the shadow-root descent handles, and this path has
+        // no frame to descend into. Measured: with an input focused inside a
+        // same-origin iframe, the main frame reports IFRAME and this refused,
+        // which is safe and, without saying why, misleading.
+        if (holder.tag === 'IFRAME') {
+          throw new Error(
+            `type has no selector, and the element that currently has focus is ${describeTextTarget(holder)}, which ` +
+              'means focus is inside that frame rather than on anything this path can see: document.activeElement on ' +
+              'the main frame reports the iframe element itself, not the field inside it. Name the field with a ' +
+              'frame-prefixed selector instead, which list_frames will build for you, for example ' +
+              '"iframe >> nth=0 >> internal:control=enter-frame >> #field". Nothing was typed' +
+              (args.clear ? ' and nothing was cleared.' : '.')
           );
         }
 
