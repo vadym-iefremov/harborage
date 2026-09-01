@@ -88,7 +88,8 @@ async function main(): Promise<void> {
         screenshotCacheDir: config.screenshotCacheDir,
         screenshotCacheTtlMs: config.screenshotCacheTtlMs
       }),
-      startedAt
+      startedAt,
+      logger
     );
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'EADDRINUSE') {

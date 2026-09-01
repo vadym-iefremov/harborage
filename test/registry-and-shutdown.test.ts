@@ -71,13 +71,21 @@ test('a stale registry entry (dead PID) gets pruned, and the daemon shuts down o
 
 test('a live, correctly-registered client keeps the daemon alive; removing it lets the daemon shut down', async () => {
   const config = await makeTestConfig({ sweepIntervalMs: 150, shutdownGraceMs: 100 });
-  const daemon = track(spawnDaemonProcess(config));
-  await waitFor(() => isDaemonHealthy(config), { timeoutMs: 10_000 });
 
+  // Registered before the daemon starts, which is the order the real wrapper
+  // uses (see registerInDaemonRegistry in src/client/wrapper.ts) and the same
+  // order the stale-entry test above already used. Registering after the
+  // daemon was healthy meant this setup had to spawn a process and fork `ps`
+  // inside the daemon's 150ms sweep interval, and losing that race exits the
+  // daemon on an empty registry, which shows up here as the assertion below
+  // failing for a reason that has nothing to do with what it is testing.
   const client = spawnInertProcess();
   const startedAt = await getProcessStartTime(client.pid);
   assert.ok(startedAt);
   await registerSelf(config.registryPath, client.pid, startedAt!);
+
+  const daemon = track(spawnDaemonProcess(config));
+  await waitFor(() => isDaemonHealthy(config), { timeoutMs: 10_000 });
 
   // Several sweeps pass while the client is alive and correctly registered.
   await new Promise(resolve => setTimeout(resolve, 700));

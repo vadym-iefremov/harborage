@@ -100,25 +100,113 @@ interface DaemonConnection {
   invalidate: (stale: Client) => void;
 }
 
+/**
+ * Announces this wrapper in the shared client registry.
+ *
+ * Called BEFORE anything asks the daemon whether it is alive, and that
+ * ordering is the point rather than tidiness. The daemon's sweep exits the
+ * moment it sees an empty registry with no live session, and a wrapper that
+ * has not written its entry yet is indistinguishable from one that does not
+ * exist. Registering afterwards left a window on every single arrival: the
+ * daemon answers `/health`, and only THEN does the wrapper fork `ps` for its
+ * own start time and write the registry file, work that on a loaded machine
+ * takes longer than the daemon's next sweep. Reproduced deterministically by
+ * slowing that one `ps` to 250ms, at which point the daemon logs
+ * `sweep.shutdown reason=registry-empty clients=0 sessions=0 uptimeMs=207`
+ * and the wrapper's first tool call comes back as a bare "fetch failed"
+ * (cause: ECONNREFUSED). Registering first means the daemon's very first
+ * sweep already counts us.
+ *
+ * Registering before a daemon is known to exist is safe, and is what the
+ * entry has always meant: "this PID intends to use the daemon", not "this
+ * PID is connected". The sweep's own `pruneDead` removes it as soon as this
+ * process is gone, keyed on pid AND start time so a reused PID is never
+ * mistaken for it.
+ */
+async function registerInDaemonRegistry(config: Config): Promise<void> {
+  const startedAt = await getProcessStartTime(process.pid);
+  if (!startedAt) {
+    console.error('[harborage] could not determine this process\'s own start time; skipping registry registration');
+    return;
+  }
+  await registerSelf(config.registryPath, process.pid, startedAt).catch(err => {
+    console.error('[harborage] failed to register with the daemon registry (continuing anyway):', err);
+  });
+}
+
+/**
+ * What a caller is told when the wrapper cannot get a connection open at all,
+ * in place of the bare `TypeError: fetch failed` undici raises.
+ *
+ * That string is the exact failure this codebase has been eliminating
+ * everywhere else, and it is at its least useful here: a caller handed it
+ * cannot tell a daemon that is not running from one that is refusing from a
+ * bug in its own call. This names which of those it was, says that no tool
+ * ran so nothing needs undoing, and points at the one file that explains why.
+ */
+function connectFailureMessage(config: Config, reason: string): string {
+  return (
+    `Could not open a connection to the harborage daemon at http://${config.host}:${config.port}/mcp (${reason}), ` +
+    'and a second attempt, after making sure a daemon was running, failed the same way. No tool call was sent, so ' +
+    'nothing ran and no browser state changed. This is the daemon being unreachable rather than anything wrong ' +
+    `with the call: read ${config.daemonLogPath} for why it exited or refused (a \`daemon.port-in-use\` line there ` +
+    `means something else already holds port ${config.port}), and check that no stale process is bound to it.`
+  );
+}
+
 function createDaemonConnection(config: Config): DaemonConnection {
   let inflight: Promise<Client> | null = null;
   let current: Client | null = null;
 
+  /**
+   * One attempt at the Streamable HTTP handshake. Closes the half-built
+   * client if it fails, so a failed attempt does not leave a socket or an SSE
+   * stream behind for the retry to pile on top of.
+   */
+  async function openClient(): Promise<Client> {
+    const client = new Client({ name: 'harborage-client-wrapper', version: '0.2.0' });
+    try {
+      await client.connect(new StreamableHTTPClientTransport(new URL(`http://${config.host}:${config.port}/mcp`)));
+    } catch (err) {
+      await client.close().catch(() => {
+        // Nothing was ever established; this is hygiene, not correctness.
+      });
+      throw err;
+    }
+    return client;
+  }
+
   async function connect(): Promise<Client> {
+    // Before ensureDaemonRunning, deliberately. See registerInDaemonRegistry.
+    await registerInDaemonRegistry(config);
     await ensureDaemonRunning(config);
 
-    const startedAt = await getProcessStartTime(process.pid);
-    if (startedAt) {
-      await registerSelf(config.registryPath, process.pid, startedAt).catch(err => {
-        console.error('[harborage] failed to register with the daemon registry (continuing anyway):', err);
-      });
-    } else {
-      console.error('[harborage] could not determine this process\'s own start time; skipping registry registration');
-    }
+    try {
+      return await openClient();
+    } catch (err) {
+      const reason = transportFailureReason(err);
+      if (reason === null) throw err;
 
-    const client = new Client({ name: 'harborage-client-wrapper', version: '0.2.0' });
-    await client.connect(new StreamableHTTPClientTransport(new URL(`http://${config.host}:${config.port}/mcp`)));
-    return client;
+      // `ensureDaemonRunning` can only ever prove the daemon was healthy at
+      // the instant it asked. A daemon deciding to exit between that answer
+      // and this handshake is a race no ordering closes, only recovers from,
+      // and recovering is exactly what a forwarded call already does on this
+      // same class of failure. Connection setup was the one path with no
+      // such recovery: it runs before `forwardTool`'s try block, so a
+      // transport error here bypassed the reconnect entirely and reached the
+      // caller as a bare "fetch failed".
+      console.error(
+        `[harborage] the daemon stopped answering while this wrapper was connecting to it (${reason}); ` +
+          'making sure one is running and connecting once more. Nothing had been sent yet, so no tool call is at risk.'
+      );
+      await ensureDaemonRunning(config);
+      try {
+        return await openClient();
+      } catch (retryErr) {
+        const retryReason = transportFailureReason(retryErr) ?? 'unknown transport failure';
+        throw new Error(connectFailureMessage(config, retryReason), { cause: retryErr });
+      }
+    }
   }
 
   function ensureReady(): Promise<Client> {

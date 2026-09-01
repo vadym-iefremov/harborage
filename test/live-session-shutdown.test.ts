@@ -147,14 +147,27 @@ test('the declined shutdown is logged with both counts, and is not logged at all
 
 test('killing the last registered client wrapper mid-flight leaves the daemon and its live session intact', async () => {
   const config = await makeTestConfig({ sweepIntervalMs: 150, shutdownGraceMs: 100, idleTimeoutMs: 60_000 });
-  const daemon = track(spawnDaemonProcess(config));
-  await waitFor(() => isDaemonHealthy(config), { timeoutMs: 20_000, message: 'daemon never became healthy' });
 
-  // A registered client wrapper, exactly as the real wrapper registers itself.
+  // A registered client wrapper, in the same order the real wrapper does it:
+  // into the registry FIRST, before anything asks whether a daemon is up.
+  // That ordering is the production fix for this exact race (see
+  // registerInDaemonRegistry in src/client/wrapper.ts), not a convenience
+  // here. Registering only after the daemon was healthy left this setup
+  // racing the daemon's own 150ms sweep, which exits on an empty registry
+  // with no live session: spawning the stand-in process and forking `ps` for
+  // its start time had to finish inside that window, and on a loaded machine
+  // it sometimes did not. The daemon then exited at `sweep.shutdown
+  // reason=registry-empty clients=0 sessions=0 uptimeMs=170` and the connect
+  // below failed with `fetch failed` (cause: ECONNRESET). Nothing about the
+  // property under test moves: the daemon still meets a registry holding
+  // exactly one live wrapper, which is what the kill below then empties.
   const wrapper = track(spawnInertProcess());
   const startedAt = await getProcessStartTime(wrapper.pid);
   assert.ok(startedAt);
   await registerSelf(config.registryPath, wrapper.pid, startedAt!);
+
+  const daemon = track(spawnDaemonProcess(config));
+  await waitFor(() => isDaemonHealthy(config), { timeoutMs: 20_000, message: 'daemon never became healthy' });
 
   const client = new Client({ name: 'live-session-shutdown-test', version: '1.0.0' });
   await client.connect(new StreamableHTTPClientTransport(new URL(`http://${config.host}:${config.port}/mcp`)));

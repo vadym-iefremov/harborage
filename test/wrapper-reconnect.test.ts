@@ -7,6 +7,7 @@ import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 
 import { cliEntry, cleanupTempDirs, daemonHealth, makeTestConfig, waitFor, wrapperEnv } from './helpers.js';
+import { readRegistry } from '../src/shared/registry.js';
 import type { Config } from '../src/shared/config.js';
 
 const clients: Client[] = [];
@@ -171,6 +172,98 @@ test('a tool that genuinely ran and failed is not retried: the work happens exac
   assert.equal(afterHealth.pid, before.pid, 'a tool error must not trigger a daemon respawn');
 
   await client.callTool({ name: 'release_session', arguments: { sessionId } });
+});
+
+test('the wrapper puts itself in the client registry before it asks whether a daemon is even up', async () => {
+  // The daemon takes three seconds to open its listener, so "the registry
+  // already names this wrapper while nothing is answering /health yet" is a
+  // state that can only exist if registration genuinely runs first.
+  const config = await makeTestConfig({
+    sweepIntervalMs: 60_000,
+    shutdownGraceMs: 60_000,
+    testStartupDelayMs: 3000,
+    daemonReadyTimeoutMs: 20_000,
+    daemonHealthPollMs: 50
+  });
+  configs.push(config);
+
+  await connectWrapper(config, 'wrapper-registers-first-test');
+
+  // Ordering, sampled rather than assumed: each pass reads both facts, and
+  // the test only passes on a pass that sees a registered wrapper with no
+  // daemon behind it. The moment a daemon answers, the window is over and
+  // the ordering was the wrong way round.
+  //
+  // This is the race that made handshake-not-blocked flake. Registering after
+  // ensureDaemonRunning meant the wrapper forked `ps` for its own start time
+  // and wrote the registry file only once the daemon was already up and
+  // already sweeping, so a daemon whose registry was still empty at its first
+  // sweep exited underneath the wrapper connecting to it, and the wrapper's
+  // first tool call came back as a bare "fetch failed".
+  let registeredBeforeDaemonWasUp = false;
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
+    const registered = (await readRegistry(config.registryPath)).length > 0;
+    const health = await daemonHealth(config);
+    if (registered && health === null) {
+      registeredBeforeDaemonWasUp = true;
+      break;
+    }
+    if (health !== null) break;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  assert.ok(
+    registeredBeforeDaemonWasUp,
+    'the wrapper must be in the registry before any daemon answers /health; registering afterwards leaves a window ' +
+      'in which the daemon sees an empty registry and shuts down under a client that is connecting to it'
+  );
+
+  // And the ordering did not cost the connection: the daemon still comes up
+  // and the wrapper still talks to it.
+  await waitFor(async () => (await daemonHealth(config)) !== null, {
+    timeoutMs: 20_000,
+    message: 'the daemon this wrapper spawned should still have come up'
+  });
+  const client = clients.at(-1)!;
+  const listed = await client.callTool({ name: 'list_sessions', arguments: {} });
+  assert.ok(!listed.isError, `expected a working connection after registering first: ${JSON.stringify(listed)}`);
+});
+
+test('a daemon that answers /health but drops the MCP handshake gives guidance, not a bare "fetch failed"', async () => {
+  const config = await makeTestConfig({ sweepIntervalMs: 60_000, shutdownGraceMs: 60_000 });
+
+  // Deliberately NOT pushed onto `configs`: nothing real is listening here,
+  // so the after hook must not try to SIGTERM whatever pid /health reports.
+  //
+  // This stands in for the narrow race no ordering can close: the daemon was
+  // genuinely healthy when ensureDaemonRunning asked, and had gone by the
+  // time the handshake reached it. Destroying the socket is what a daemon
+  // exiting mid-handshake does to the connection, and it is what produced the
+  // ECONNRESET behind the `fetch failed` that made live-session-shutdown
+  // flake.
+  const server = createServer((req, res) => {
+    if (req.url === '/health') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok', pid: 0, uptimeMs: 0 }));
+      return;
+    }
+    req.socket.destroy();
+  });
+  servers.push(server);
+  await new Promise<void>(resolve => server.listen(config.port, config.host, resolve));
+
+  const client = await connectWrapper(config, 'wrapper-connect-failure-test');
+  const result = await client.callTool({ name: 'list_sessions', arguments: {} });
+
+  assert.ok(result.isError, `expected an error when the handshake cannot complete: ${JSON.stringify(result)}`);
+  const message = JSON.stringify(result.content);
+  // The whole point: the caller is told what failed and what to do about it,
+  // rather than being handed undici's collapsed string with no way to tell a
+  // dead daemon from a bug in their own call.
+  assert.match(message, /Could not open a connection to the harborage daemon/, message);
+  assert.match(message, /No tool call was sent/, message);
+  assert.match(message, new RegExp(config.daemonLogPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), message);
+  assert.notEqual(message, JSON.stringify([{ type: 'text', text: 'fetch failed' }]));
 });
 
 test('concurrent calls that all hit the dead daemon share one reconnect, and spawn one daemon between them', async () => {
