@@ -489,9 +489,11 @@ export class SessionStore {
       // read on this buffer is scoped by pageId, so there is nowhere to file
       // it, and the page-level listener this replaced never saw them either.
       if (!page) return;
+      const pageId = this.pageIdFor(record, page);
+      if (pageId === undefined) return;
       pushBounded(
         record.consoleBuffer,
-        { pageId: this.adoptPage(record, page), type: msg.type(), text: msg.text(), timestamp: Date.now() },
+        { pageId, type: msg.type(), text: msg.text(), timestamp: Date.now() },
         this.bufferLimits.console
       );
     });
@@ -548,11 +550,12 @@ export class SessionStore {
         // A dialog with no page cannot be filed under a tab, but it still
         // has to be resolved or whatever raised it stays wedged, which is
         // what the unconditional resolve below is for.
-        if (page) {
+        const pageId = page ? this.pageIdFor(record, page) : undefined;
+        if (pageId !== undefined) {
           pushBounded(
             record.dialogBuffer,
             {
-              pageId: this.adoptPage(record, page),
+              pageId,
               type: dialog.type(),
               message: dialog.message(),
               defaultValue: dialog.defaultValue(),
@@ -578,12 +581,14 @@ export class SessionStore {
     context.on('weberror', webError => {
       const page = webError.page();
       if (!page) return;
+      const pageId = this.pageIdFor(record, page);
+      if (pageId === undefined) return;
       const err = webError.error();
       const stack = typeof err.stack === 'string' && err.stack.trim() !== '' ? err.stack : undefined;
       pushBounded(
         record.pageErrorBuffer,
         {
-          pageId: this.adoptPage(record, page),
+          pageId,
           type: 'uncaught-exception',
           valueType: err.name && err.name !== '' ? err.name : 'Error',
           message: err.message,
@@ -615,7 +620,9 @@ export class SessionStore {
       this.parkUnattributed(record, request, partial);
       return;
     }
-    this.pushNetworkEntry(record, { ...partial, pageId: this.adoptPage(record, owner.page) });
+    const pageId = this.pageIdFor(record, owner.page);
+    if (pageId === undefined) return;
+    this.pushNetworkEntry(record, { ...partial, pageId });
   }
 
   /**
@@ -656,11 +663,11 @@ export class SessionStore {
     record.pendingNetworkByRequest.delete(request);
 
     const owner = ownerOfRequest(request);
-    if (owner.kind !== 'page') {
+    const pageId = owner.kind === 'page' ? this.pageIdFor(record, owner.page) : undefined;
+    if (pageId === undefined) {
       record.networkBuffer.dropped += held.length;
       return;
     }
-    const pageId = this.adoptPage(record, owner.page);
     for (const entry of held) {
       this.pushNetworkEntry(record, { ...entry, pageId });
     }
@@ -775,10 +782,14 @@ export class SessionStore {
   private async installRejectionHook(record: SessionRecord, context: BrowserContext): Promise<void> {
     await context.exposeBinding(rejectionBindingName, (source, payload) => {
       const entry = payload as Omit<PageErrorEntry, 'pageId' | 'type' | 'timestamp'>;
+      // Same close-aware lookup the other buffers use: a rejection reported
+      // as its tab tears down must not resurrect that tab in list_tabs.
+      const pageId = this.pageIdFor(record, source.page);
+      if (pageId === undefined) return;
       pushBounded(
         record.pageErrorBuffer,
         {
-          pageId: this.adoptPage(record, source.page),
+          pageId,
           type: 'unhandled-rejection',
           valueType: entry.valueType,
           message: entry.message,
@@ -850,6 +861,27 @@ export class SessionStore {
    * than minting a second one is what stops `new_tab` from reporting a tab id
    * that no longer matches the one `list_tabs` shows.
    */
+  /**
+   * The id a buffered event should be filed under, or undefined when there is
+   * no tab to file it under any more.
+   *
+   * The buffer handlers use this rather than `adoptPage` directly, because
+   * they can run for a page the session has already lost. A tab's id is
+   * retired when the tab closes, and an event that arrives after that (a
+   * request failing as the tab goes away is the ordinary case) would
+   * otherwise mint a SECOND id for a tab that no longer exists and put it
+   * back in `list_tabs`, where nothing would ever remove it again. Adopting
+   * is still right for a page that is merely new: that is what lets an event
+   * which beats `context.on('page')` be filed under the id that event will
+   * go on to report.
+   */
+  private pageIdFor(record: SessionRecord, page: Page): string | undefined {
+    for (const [existingId, existing] of record.pages) {
+      if (existing === page) return existingId;
+    }
+    return page.isClosed() ? undefined : this.adoptPage(record, page);
+  }
+
   private adoptPage(record: SessionRecord, page: Page, preferredId?: string): string {
     for (const [existingId, existing] of record.pages) {
       if (existing === page) return existingId;
