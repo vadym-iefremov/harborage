@@ -399,20 +399,31 @@ interface PointerPoint {
 }
 
 /**
- * Clears any text the page currently has selected, and arms a probe that
- * notices a native drag starting.
+ * Clears any text the page currently has selected, arms a probe that notices
+ * a native drag starting, and returns the identity of the document it was
+ * armed on (readDragProbe below needs it).
  *
- * Both exist because of the same trap, found the hard way. Pressing inside an
- * existing text selection makes Chromium drag the SELECTION rather than let
- * the page see the gesture: pointermove stops firing entirely from that moment
- * on, so a canvas library gets a pointerdown, nothing, and a pointerup, and
- * leaves its node exactly where it was while every call reports success. A
- * selection left behind by an EARLIER drag is enough to do it, which makes the
- * second drag of a run behave differently from the first. Clearing it keeps a
- * drag meaning the same thing every time; the probe reports the case that is
- * genuinely native so a caller is never guessing which kind of drag ran.
+ * The selection-clearing exists because of a trap found the hard way.
+ * Pressing inside an existing text selection makes Chromium drag the
+ * SELECTION rather than let the page see the gesture: pointermove stops
+ * firing entirely from that moment on, so a canvas library gets a
+ * pointerdown, nothing, and a pointerup, and leaves its node exactly where
+ * it was while every call reports success. A selection left behind by an
+ * EARLIER drag is enough to do it, which makes the second drag of a run
+ * behave differently from the first. Clearing it keeps a drag meaning the
+ * same thing every time.
+ *
+ * The document identity is returned for a second, quieter trap in the same
+ * family: the counter this arms lives on ONE document, and if the gesture
+ * itself navigates the page away (a native drag started on a plain link, or
+ * an unrelated navigation mid-gesture), the listener and the counter both
+ * leave with it. Nothing throws when that happens: a fresh document reads
+ * window.__harborageDragStarts as undefined, which reads back as an ordinary,
+ * quiet "no drag happened" exactly like a genuine negative would. Only
+ * comparing where the probe was armed against where it is read, in
+ * readDragProbe, catches that.
  */
-function armDragProbe(page: Page): Promise<void> {
+function armDragProbe(page: Page): Promise<number> {
   return page.evaluate(() => {
     window.getSelection()?.removeAllRanges();
     window.__harborageDragStarts = 0;
@@ -429,12 +440,31 @@ function armDragProbe(page: Page): Promise<void> {
         true
       );
     }
+    return performance.timeOrigin;
   });
 }
 
-/** Whether the browser ran the gesture just performed as a native HTML5 drag. */
-function readDragProbe(page: Page): Promise<boolean> {
-  return page.evaluate(() => (window.__harborageDragStarts ?? 0) > 0).catch(() => false);
+/**
+ * Whether the browser ran the gesture just performed as a native HTML5 drag,
+ * null when that cannot be answered honestly.
+ *
+ * This is the same trap hover's readback fix targets, one level earlier: a
+ * read that cannot be trusted is not the same thing as a read that ran and
+ * found nothing, and collapsing the two into "false" reports genuine
+ * ignorance as though it were negative evidence. `armedOn`, the document
+ * identity armDragProbe was run on, is compared against the document
+ * identity right now. They differ exactly when the gesture navigated the
+ * page away, which leaves the counter on a document that no longer exists;
+ * reading window.__harborageDragStarts on whatever loaded in its place
+ * returns undefined without a single check ever throwing, and that used to
+ * read back as a clean, confident "false". An outright evaluate failure (a
+ * destroyed execution context caught mid-navigation) folds into the same
+ * null.
+ */
+async function readDragProbe(page: Page, armedOn: number): Promise<boolean | null> {
+  const now = await documentIdentity(page);
+  if (now === null || now !== armedOn) return null;
+  return page.evaluate(() => (window.__harborageDragStarts ?? 0) > 0).catch(() => null);
 }
 
 /**
@@ -1380,7 +1410,7 @@ export const interactionTools = defineTools({
   drag: defineTool({
     serializesInput: true,
     description:
-      'Drag from one point to another in a session\'s tab with a real mouse: press, several intermediate moves, release. One atomic gesture, not a separate grab and drop, because a half-finished drag leaves the page in a state nothing else here can recover. Covers BOTH kinds of dragging: pointer-event canvases (React Flow, dnd-kit, d3-drag, anything moving an element from pointermove) and native HTML5 drag-and-drop (draggable="true" with dragstart/dragover/drop). The same mouse sequence drives both, so there is no mode to choose. Source and target each take a selector (the element\'s centre), a raw x/y viewport point (for a region of a canvas that is not a DOM element), or a selector plus x/y (an offset inside it, e.g. a node\'s drag handle). IF THE DRAG APPEARS TO DO NOTHING, in this order: raise "steps", because most drag libraries spend the first move activating the drag and only start following on later ones, so too few moves fires every event and moves nothing; set "holdMs" if the app uses a long-press or delay-activated drag, which cancels outright when the pointer moves too soon; set "settleMs" if the drop lands but the app has not finished reacting; check the coordinates in the result, which are where the mouse really went. Returns the resolved source and target points, plus \'nativeDrag\': true when the browser ran the gesture as a native HTML5 drag rather than as pointer events, which tells a canvas drag that did nothing exactly why. ' +
+      'Drag from one point to another in a session\'s tab with a real mouse: press, several intermediate moves, release. One atomic gesture, not a separate grab and drop, because a half-finished drag leaves the page in a state nothing else here can recover. Covers BOTH kinds of dragging: pointer-event canvases (React Flow, dnd-kit, d3-drag, anything moving an element from pointermove) and native HTML5 drag-and-drop (draggable="true" with dragstart/dragover/drop). The same mouse sequence drives both, so there is no mode to choose. Source and target each take a selector (the element\'s centre), a raw x/y viewport point (for a region of a canvas that is not a DOM element), or a selector plus x/y (an offset inside it, e.g. a node\'s drag handle). IF THE DRAG APPEARS TO DO NOTHING, in this order: raise "steps", because most drag libraries spend the first move activating the drag and only start following on later ones, so too few moves fires every event and moves nothing; set "holdMs" if the app uses a long-press or delay-activated drag, which cancels outright when the pointer moves too soon; set "settleMs" if the drop lands but the app has not finished reacting; check the coordinates in the result, which are where the mouse really went. Returns the resolved source and target points, plus \'nativeDrag\': true when the browser ran the gesture as a native HTML5 drag rather than as pointer events, which tells a canvas drag that did nothing exactly why; false when the probe genuinely ran and saw no native drag start; and null, with a note, on the rare gesture that navigates the page away before the probe can be read, since a fresh document\'s own counter is not evidence about the document that navigated away, and reporting that as false would be exactly the kind of unearned negative this field exists to avoid. ' +
       'A resolved selector is only a bounding box, and a box says nothing about what is drawn on top of it, so BOTH endpoints are hit-tested with elementFromPoint before the mouse ever moves, the same test element_box runs for a plain click target. sourceHit and targetHit each carry matchesTarget (true when the point really belongs to the named selector, an ancestor of it, or a descendant of it; null for a raw x/y endpoint, which names nothing to compare against) and elementAtPoint (what is really there, named the way element_box\'s occludedBy is, whenever that differs from a clean match). When a selector\'s point does not reach its own element the top-level result carries "matched": false and a "note" naming the endpoint and what covered it instead, so a press that silently lands on a modal or a loading overlay cannot read as a normal drag. This does NOT throw for an occluded endpoint: a canvas point that is deliberately under a transparent hit-testing overlay, or a selector naming a node nested inside the thing that truly receives the gesture, are both real drags, so check "matched" rather than assuming a resolved call pressed what it was asked to. ' +
       'Clears any existing text selection before pressing, deliberately: a press landing inside a selection left over from an earlier drag makes the browser drag that selection instead, and the page then sees no pointermove at all. Does NOT wait for either element to appear: call wait_for first. Does NOT verify that anything moved, so assert the page state yourself afterwards.',
     inputSchema: z.object({
@@ -1449,7 +1479,7 @@ export const interactionTools = defineTools({
 
       const modifiers = args.modifiers ?? [];
 
-      await armDragProbe(target.page);
+      const dragProbeArmedOn = await armDragProbe(target.page);
       const mouse = target.page.mouse;
       for (const modifier of modifiers) {
         await target.page.keyboard.down(modifier);
@@ -1477,7 +1507,7 @@ export const interactionTools = defineTools({
           await target.page.keyboard.up(modifier).catch(() => {});
         }
       }
-      const nativeDrag = await readDragProbe(target.page);
+      const nativeDrag = await readDragProbe(target.page, dragProbeArmedOn);
 
       // Occlusion is reported, not thrown on, and that is a deliberate choice rather than
       // an oversight: a canvas point deliberately sitting under a transparent hit-testing
@@ -1512,6 +1542,10 @@ export const interactionTools = defineTools({
       if (nativeDrag) {
         notes.push(
           'The browser ran this as a NATIVE HTML5 drag (a dragstart fired), not as a stream of pointer events. That is correct for a draggable="true" element with a drop handler. It is the wrong mechanism for a canvas library, which sees no pointermove at all while a native drag is in flight: something under the press point is draggable by default, such as an image or a link.'
+        );
+      } else if (nativeDrag === null) {
+        notes.push(
+          'Whether this ran as a native HTML5 drag could not be determined: the gesture appears to have navigated the page away, so the document the probe was armed on is gone. A fresh document\'s own counter starting at zero is not evidence about the document that navigated away, so "nativeDrag" is null here rather than false. If a native drag was in fact the reason the page navigated (dragging a plain link, for instance), that is itself worth checking directly.'
         );
       }
 

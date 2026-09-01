@@ -61,10 +61,36 @@ const SHADOW_HTML = `<!doctype html>
 </script>
 </body></html>`;
 
+/**
+ * A press that navigates the page away before the drag gesture finishes:
+ * a mousedown handler that sets location.href synchronously, the same
+ * outcome a real page gets from dragging a plain link and dropping it
+ * somewhere that does not handle the drop, which falls back to the
+ * browser's own default of navigating to the link's href. The probe this
+ * arms lives on THIS document, and it is gone by the time the drag
+ * finishes.
+ */
+const NAV_TRAP_HTML = `<!doctype html>
+<html>
+<body style="margin:0">
+  <div id="navTrap" style="width:120px;height:60px;background:rgb(200,0,0)">drag me away</div>
+</body>
+<script>
+  document.getElementById('navTrap').addEventListener('mousedown', function () {
+    location.href = '/elsewhere';
+  });
+</script>
+</html>`;
+
+const ELSEWHERE_HTML = `<!doctype html>
+<html><body><h1 id="marker">elsewhere</h1></body></html>`;
+
 const PAGES: Record<string, string> = {
   '/trap': TRAP_HTML,
   '/history': HISTORY_HTML,
-  '/shadow': SHADOW_HTML
+  '/shadow': SHADOW_HTML,
+  '/navtrap': NAV_TRAP_HTML,
+  '/elsewhere': ELSEWHERE_HTML
 };
 
 let server: Server;
@@ -300,6 +326,45 @@ test('hover on a unique selector reports hovering: true with no match-count note
   assert.equal(body.matchedElements, 1);
   assert.equal(body.hovering, true);
   assert.ok(!('note' in body), 'a unique match needs no note at all');
+
+  await sessions.releaseSession(sessionId);
+});
+
+// ---------------------------------------------------------------------------
+// Defect 4: drag's nativeDrag probe when the gesture navigates the page away
+// ---------------------------------------------------------------------------
+
+test('drag whose gesture navigates the page away reports nativeDrag: null, not a false negative', async () => {
+  const sessionId = await sessionOn('/navtrap');
+
+  const body = payload(await handlers.drag({ sessionId, source: { selector: '#navTrap' }, target: { x: 400, y: 300 } }));
+
+  // The trap really did fire: the tab genuinely left the document the probe
+  // was armed on.
+  assert.equal(
+    await evaluate<string | null>(sessionId, "document.getElementById('marker') ? document.getElementById('marker').textContent : null"),
+    'elsewhere'
+  );
+
+  assert.equal(body.nativeDrag, null, 'a probe read on a document that is not the one it was armed on must not collapse into false');
+  assert.equal(typeof body.note, 'string', 'null must be explained, not left for the caller to misread as a confirmed negative');
+  assert.match(String(body.note), /could not be determined/i);
+  assert.match(String(body.note), /navigated the page away/i);
+
+  await sessions.releaseSession(sessionId);
+});
+
+test('an ordinary drag on a page that never navigates still reports nativeDrag: false, not null', async () => {
+  const sessionId = await sessionOn('/history');
+  await handlers.evaluate({
+    sessionId,
+    expression: "document.body.innerHTML = '<div id=\"a\" style=\"width:80px;height:80px;background:blue\"></div><div id=\"b\" style=\"width:80px;height:80px;background:red;margin-top:200px\"></div>'"
+  });
+
+  const body = payload(await handlers.drag({ sessionId, source: { selector: '#a' }, target: { selector: '#b' } }));
+
+  assert.equal(body.nativeDrag, false, 'the document never changed, so the probe must give a real answer, not null');
+  assert.ok(!('note' in body) || !String(body.note ?? '').match(/could not be determined/i), 'a page that never navigated must not carry the "could not be determined" note');
 
   await sessions.releaseSession(sessionId);
 });
