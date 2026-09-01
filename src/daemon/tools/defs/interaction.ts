@@ -1751,9 +1751,20 @@ async function replaceKeylesslyOrFallBack(
     locator as unknown as FenceTarget,
     reselected === 'covering' ? 'covering' : 'inside'
   );
-  if (!deleteFenced) return;
   let deleteBlocked = false;
   try {
+    // Inside the try, like the same check in clearOrFillFormControl and in the fill
+    // path, and unlike how these two sites used to read. `if (!deleteFenced) return`
+    // sitting above the try looks like "nothing was installed, so there is nothing to
+    // take down", and that is not what a false actually means: installWriteFence
+    // assigns window.__harborageWriteFence BEFORE it adds a single listener and folds
+    // every failure into `false`, so the one path that reports false having already
+    // done work would have walked away from a capture-phase keydown handler that
+    // cancels keystrokes, left on the document for the rest of its life. Returning
+    // from inside the try still runs the finally, and removeWriteFence is a no-op
+    // when there is no fence, so this costs an evaluate on a path that was already
+    // failing and buys back the guarantee.
+    if (!deleteFenced) return;
     await page.keyboard.press('Delete');
   } finally {
     deleteBlocked = await removeWriteFence(page);
@@ -1761,8 +1772,8 @@ async function replaceKeylesslyOrFallBack(
   if (deleteBlocked || value.length === 0) return;
 
   const fenced = await installWriteFence(locator as unknown as FenceTarget, 'inside');
-  if (!fenced) return;
   try {
+    if (!fenced) return;
     await page.keyboard.insertText(value);
   } finally {
     await removeWriteFence(page);
