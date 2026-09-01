@@ -218,6 +218,13 @@ declare const window: {
     borderTopWidth: string;
     paddingLeft: string;
     paddingTop: string;
+    // The four that decide whether a frame's coordinate map can be trusted.
+    // zoom is here because CSS zoom on an iframe breaks coordinate mapping
+    // below Playwright, not in this code: see frameCoordinateMap.
+    transform: string;
+    transformOrigin: string;
+    perspective: string;
+    zoom: string;
   };
   // Used to wait out one renderer frame after dispatching an input event, so a
   // readback cannot run before the page's own listeners have. See wheel.
@@ -246,6 +253,19 @@ interface FrameHostElement extends PageElement {
   offsetHeight?: number;
   getBoundingClientRect(): { left: number; top: number; width: number; height: number };
 }
+
+/**
+ * The browser's own matrix parser, used rather than a hand-rolled one.
+ *
+ * getComputedStyle().transform serialises to "matrix(...)" or "matrix3d(...)",
+ * and DOMMatrix parses both and reports through is2D whether the result is
+ * really planar. Chromium flattens a z-free translate3d to a 2D matrix, so the
+ * extremely common translate3d(0,0,0) compositing hint stays supported instead
+ * of being refused as 3D.
+ */
+declare const DOMMatrix: {
+  new (init?: string): { a: number; b: number; c: number; d: number; e: number; f: number; is2D: boolean };
+};
 
 /** The tags whose contents live in `.value` rather than in their child nodes. */
 const formControlTags = ['INPUT', 'TEXTAREA', 'SELECT'];
@@ -1841,18 +1861,114 @@ async function hitTestPointerPoint(page: Page, point: PointerPoint): Promise<Poi
           // frame's own ancestors when something with pointer-events: none is in the way, is
           // the parent document swallowing the event before the frame ever sees it.
           const reaches = (hit as unknown) === (host as unknown);
-          const rect = host.getBoundingClientRect();
+
+          // Mapping the point into the frame's own coordinate space.
+          //
+          // This used to divide bounding boxes: scaleX = rect.width / offsetWidth, with the
+          // origin taken from the bbox corner. That is only right when the iframe is
+          // axis-aligned. getBoundingClientRect returns the AXIS-ALIGNED bbox of the
+          // TRANSFORMED border box, so under rotation the ratio is not the scale at all: a
+          // 400x300 frame at 45 degrees has rect.width 494.9 against offsetWidth 400, reading
+          // 1.237 when the true scale is 1, and the bbox corner is not the content corner. The
+          // error is near zero at the frame's centre and largest at its edges, which is exactly
+          // how it survived a first round of testing. skewX passed only by luck for the same
+          // reason, not because skew was handled.
+          //
+          // The exact map instead. The element's own transform matrix and transform-origin are
+          // both readable, so the bbox of the transformed border box can be computed a second
+          // time in the element's LOCAL space. Subtracting that local bbox corner from the
+          // viewport bbox corner recovers P0, the position the border box would have had with
+          // no transform at all, and P0 is the one term the affine map was missing:
+          //
+          //     viewport = P0 + O + M(p - O)
+          //
+          // for a local border-box point p, transform-origin O and matrix M. Inverting it maps
+          // a viewport point back into the frame. No offsetParent walking and no scroll
+          // arithmetic, which is what makes it short enough to be obviously right, and it holds
+          // for any 2D affine: rotate, skew, scale, matrix, or a combination.
+          //
+          // getBoxQuads would have given the transformed corners directly and made all of this
+          // unnecessary. It is not implemented in the Chromium this Playwright ships, checked
+          // rather than assumed, which is why the map is reconstructed here instead.
           const style = window.getComputedStyle(host);
-          const scaleX = host.offsetWidth ? rect.width / host.offsetWidth : 1;
-          const scaleY = host.offsetHeight ? rect.height / host.offsetHeight : 1;
-          // The child document is painted in the iframe's CONTENT box, so the origin is the
-          // border box plus border and padding, each scaled the same way the box was.
-          const originX = rect.left + ((parseFloat(style.borderLeftWidth) || 0) + (parseFloat(style.paddingLeft) || 0)) * scaleX;
-          const originY = rect.top + ((parseFloat(style.borderTopWidth) || 0) + (parseFloat(style.paddingTop) || 0)) * scaleY;
+          let unmappable: string | null = null;
+          // The recovery of P0 assumes the viewport bbox differs from the untransformed one
+          // only by this element's OWN transform. An ancestor that scales, rotates or skews
+          // breaks that, and cannot be undone from here, so it is refused rather than guessed
+          // at. A pure TRANSLATION on an ancestor is harmless and stays supported: it shifts
+          // the viewport bbox and the untransformed origin by the same amount, so P0 still
+          // comes out right. That case is worth keeping, because transform: translateZ(0) and
+          // translate3d(0,0,0) are everywhere as compositing hints.
+          for (let ancestor = host.parentElement; ancestor; ancestor = ancestor.parentElement ?? null) {
+            const ancestorStyle = window.getComputedStyle(ancestor);
+            if (ancestorStyle.transform !== 'none') {
+              const ancestorMatrix = new DOMMatrix(ancestorStyle.transform);
+              if (!ancestorMatrix.is2D || ancestorMatrix.a !== 1 || ancestorMatrix.b !== 0 || ancestorMatrix.c !== 0 || ancestorMatrix.d !== 1) {
+                unmappable = 'an ancestor of the iframe is scaled, rotated or skewed';
+                break;
+              }
+            }
+            if (ancestorStyle.perspective !== 'none') {
+              unmappable = 'an ancestor of the iframe sets perspective';
+              break;
+            }
+            if (ancestorStyle.zoom && ancestorStyle.zoom !== '1' && ancestorStyle.zoom !== 'normal') {
+              unmappable = 'an ancestor of the iframe sets CSS zoom';
+              break;
+            }
+          }
+          if (!unmappable && style.perspective !== 'none') unmappable = 'the iframe sets perspective';
+          // CSS zoom on an iframe is a known blind spot BELOW this code: coordinate mapping
+          // across the frame boundary is wrong in the browser automation layer itself, and
+          // Playwright's own click times out on an element inside such a frame. Nothing here
+          // can be more correct than that, so it is refused rather than answered.
+          if (!unmappable && style.zoom && style.zoom !== '1' && style.zoom !== 'normal') unmappable = 'the iframe sets CSS zoom';
+
+          let localX = 0;
+          let localY = 0;
+          if (!unmappable) {
+            const matrix = style.transform === 'none' ? new DOMMatrix() : new DOMMatrix(style.transform);
+            if (!matrix.is2D) {
+              unmappable = 'the iframe uses a 3D transform';
+            } else {
+              const originParts = style.transformOrigin.split(' ');
+              const originX = parseFloat(originParts[0]) || 0;
+              const originY = parseFloat(originParts[1]) || 0;
+              const width = host.offsetWidth ?? 0;
+              const height = host.offsetHeight ?? 0;
+              const corners = [[0, 0], [width, 0], [width, height], [0, height]];
+              let minX = Infinity;
+              let minY = Infinity;
+              for (const corner of corners) {
+                const cx = corner[0] - originX;
+                const cy = corner[1] - originY;
+                const tx = originX + matrix.a * cx + matrix.c * cy + matrix.e;
+                const ty = originY + matrix.b * cx + matrix.d * cy + matrix.f;
+                if (tx < minX) minX = tx;
+                if (ty < minY) minY = ty;
+              }
+              const rect = host.getBoundingClientRect();
+              const determinant = matrix.a * matrix.d - matrix.b * matrix.c;
+              if (!determinant) {
+                unmappable = 'the iframe is scaled to nothing';
+              } else {
+                // Undo the translation and the origin, invert the 2x2, then step from the
+                // border box to the content box the child document is actually painted in.
+                const wx = arg.x - (rect.left - minX) - originX - matrix.e;
+                const wy = arg.y - (rect.top - minY) - originY - matrix.f;
+                const borderX = (parseFloat(style.borderLeftWidth) || 0) + (parseFloat(style.paddingLeft) || 0);
+                const borderY = (parseFloat(style.borderTopWidth) || 0) + (parseFloat(style.paddingTop) || 0);
+                localX = originX + (matrix.d * wx - matrix.c * wy) / determinant - borderX;
+                localY = originY + (matrix.a * wy - matrix.b * wx) / determinant - borderY;
+              }
+            }
+          }
+
           return {
             reaches,
-            x: (arg.x - originX) / (scaleX || 1),
-            y: (arg.y - originY) / (scaleY || 1),
+            unmappable,
+            x: localX,
+            y: localY,
             hit: hit
               ? {
                   tagName: String(hit.tagName).toLowerCase(),
@@ -1867,6 +1983,21 @@ async function hitTestPointerPoint(page: Page, point: PointerPoint): Promise<Poi
         { x: local.x, y: local.y, drillCap: HIT_TEST_DRILL_CAP }
       );
       if (!step.reaches) return { matchesTarget: false, elementAtPoint: step.hit };
+      // Checked AFTER reaches, deliberately. "Something in the parent is covering the iframe"
+      // is a real answer that does not need the point mapped any further, so an unmappable
+      // frame below it must not throw that away. Only once the event is known to reach the
+      // frame does an unusable coordinate map make the rest of the question unanswerable.
+      if (step.unmappable) {
+        return {
+          matchesTarget: null,
+          elementAtPoint: null,
+          unknownReason:
+            `The point could not be mapped into the iframe's own coordinate space, because ${step.unmappable}. ` +
+            'The event does reach the frame, but whether it reaches the element named inside it is UNKNOWN rather ' +
+            'than false, and nothing here is evidence of an overlay. Aim at a raw x/y point, or check the element ' +
+            'from inside the frame with element_box instead.'
+        };
+      }
       local = { x: step.x, y: step.y };
     }
   } finally {
@@ -1993,8 +2124,12 @@ function missRemedy(el: TopmostElement | null): string {
     return (
       'That element is in an ANCESTOR FRAME, not in the same document as the selector: the point never ' +
       'reaches the iframe at all, so nothing inside the frame receives the event and nothing inside the ' +
-      'frame can fix it. Something in the parent document is covering the iframe, or the iframe itself is ' +
-      'pointer-events: none. Deal with the parent document first.'
+      'frame can fix it. Usually something in the parent document is covering the iframe, or the iframe ' +
+      'itself is pointer-events: none, and dealing with the parent document is the fix. One other cause ' +
+      'looks identical and is not a page bug at all: CSS zoom on the iframe or one of its ancestors, ' +
+      'where coordinates are mapped across the frame boundary incorrectly below this tool. Playwright\'s ' +
+      'own click times out on an element inside such a frame, so nothing here can reach it either. Check ' +
+      'for a zoom before going looking for an overlay.'
     );
   }
   if (el?.containsTarget) {
@@ -3292,7 +3427,7 @@ export const interactionTools = defineTools({
       'Read the asymmetry carefully, because it is easy to get backwards and this tool used to have it backwards: an ANCESTOR of the element that took the press is on the composed path and MATCHES (a <button> whose centre is painted by its own inline label, or a parent that receives the press because its child is pointer-events: none), while a DESCENDANT of it is NOT and does not. So a drag endpoint that falls just outside a canvas node and lands on the pane behind it is a MISS, not a hit on the node, even though the pane contains the node. Note that <body> and <html> are on the composed path of every point, so a selector naming "body" matches everywhere, correctly: a press anywhere really does run body\'s listeners. When elementAtPoint is an ancestor of your selector it says so with "containsTarget": true, because that is a different diagnosis from an overlay and needs a different remedy: the point is inside your element\'s box but outside anything it hit-tests, which is what pointer-events: none, visibility: hidden, a ::before or ::after scrim on a wrapper, a clip-path cut-out, a wrapped inline, or an offset that simply falls off the element all look like. Changing a z-index will not help any of those. ' +
       'Shadow DOM is handled by the same walk, in both directions: an endpoint inside an open or closed shadow root that is genuinely unoccluded matches rather than reading as occluded by its own host; a shadow HOST matches when the press lands on its own shadow content, because the host is on that content\'s composed path; a shadow-tree wrapper matches when the press lands on light-DOM children slotted into it; and a real overlay sitting on top of a target INSIDE THAT SAME shadow root is still caught and named. When a selector\'s point does not reach its own element the top-level result carries "matched": false and a "note" naming the endpoint, what took the press, and what to do about it, so a press that silently lands on a modal, a loading overlay or the container behind a node cannot read as a normal drag. This does NOT throw for a missed endpoint: a canvas point deliberately under a transparent hit-testing overlay is a real drag, so check "matched" rather than assuming a resolved call pressed what it was asked to. ' +
       'elementAtPoint is filled in whenever the topmost node is not the named element ITSELF, on a match as well as on a miss, so naming "body" with an offset tells you exactly as much about that point as passing the same coordinates raw would. "matched" is true, false, or NULL: null means the hit test could not answer, not that it passed, which currently happens only when the DOM at that point is nested deeper than the walk is allowed to run. A note always says which. ' +
-      'A frame-prefixed selector from list_frames is fully supported and hit-tested in the MAIN frame\'s coordinate space, which is where the mouse actually goes. Every ancestor frame is checked on the way down, because a pointer event cannot cross a frame boundary: if something in a PARENT document covers the iframe, the press never reaches the frame at all, and that is reported with elementAtPoint carrying "inAncestorFrame": true and a note saying nothing inside the frame can fix it. ' +
+      'A frame-prefixed selector from list_frames is fully supported and hit-tested in the MAIN frame\'s coordinate space, which is where the mouse actually goes. Every ancestor frame is checked on the way down, because a pointer event cannot cross a frame boundary: if something in a PARENT document covers the iframe, the press never reaches the frame at all, and that is reported with elementAtPoint carrying "inAncestorFrame": true and a note saying nothing inside the frame can fix it.A transformed iframe is mapped exactly, rotation and skew included. Two shapes cannot be mapped and come back as "matched": null with a note rather than as a guess: an ancestor of the iframe that is itself scaled, rotated or skewed (a pure translation is fine), and CSS zoom anywhere in that chain. CSS zoom is a blind spot BELOW this tool, where coordinates are mapped across a frame boundary incorrectly in the browser automation layer itself: Playwright\'s own click times out on an element inside such a frame, so the mouse cannot reach it from here either. ' +
       'Both endpoints are waited for and scrolled into view BEFORE either is measured, because resolving one endpoint scrolls the page and would otherwise leave the other one\'s coordinates stale. When the two cannot be on screen at the same time, which no single mouse gesture can do, the result says exactly that rather than letting the hit test blame an overlay at a clamped point. ' +
       'Neither endpoint selector has to be unique. Like click and hover, a selector matching several elements resolves to the FIRST one and no error is raised; the resolved source and target each carry "matchedElements", with a note whenever it is more than one. That is worth knowing before you read a result: ".react-flow__node" on a canvas with eleven nodes resolves happily to whichever one is first in the DOM. ' +
       'Clears any existing text selection before pressing, deliberately: a press landing inside a selection left over from an earlier drag makes the browser drag that selection instead, and the page then sees no pointermove at all. Does NOT wait for either element to appear: call wait_for first. Does NOT verify that anything moved, so assert the page state yourself afterwards.',
@@ -3701,7 +3836,7 @@ export const interactionTools = defineTools({
       'Turn the mouse wheel in a session\'s tab, which is how a canvas is zoomed and how anything with its own scroll container is scrolled. WHERE the wheel lands matters and is not incidental: a canvas zooms toward the pointer, so "point" takes the same shape as drag\'s endpoints (a selector, a raw x/y viewport point, or a selector plus an offset inside it). Omitting it aims at the centre of the viewport, deliberately, rather than at wherever some earlier click or hover happened to leave the pointer. deltaY is positive to scroll down and negative to scroll up, deltaX positive to scroll right, matching a real wheel. MODIFIERS ARE THE PINCH: a browser delivers a trackpad pinch as a wheel event with ctrlKey set, and canvas libraries branch on exactly that, so modifiers: ["Control"] is the only way to test the zoom path in an app whose plain wheel pans. They are held for the whole gesture and released afterwards. Use "repeat" when one large delta and several small ones are not the same thing, which is common: libraries that accumulate deltas, debounce, or clamp per event behave differently, and "delay" spaces the events out for one that debounces. Always reads back what really moved: the result carries the point used, the total deltas dispatched, the scroll offsets before and after (for the page and for whichever container the browser would actually scroll at that point), and "moved". Note that "moved": false is CORRECT for a canvas zoom, because a zoom is a CSS transform rather than a scroll and nothing here can observe it generically: assert the app\'s own state for that. It is a real failure if you expected a scroll. ' +
       'Resolving "point" only measures a box, it says nothing about what is drawn on top of it, and mouse.wheel dispatches at raw coordinates with none of Playwright\'s own actionability checks in the way, so the point is hit-tested before the event fires, with the same test drag and element_box run. It answers whether a real pointer event at those coordinates would reach the element named, by checking that element against the COMPOSED PATH of whatever is really topmost at the point. "pointHit" carries matchesTarget (null when point has no selector, which names nothing to compare against) and elementAtPoint, naming what really received the event whenever that is not a match. ' +
       'The asymmetry is the part to read carefully: an ANCESTOR of the element that took the event is on the composed path and matches, a DESCENDANT of it is not. A wheel aimed at a point that falls outside a scroll container and onto the pane behind it is therefore a MISS, not a hit on the container, even though the pane contains it. That combination, a clean-looking hit with nothing scrolled, is exactly what a canvas zoom looks like, so getting it wrong lets a dead wheel be explained away as a zoom. When elementAtPoint is an ancestor of your selector it says so with "containsTarget": true, which means the point is inside your element\'s box but outside anything it hit-tests (pointer-events: none, a pseudo-element scrim on a wrapper, a clip-path cut-out, or an offset that falls off the element): a z-index change will not fix any of those. Shadow DOM is handled in both directions, so an unoccluded element inside an open or closed shadow root matches, a shadow host matches when the event lands on its own shadow content, and a real overlay inside the same shadow root is still caught and named. "scroll" is drilled the same way: a scrollable container that lives inside a shadow root is found and reported on, not just the shadow host\'s own ancestors. When a selector\'s point does not reach its own element the result carries "matched": false and a "note" naming what took the event and what to do about it. This does NOT throw for a missed point: a canvas point deliberately under a transparent hit-testing overlay is a real target, so check "matched" rather than assuming a resolved call landed where it was aimed. ' +
-      'A frame-prefixed selector from list_frames is hit-tested in the MAIN frame\'s coordinate space, which is where the event actually goes, and every ancestor frame is checked on the way down: a pointer event cannot cross a frame boundary, so something in a PARENT document covering the iframe means the wheel never reaches the frame at all, reported with "inAncestorFrame": true. "matched" is true, false, or NULL, where null means the hit test could not answer rather than that it passed. ' +
+      'A frame-prefixed selector from list_frames is hit-tested in the MAIN frame\'s coordinate space, which is where the event actually goes, and every ancestor frame is checked on the way down: a pointer event cannot cross a frame boundary, so something in a PARENT document covering the iframe means the wheel never reaches the frame at all, reported with "inAncestorFrame": true. "matched" is true, false, or NULL, where null means the hit test could not answer rather than that it passed.A transformed iframe is mapped exactly, rotation and skew included; an ancestor that is itself scaled, rotated or skewed, and CSS zoom anywhere in the chain, cannot be mapped and come back as null with a note. ' +
       'Waits for a real renderer round trip after dispatching, so by the time this returns the page has run its own wheel handlers. Without that the readback could observe a page that had not yet seen the event, which was invisible whenever something DID scroll and wide open whenever nothing did. ' +
       'The point\'s selector does not have to be unique. Like click and hover, a selector matching several elements resolves to the FIRST one with no error; the resolved point carries "matchedElements", with a note whenever it is more than one. Does NOT dispatch a pinch gesture, a touch event, or a smooth scroll animation of its own.',
     inputSchema: z.object({

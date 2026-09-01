@@ -193,7 +193,14 @@ before(async () => {
       '/frame-covered': FRAME_COVERED_HTML,
       '/far-apart': FAR_APART_HTML,
       '/scrim-pair': SCRIM_PAIR_HTML,
-      '/wheel-listener': WHEEL_LISTENER_HTML
+      '/wheel-listener': WHEEL_LISTENER_HTML,
+      '/rot-inner': ROT_INNER_HTML,
+      '/rot-ancestor': ROT_ANCESTOR_HTML,
+      '/rot-translate': ROT_TRANSLATE_HTML,
+      '/zoom-frame': ZOOM_FRAME_HTML,
+      ...Object.fromEntries(
+        transformCases.filter(one => one.style !== undefined).map(one => [one.path, rotWrapper(one.style as string)])
+      )
     };
     const body = routes[path] ?? FIXTURE_HTML;
     res.setHeader('content-type', 'text/html; charset=utf-8');
@@ -891,6 +898,154 @@ test('wheel has delivered its event to the page by the time it returns, even whe
       `the page must have seen the wheel event by the time the call returned (trial ${trial})`
     );
   }
+
+  await sessions.releaseSession(sessionId);
+});
+
+// ---------------------------------------------------------------------------
+// Round 4. A transformed iframe, which the frame chain above got wrong by
+// dividing bounding boxes: getBoundingClientRect returns the AXIS-ALIGNED bbox
+// of the TRANSFORMED border box, so under rotation rect.width / offsetWidth is
+// not the scale and the bbox corner is not the content corner. The error is
+// near zero at the frame's centre and largest at its edges, which is how it
+// survived the first round of frame testing, and skewX passed by luck for the
+// same reason rather than because skew was handled.
+//
+// Every case below puts a SMALL target hard against the frame's corner, where
+// the error is biggest, and grades against a real capturing pointerdown
+// listener inside the frame.
+// ---------------------------------------------------------------------------
+
+/** A small target at the frame's own origin, with a big decoy across the middle where a mis-mapped point lands. */
+const ROT_INNER_HTML = `<!doctype html>
+<html><head><style>html,body{margin:0;background:rgb(238,238,255)}</style></head><body>
+  <div id="rotDecoy" style="position:absolute;left:0;top:0;width:400px;height:300px;background:rgb(255,221,221)"></div>
+  <div id="rotBtn" style="position:absolute;left:6px;top:6px;width:34px;height:26px;background:rgb(140,200,255);z-index:3"></div>
+<script>
+  window.__hbFired = {};
+  ['rotBtn', 'rotDecoy'].forEach(function (id) {
+    document.getElementById(id).addEventListener('pointerdown', function () { window.__hbFired[id] = true; }, true);
+  });
+</script>
+</body></html>`;
+
+const rotWrapper = (style: string) =>
+  `<!doctype html><html><head><style>body{margin:0}</style></head><body>` +
+  `<iframe src="/rot-inner" style="position:absolute;left:250px;top:180px;width:400px;height:300px;${style}"></iframe>` +
+  `</body></html>`;
+
+/** An iframe inside an ancestor that is itself rotated, which cannot be mapped and must say so. */
+const ROT_ANCESTOR_HTML = `<!doctype html>
+<html><head><style>body{margin:0}</style></head><body>
+  <div style="transform:rotate(15deg);transform-origin:0 0">
+    <iframe src="/rot-inner" style="position:absolute;left:250px;top:180px;width:400px;height:300px;border:0"></iframe>
+  </div>
+</body></html>`;
+
+/** The same iframe under a pure-translation ancestor, the compositing hint that must keep working. */
+const ROT_TRANSLATE_HTML = `<!doctype html>
+<html><head><style>body{margin:0}</style></head><body>
+  <div style="transform:translate3d(30px,20px,0)">
+    <iframe src="/rot-inner" style="position:absolute;left:250px;top:180px;width:400px;height:300px;border:0"></iframe>
+  </div>
+</body></html>`;
+
+/** CSS zoom on the iframe: broken below this tool, so the only honest answer is that there is none. */
+const ZOOM_FRAME_HTML = `<!doctype html>
+<html><head><style>body{margin:0}</style></head><body>
+  <iframe src="/rot-inner" style="position:absolute;left:250px;top:180px;width:400px;height:300px;border:0;zoom:1.4"></iframe>
+</body></html>`;
+
+const transformCases: { name: string; path: string; style?: string }[] = [
+  { name: 'no transform, as a control', path: '/rot-flat', style: 'border:0' },
+  { name: 'rotated 20 degrees about its centre', path: '/rot-20', style: 'border:0;transform:rotate(20deg);transform-origin:50% 50%' },
+  { name: 'rotated 45 degrees about its centre', path: '/rot-45', style: 'border:0;transform:rotate(45deg);transform-origin:50% 50%' },
+  { name: 'rotated 45 degrees with a border and padding', path: '/rot-45bp', style: 'border:5px solid rgb(0,0,0);padding:7px;transform:rotate(45deg);transform-origin:50% 50%' },
+  // A GUARD, not a reproduction: this one passed against the broken bbox-ratio code too, even
+  // though that code was just as wrong about skew (bbox width 509 against offsetWidth 400). It
+  // is kept because it must not break, not as evidence that skew is handled. The rotation cases
+  // above are the ones that actually failed before the fix.
+  { name: 'skewed by skewX(20deg)', path: '/rot-skew', style: 'border:0;transform:skewX(20deg)' },
+  { name: 'rotated and scaled about its top-left corner', path: '/rot-scale', style: 'border:0;transform:rotate(-30deg) scale(1.2);transform-origin:0 0' },
+  { name: 'under a pure-translation ancestor', path: '/rot-translate' }
+];
+
+for (const shape of transformCases) {
+  test(`drag and element_box agree with a real press for an iframe ${shape.name}`, async () => {
+    const sessionId = await sessionOn(shape.path);
+    await resetOracleInFrame(sessionId);
+
+    const body = payload(
+      await handlers.drag({ sessionId, source: { selector: `${FRAME_PREFIX}#rotBtn` }, target: { selector: `${FRAME_PREFIX}#rotBtn` }, steps: 1 })
+    );
+    const btnFired = await oracleFiredInFrame(sessionId, 'rotBtn');
+    const decoyFired = await oracleFiredInFrame(sessionId, 'rotDecoy');
+
+    assert.equal(btnFired, true, `the fixture is wrong if a real press at ${JSON.stringify(body.source)} did not reach #rotBtn`);
+    assert.equal(decoyFired, false, 'and the decoy across the middle must not be what took it');
+    assert.equal(body.sourceHit.matchesTarget, true, 'the press provably reached the element, so this must not read as a miss');
+    assert.equal(body.matched, true);
+
+    const el = payload(await handlers.element_box({ sessionId, selectors: [`${FRAME_PREFIX}#rotBtn`] })).results[0].elements[0];
+    assert.equal(el.topmostAtCentre, true, 'element_box maps the same geometry and must reach the same answer');
+    assert.equal(el.occludedBy, null, 'blaming the parent document for swallowing a click that landed is a fabricated diagnosis');
+
+    await sessions.releaseSession(sessionId);
+  });
+}
+
+test('an iframe inside a rotated ancestor is reported as unmappable, not as occluded', async () => {
+  const sessionId = await sessionOn('/rot-ancestor');
+
+  // P0 is recovered by subtracting the element's own transform from its viewport bbox, which
+  // only works when nothing above it rotates, scales or skews. That is checked rather than
+  // hoped for, and the honest answer when it fails is that there is no answer.
+  const body = payload(
+    await handlers.drag({ sessionId, source: { selector: `${FRAME_PREFIX}#rotBtn` }, target: { x: 900, y: 20 }, steps: 2 })
+  );
+  assert.equal(body.sourceHit.matchesTarget, null, 'unmappable is not the same as missed');
+  assert.equal(body.matched, null, 'and it must not fold into a clean pass either');
+  assert.equal(body.sourceHit.elementAtPoint, null, 'naming an occluder here would be an invention');
+  assert.match(String(body.note), /scaled, rotated or skewed/, 'the note has to name the actual reason');
+
+  const el = payload(await handlers.element_box({ sessionId, selectors: [`${FRAME_PREFIX}#rotBtn`] })).results[0].elements[0];
+  assert.equal(el.topmostAtCentre, null);
+  assert.equal(el.occludedBy, null);
+  assert.match(String(el.topmostUnknownReason), /scaled, rotated or skewed/);
+
+  await sessions.releaseSession(sessionId);
+});
+
+test('CSS zoom on an iframe is admitted rather than answered, in both tools', async () => {
+  const sessionId = await sessionOn('/zoom-frame');
+
+  // Coordinate mapping across a frame boundary under CSS zoom is broken BELOW this tool.
+  // Playwright's own click times out on this element and a press at its own boundingBox
+  // coordinate does not fire the listener, so the mouse cannot reach it from here at all.
+  // That is verified in probe/r4-zoom-rot.ts rather than here, because reproducing it costs a
+  // full 30s Playwright timeout per run and this suite shares one laptop.
+  //
+  // Which of the two honest answers comes back depends on the geometry, and both are asserted
+  // together on purpose: when the mis-mapped resolved point still lands on the iframe, the
+  // verdict is null (on the frame, unmappable inside it); when it lands off the iframe
+  // entirely, the verdict is false (it provably did not reach the frame). The invariant that
+  // matters, and the one that was broken, is that NEITHER tool may report a clean hit for an
+  // element nothing can click, and that whichever answer comes back names zoom as the cause
+  // instead of sending the caller after an overlay that is not there.
+  const body = payload(
+    await handlers.drag({ sessionId, source: { selector: `${FRAME_PREFIX}#rotBtn` }, target: { x: 900, y: 20 }, steps: 2 })
+  );
+  assert.notEqual(body.sourceHit.matchesTarget, true, 'a clean hit on an element nothing can click is the false pass');
+  assert.notEqual(body.matched, true);
+  assert.match(String(body.note), /CSS zoom/, 'the note must name zoom rather than send the caller after an overlay');
+
+  const el = payload(await handlers.element_box({ sessionId, selectors: [`${FRAME_PREFIX}#rotBtn`] })).results[0].elements[0];
+  assert.notEqual(el.topmostAtCentre, true, 'reporting true for an element nothing can click was the defect');
+  assert.match(
+    String(el.topmostUnknownReason ?? el.occludedBy?.tagName ?? ''),
+    /CSS zoom|iframe/,
+    'and element_box has to explain itself too'
+  );
 
   await sessions.releaseSession(sessionId);
 });

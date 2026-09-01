@@ -232,6 +232,16 @@ interface ProbeStyle {
   getPropertyValue(property: string): string;
 }
 
+/**
+ * The browser's own matrix parser, used rather than a hand-rolled one.
+ * getComputedStyle().transform serialises to "matrix(...)" or "matrix3d(...)";
+ * DOMMatrix parses both and reports through is2D whether the result is really
+ * planar. The twin of the declaration in interaction.ts.
+ */
+declare const DOMMatrix: {
+  new (init?: string): { a: number; b: number; c: number; d: number; e: number; f: number; is2D: boolean };
+};
+
 interface ProbeElement {
   tagName: string;
   id: string;
@@ -922,11 +932,13 @@ interface AncestorFrameOccluder {
  * the probe that was already running, needs no round trip of its own, and works for a
  * cross-origin frame too, unlike anything that would have to touch contentDocument.
  */
+type FrameChainAnswer = { blocked: AncestorFrameOccluder } | { unmappable: string } | null;
+
 async function ancestorFrameOccluders(
   locator: Locator,
   points: ({ x: number; y: number } | null)[]
-): Promise<(AncestorFrameOccluder | null)[]> {
-  const blank = points.map(() => null);
+): Promise<FrameChainAnswer[]> {
+  const blank: FrameChainAnswer[] = points.map(() => null);
   const handle = await locator.first().elementHandle().catch(() => null);
   if (!handle) return blank;
 
@@ -950,35 +962,111 @@ async function ancestorFrameOccluders(
     // origin and scale map a point from frame i's space into frame i+1's. The element's own
     // points arrive in the innermost frame's space, so they are mapped back OUT first, and the
     // reachability checks then run from the outermost frame inwards.
-    const steps: { originX: number; originY: number; scaleX: number; scaleY: number }[] = [];
+    // The forward half of the same affine map hitTestPointerPoint inverts in interaction.ts,
+    // and it replaced the same wrong arithmetic. Dividing bounding boxes (rect.width /
+    // offsetWidth) is only right for an axis-aligned iframe: getBoundingClientRect returns the
+    // AXIS-ALIGNED bbox of the TRANSFORMED border box, so a 400x300 frame rotated 45 degrees
+    // reads a scale of 1.237 when the true scale is 1, and the bbox corner is not the content
+    // corner. Recomputing that bbox in the element's LOCAL space and subtracting recovers P0,
+    // the untransformed border-box origin, which is the term that makes the map exact for any
+    // 2D affine. See the long comment at the matching code in interaction.ts. If one changes,
+    // change the other. (getBoxQuads would make this unnecessary, and is not implemented in the
+    // Chromium this Playwright ships, checked rather than assumed.)
+    const steps: ({ p0x: number; p0y: number; ox: number; oy: number; a: number; b: number; c: number; d: number; e: number; f: number; contentX: number; contentY: number; unmappable: null } | { unmappable: string })[] = [];
     for (const frameElement of chain) {
       steps.push(
         await frameElement.evaluate((element: unknown) => {
           const host = element as FrameHostElement;
-          const rect = host.getBoundingClientRect();
           const style = getComputedStyle(host);
-          const scaleX = host.offsetWidth ? rect.width / host.offsetWidth : 1;
-          const scaleY = host.offsetHeight ? rect.height / host.offsetHeight : 1;
+          // An ancestor that scales, rotates or skews defeats the P0 recovery and cannot be
+          // undone from here. A pure translation is harmless, and stays supported because
+          // translateZ(0) and translate3d(0,0,0) are everywhere as compositing hints.
+          for (let ancestor = host.parentElement; ancestor; ancestor = ancestor.parentElement) {
+            const ancestorStyle = getComputedStyle(ancestor);
+            const ancestorTransform = ancestorStyle.getPropertyValue('transform');
+            if (ancestorTransform && ancestorTransform !== 'none') {
+              const ancestorMatrix = new DOMMatrix(ancestorTransform);
+              if (!ancestorMatrix.is2D || ancestorMatrix.a !== 1 || ancestorMatrix.b !== 0 || ancestorMatrix.c !== 0 || ancestorMatrix.d !== 1) {
+                return { unmappable: 'an ancestor of the iframe is scaled, rotated or skewed' };
+              }
+            }
+            if (ancestorStyle.getPropertyValue('perspective') !== 'none') {
+              return { unmappable: 'an ancestor of the iframe sets perspective' };
+            }
+            const ancestorZoom = ancestorStyle.getPropertyValue('zoom');
+            if (ancestorZoom && ancestorZoom !== '1' && ancestorZoom !== 'normal') {
+              return { unmappable: 'an ancestor of the iframe sets CSS zoom' };
+            }
+          }
+          if (style.getPropertyValue('perspective') !== 'none') return { unmappable: 'the iframe sets perspective' };
+          // CSS zoom on an iframe breaks coordinate mapping BELOW this code: Playwright's own
+          // click times out on an element inside such a frame, so nothing here can be more
+          // correct than that. Refused rather than answered.
+          const zoom = style.getPropertyValue('zoom');
+          if (zoom && zoom !== '1' && zoom !== 'normal') return { unmappable: 'the iframe sets CSS zoom' };
+
+          const transform = style.getPropertyValue('transform');
+          const matrix = !transform || transform === 'none' ? new DOMMatrix() : new DOMMatrix(transform);
+          if (!matrix.is2D) return { unmappable: 'the iframe uses a 3D transform' };
+          if (!(matrix.a * matrix.d - matrix.b * matrix.c)) return { unmappable: 'the iframe is scaled to nothing' };
+
+          const originParts = style.getPropertyValue('transform-origin').split(' ');
+          const ox = parseFloat(originParts[0]) || 0;
+          const oy = parseFloat(originParts[1]) || 0;
+          const width = host.offsetWidth ?? 0;
+          const height = host.offsetHeight ?? 0;
+          let minX = Infinity;
+          let minY = Infinity;
+          for (const corner of [[0, 0], [width, 0], [width, height], [0, height]]) {
+            const cx = corner[0] - ox;
+            const cy = corner[1] - oy;
+            const tx = ox + matrix.a * cx + matrix.c * cy + matrix.e;
+            const ty = oy + matrix.b * cx + matrix.d * cy + matrix.f;
+            if (tx < minX) minX = tx;
+            if (ty < minY) minY = ty;
+          }
+          const rect = host.getBoundingClientRect();
           return {
-            originX: rect.left + ((parseFloat(style.getPropertyValue('border-left-width')) || 0) + (parseFloat(style.getPropertyValue('padding-left')) || 0)) * scaleX,
-            originY: rect.top + ((parseFloat(style.getPropertyValue('border-top-width')) || 0) + (parseFloat(style.getPropertyValue('padding-top')) || 0)) * scaleY,
-            scaleX: scaleX || 1,
-            scaleY: scaleY || 1
+            unmappable: null,
+            p0x: rect.left - minX,
+            p0y: rect.top - minY,
+            ox,
+            oy,
+            a: matrix.a,
+            b: matrix.b,
+            c: matrix.c,
+            d: matrix.d,
+            e: matrix.e,
+            f: matrix.f,
+            contentX: (parseFloat(style.getPropertyValue('border-left-width')) || 0) + (parseFloat(style.getPropertyValue('padding-left')) || 0),
+            contentY: (parseFloat(style.getPropertyValue('border-top-width')) || 0) + (parseFloat(style.getPropertyValue('padding-top')) || 0)
           };
         })
       );
     }
 
-    // perLevel[i] holds every point expressed in frame i's own coordinate space.
+    const unmappableStep = steps.find(step => step.unmappable !== null);
+    if (unmappableStep) return points.map(() => ({ unmappable: unmappableStep.unmappable as string }));
+
+    // perLevel[i] holds every point expressed in frame i's own coordinate space, mapped
+    // outwards from the innermost frame one level at a time.
     const perLevel: ({ x: number; y: number } | null)[][] = [];
     let current = points;
     for (let level = chain.length - 1; level >= 0; level -= 1) {
-      const step = steps[level]!;
-      current = current.map(point => (point ? { x: point.x * step.scaleX + step.originX, y: point.y * step.scaleY + step.originY } : null));
+      const step = steps[level] as { p0x: number; p0y: number; ox: number; oy: number; a: number; b: number; c: number; d: number; e: number; f: number; contentX: number; contentY: number };
+      current = current.map(point => {
+        if (!point) return null;
+        const px = point.x + step.contentX - step.ox;
+        const py = point.y + step.contentY - step.oy;
+        return {
+          x: step.p0x + step.ox + step.a * px + step.c * py + step.e,
+          y: step.p0y + step.oy + step.b * px + step.d * py + step.f
+        };
+      });
       perLevel[level] = current;
     }
 
-    const blocked: (AncestorFrameOccluder | null)[] = points.map(() => null);
+    const blocked: FrameChainAnswer[] = points.map(() => null);
     for (let level = 0; level < chain.length; level += 1) {
       const answers = await chain[level]!.evaluate(
         (element: unknown, arg: { points: ({ x: number; y: number } | null)[]; drillCap: number }) => {
@@ -1006,7 +1094,7 @@ async function ancestorFrameOccluders(
       );
       answers.forEach((answer, index) => {
         // First failing level wins: the outermost thing in the way is the one to deal with.
-        if (answer && !blocked[index]) blocked[index] = answer;
+        if (answer && !blocked[index]) blocked[index] = { blocked: answer };
       });
     }
     return blocked;
@@ -2613,6 +2701,17 @@ export const inspectTools = defineTools({
       'top of an element inside the same shadow root is still caught, at whatever nesting depth of shadow roots ' +
       'it is at. ' +
       'The point tested comes back as hitTestPoint, with hitTestPointIsCentre alongside it, because an element ' +
+      'Inside an iframe the hit test still answers the question about a REAL click, and a pointer event cannot ' +
+      'cross a frame boundary: every ancestor frame has to receive the event at that point before anything inside ' +
+      'the frame can. So a modal in a PARENT document covering the iframe is caught and named, with occludedBy ' +
+      'carrying "inAncestorFrame": true, and nothing inside the frame can fix that one. Coordinates stay relative ' +
+      'to the frame\'s own viewport as documented; only the verdict looks one document out. A transformed iframe ' +
+      'is mapped exactly, rotation and skew included. Two shapes cannot be mapped and are reported as UNKNOWN ' +
+      'rather than guessed at, with topmostAtCentre null and the reason in topmostUnknownReason: an ancestor of ' +
+      'the iframe that is itself scaled, rotated or skewed (a pure translation is fine), and CSS zoom anywhere in ' +
+      'that chain. CSS zoom is a known blind spot BELOW this tool rather than in it: coordinates are mapped across ' +
+      'a frame boundary incorrectly in the browser automation layer, and Playwright\'s own click times out on an ' +
+      'element inside such a frame, so no answer here could be better than an admission. ' +
       'whose centre falls outside the viewport is tested at the nearest point inside it instead. When that point ' +
       'misses, nothing follows from it: topmostAtCentre is null, occludedBy stays null, and ' +
       'topmostUnknownReason says why and what to do (scroll it into view, then ask again). Reporting whatever ' +
@@ -2946,12 +3045,26 @@ export const inspectTools = defineTools({
             root.locator(selector),
             elements.map(element => element.hitTestPoint)
           );
-          occluders.forEach((occluder, index) => {
-            if (!occluder) return;
+          occluders.forEach((answer, index) => {
+            if (!answer) return;
             const element = elements[index];
             if (!element) return;
+            if ('unmappable' in answer) {
+              // The frame's geometry could not be mapped, so whether anything in a parent
+              // document is covering it is UNKNOWN. Leaving the in-frame answer standing would
+              // report a clean hit for a click that may never arrive, and overriding it to
+              // false would invent an occluder. Neither is honest, so neither is done.
+              element.topmostAtCentre = null;
+              element.occludedBy = null;
+              element.topmostUnknownReason =
+                `This element is inside an iframe whose geometry could not be mapped, because ${answer.unmappable}. ` +
+                'The hit test inside the frame says nothing is covering it there, but a pointer event cannot cross ' +
+                'a frame boundary, and whether one in a parent document would is UNKNOWN. Nothing here is evidence ' +
+                'either way. Test the element from inside the frame, or check the parent document yourself.';
+              return;
+            }
             element.topmostAtCentre = false;
-            element.occludedBy = occluder;
+            element.occludedBy = answer.blocked;
             element.topmostUnknownReason = null;
           });
         }
