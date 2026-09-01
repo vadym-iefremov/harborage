@@ -181,24 +181,51 @@ declare const performance: {
   getEntriesByType(type: string): { name?: string; responseStatus?: number }[];
 };
 
+/**
+ * The handful of Event members the write fence touches. Declared rather than
+ * pulled from lib.dom for the same reason everything else in this file is:
+ * the daemon's tsconfig has no "dom" lib on purpose.
+ */
+interface PageEvent {
+  key?: string;
+  cancelable?: boolean;
+  preventDefault(): void;
+  stopPropagation(): void;
+  stopImmediatePropagation(): void;
+}
+
+/**
+ * Chromium's AbortController, declared for one narrow use: it is how the write
+ * fence removes every listener it installed without holding a reference to any
+ * of them. That matters because those listeners have to be anonymous function
+ * EXPRESSIONS passed straight to addEventListener. Naming them, even by
+ * assigning one to a const, makes esbuild's keepNames rewrite it into a
+ * `__name(...)` call against a helper that exists in the bundle and not in the
+ * page, and Playwright serializes only the function's own source, so the whole
+ * evaluate dies with "__name is not defined". One signal removes them all.
+ */
+declare const AbortController: { new (): { signal: unknown; abort(): void } };
+
 declare const document: {
   activeElement: PageElement | null;
   /** Read by navigate's and reload's settle snapshot, together with performance.timeOrigin, in one crossing. */
   title: string;
   /** Read by the same snapshot, to spot a <meta http-equiv="refresh"> that will move the tab after the call returns. */
   querySelector(selector: string): PageElement | null;
-  addEventListener(type: string, handler: () => void, options?: unknown): void;
-  removeEventListener(type: string, handler: () => void, options?: unknown): void;
+  addEventListener(type: string, handler: (event: PageEvent) => void, options?: unknown): void;
+  removeEventListener(type: string, handler: (event: PageEvent) => void, options?: unknown): void;
   elementFromPoint(x: number, y: number): PageElement | null;
   scrollingElement: PageElement | null;
   // Used to scope a deletion to one element's own contents instead of
   // pressing the browser's select-all, which the browser scopes for you.
   createRange(): PageRange;
 };
-/** The handful of Range members selectElementContents touches. */
+/** The handful of Range members selectElementContents and the write fence touch. */
 interface PageRange {
   startContainer: unknown;
   endContainer: unknown;
+  /** True when the range covers nothing, which is a caret rather than a selection. */
+  collapsed: boolean;
   selectNodeContents(node: unknown): void;
 }
 declare const window: {
@@ -231,6 +258,10 @@ declare const window: {
   requestAnimationFrame(callback: () => void): number;
   __harborageDragProbed?: boolean;
   __harborageDragStarts?: number;
+  // The write fence's own state: see installWriteFence. Kept on window
+  // because the listeners it installs have to be removable from a later
+  // evaluate, which cannot close over anything from the one that made them.
+  __harborageWriteFence?: { blocked: boolean; controller?: { abort(): void } };
 };
 
 /**
@@ -485,6 +516,30 @@ const richTextEditorWarning =
   'a ProseMirror or TipTap view\'s state.doc.toJSON(), or editor.getEditorState().toJSON() for Lexical.';
 
 /**
+ * Why a readback taken from an element that CONTAINS an editor is only partly
+ * trustworthy. Deliberately narrower than the two messages above: nothing here
+ * says the readback was truncated, because the element's own text was not, and
+ * nothing here points at an editor API for a value the caller may never have
+ * been asking about.
+ */
+const containedVirtualizedWarning =
+  'This element is not itself an editor, but it CONTAINS a virtualizing code editor (Monaco, CodeMirror or Ace), ' +
+  'whose rendered view forms part of the text read back below. Its own text is read back accurately; the embedded ' +
+  'editor\'s part of it is only what happens to be on screen, so a long embedded document appears truncated and ' +
+  'without line breaks. Nothing here says the value below is wrong, only that the part contributed by the editor ' +
+  'cannot be compared against that editor\'s real document. Read that separately through the editor\'s own API if ' +
+  'it matters, or name a narrower element that excludes it.';
+
+/** The same, for an embedded rich-text editor, whose failure is structural rather than truncating. */
+const containedRichTextWarning =
+  'This element is not itself an editor, but it CONTAINS a rich-text editor (Quill, ProseMirror, TipTap, Slate or ' +
+  'Lexical), whose rendered view forms part of the text read back below. Its own text is read back accurately; the ' +
+  'embedded editor contributes its text with every line break gone and every non-text node, image, embed or ' +
+  'mention, missing entirely. Nothing here says the value below is wrong, only that the part contributed by the ' +
+  'editor cannot be compared against that editor\'s real document. Read that separately through its own API if it ' +
+  'matters, or name a narrower element that excludes it.';
+
+/**
  * Why textContent cannot be trusted for an element with an attached
  * EditContext. Confirmed directly: attaching a real EditContext to a
  * contenteditable element in Chromium left its textContent empty even though
@@ -562,6 +617,19 @@ interface TextTargetReport {
   editingHost: { tag: string; id: string; classes: string } | null;
   /** Which family of editor's readback this element's textContent cannot answer for. */
   editorKind: EditorKind;
+  /**
+   * Whether the element IS (or is inside) that editor, or merely CONTAINS one.
+   *
+   * The distinction is the difference between two very different sentences.
+   * When the marker is at or above the element, its textContent IS the
+   * editor's rendered view and the whole readback is suspect. When the marker
+   * is only below it, the readback is this element's own text, which is
+   * complete and correct except for the region the embedded editor renders.
+   * Saying the second is the first produced a warning about truncation, and
+   * advice to call monaco.editor.getModels(), over a readback of
+   * "ZSee code here." that was neither truncated nor Monaco.
+   */
+  editorAt: 'target' | 'descendant' | null;
   /** An EditContext is attached, so the DOM is not this element's text store at all. */
   editContext: boolean;
 }
@@ -663,15 +731,18 @@ function inspectTextTarget(
     // contains one is the honest answer, because its textContent really does
     // include that truncated render.
     let editorKind: EditorKind = null;
+    let editorAt: 'target' | 'descendant' | null = null;
     let step: TreeWalkElement | null = node;
     for (let hops = 0; step && hops < 8 && editorKind === null; hops += 1) {
       if (step.matches(markers.virtualized)) editorKind = 'virtualized';
       else if (step.matches(markers.richText)) editorKind = 'richText';
       else step = step.parentElement ?? step.getRootNode().host ?? null;
     }
+    if (editorKind !== null) editorAt = 'target';
     if (editorKind === null && node.querySelector) {
       if (node.querySelector(markers.virtualized)) editorKind = 'virtualized';
       else if (node.querySelector(markers.richText)) editorKind = 'richText';
+      if (editorKind !== null) editorAt = 'descendant';
     }
     // querySelector does not cross a shadow boundary, so open roots in the
     // subtree are walked separately, under a node budget so a huge page
@@ -686,7 +757,10 @@ function inspectTextTarget(
           if (root?.querySelector) {
             if (root.querySelector(markers.virtualized)) editorKind = 'virtualized';
             else if (root.querySelector(markers.richText)) editorKind = 'richText';
-            if (editorKind !== null) break;
+            if (editorKind !== null) {
+              editorAt = 'descendant';
+              break;
+            }
           }
           const kids = parent.children;
           for (let i = 0; kids && i < kids.length && budget > 0; i += 1) {
@@ -738,6 +812,7 @@ function inspectTextTarget(
       isEditingHost,
       editingHost,
       editorKind,
+      editorAt,
       editContext: Boolean(node.editContext)
     };
   }
@@ -931,6 +1006,16 @@ function refusalForUnwritableTarget(lead: string, target: TextTargetReport, insp
 /** Why this element's textContent readback cannot be believed, or null when it can. */
 function readbackWarningFor(target: TextTargetReport | null): string | null {
   if (!target) return null;
+  // A container that merely CONTAINS an editor gets its own sentence. Saying
+  // the editor's sentence here claimed a truncation that had not happened and
+  // pointed at an API belonging to an element nothing was written to, over a
+  // readback that was complete and correct. What is true of a container is
+  // narrower and still worth saying: part of what it reads back is an editor's
+  // rendered view, and that part cannot be trusted to match that editor's own
+  // document.
+  if (target.editorAt === 'descendant' && target.editorKind !== null) {
+    return target.editorKind === 'virtualized' ? containedVirtualizedWarning : containedRichTextWarning;
+  }
   if (target.editorKind === 'virtualized') return virtualizedEditorWarning;
   if (target.editorKind === 'richText') return richTextEditorWarning;
   return target.editContext ? editContextWarning : null;
@@ -1111,6 +1196,208 @@ async function selectorActionFailure(
 }
 
 /**
+ * PageElement widened with the two listener methods the write fence needs.
+ * A separate interface reached through a cast inside the callback, never a
+ * callback's own `el` parameter, for the reason ShadowDrillElement's comment
+ * gives: widening PageElement itself breaks every other locator.evaluate in
+ * this file under the test tsconfig's lib.dom.
+ */
+/**
+ * Anything the fence can be installed on. Both `Locator` and `ElementHandle`
+ * satisfy it: the no-selector clear has only a handle to the focused element,
+ * and the selector paths have a locator, and both need the same protection.
+ */
+/**
+ * What the fence checks at dispatch time.
+ *
+ *   'none'      no document-selection check at all. A form control keeps its
+ *               selection in selectionStart and selectionEnd, and while one
+ *               has focus document.getSelection() reports a range that is not
+ *               inside it, so this check would refuse every write. Measured.
+ *   'inside'    the selection must still be inside the target. Used when the
+ *               placed range was legitimately collapsed, which is what
+ *               selecting the contents of an EMPTY element gives.
+ *   'covering'  the selection must still be inside the target AND still cover
+ *               something. See installWriteFence for why the second half is
+ *               not pedantry.
+ */
+type WriteFenceMode = 'none' | 'inside' | 'covering';
+
+interface FenceTarget {
+  evaluate(fn: (el: PageElement, mode: string) => boolean, arg: string): Promise<boolean>;
+}
+
+/**
+ * A form control that has to be emptied, reached either by a selector or by a
+ * handle to whatever holds focus. Structural rather than Playwright's own
+ * Locator or ElementHandle<T>, whose default type parameter is `Node`: this
+ * file's tsconfig has no "dom" lib, so naming either does not compile.
+ *
+ * `selectText` is on here because it is how a control gets emptied without a
+ * key. Measured on a text input, a number input, an email input, a date input
+ * and a textarea: selectText dispatches no events at all and leaves the
+ * control's own text selected, and the insertText that follows replaces
+ * exactly that.
+ */
+interface ClearableField extends FenceTarget {
+  fill(value: string): Promise<void>;
+  selectText(): Promise<void>;
+  // Both shapes of Playwright's own overloaded evaluate: the fence passes an
+  // argument, the readback does not. Declared here rather than widened on
+  // FenceTarget so nothing else in this file loses the argument's type.
+  evaluate(fn: (el: PageElement, mode: string) => boolean, arg: string): Promise<boolean>;
+  evaluate(fn: (el: PageElement) => string): Promise<string>;
+}
+
+interface FenceElement extends PageElement {
+  addEventListener(type: string, handler: (event: PageEvent) => void, options?: unknown): void;
+  removeEventListener(type: string, handler: (event: PageEvent) => void, options?: unknown): void;
+}
+
+/**
+ * Keeps a write inside the element the caller named, at the moment the write
+ * is actually dispatched rather than one round trip earlier.
+ *
+ * Read this together with the change that made it small. Rounds two and three
+ * fought the scope of the deletion, and got that right: a Range over the
+ * target's own contents bounds what the browser's default deletion touches.
+ * Neither addressed the DELIVERY. A literal Delete key was still pressed, and
+ * a key event reaches every ancestor. Measured: filling an inline
+ * contenteditable label inside a canvas node deleted the whole node, because
+ * the canvas listens for Delete and removes whatever is focused. The selection
+ * was scoped correctly and the sibling content survived. The keystroke did the
+ * damage, not the deletion.
+ *
+ * That keystroke is gone now. Every write path replaces text with
+ * keyboard.insertText over a live selection, which dispatches no key event at
+ * all, so an ancestor's Delete handler has nothing to hear in either phase.
+ * See setFieldValue for the measurements. What is left for this fence to do is
+ * narrower and still real:
+ *
+ * A capture listener on `document` runs before anything else in the page (only
+ * a window-level capture listener could precede it) and answers the question
+ * the previous round trip could not answer atomically: is the selection STILL
+ * where it was put at the moment the event is dispatched? A page that moves
+ * the selection on `selectionchange` fires after the evaluate that placed and
+ * verified the Range has already returned, so verifying in one round trip and
+ * writing in the next is a real window however small it is. Checking inside
+ * the dispatch is not a smaller window, it is no window: if the selection has
+ * moved, the event is cancelled and stopped dead before any handler, the
+ * editor's included, can act on it. `beforeinput` is cancelable, so the check
+ * covers the insert as well as a key.
+ *
+ * "Still where it was put" has two halves, and the second was learned the hard
+ * way. Asking only whether the selection is still INSIDE the target misses the
+ * page that collapses it to a caret inside that same element, and a write into
+ * a caret is an insert rather than a replacement: it leaves the old contents
+ * alone and puts the new value beside them. Measured on a fixture that
+ * collapses the selection on selectionchange, "ORIGINALCONTENT" filled with
+ * "NEW" became "NEWORIGINALCONTENT" while the guard reported nothing wrong. So
+ * 'covering' additionally requires the range to still cover something.
+ * 'inside' is for the one case where a collapsed range is honest, an element
+ * that was empty to begin with, which selectElementContents reports separately
+ * for exactly this reason.
+ *
+ * `beforeinput` is guarded but not stopped from bubbling, because a
+ * text-change notification reaching the application is legitimate: the caller
+ * did ask for the text to change.
+ *
+ * The keydown half of the guard, and the bubble listeners that stop a key
+ * going further up from the target, are kept even though nothing here presses
+ * a key any more. They are there for exactly the failure that produced
+ * Finding 2: `locator.fill('')` dispatched a real Delete that none of this
+ * code pressed, on a path nobody had enumerated. If a future Playwright
+ * reintroduces a keystroke into a path that reaches this fence, the key is
+ * bounded rather than loose, and round4-write's key-log tests fail loudly
+ * rather than the behaviour changing quietly.
+ *
+ * One thing it still cannot do, and it is a DOM invariant rather than an
+ * oversight: an ancestor's CAPTURE-phase handler runs before the event reaches
+ * the target at all, so nothing installed at or below the target can prevent
+ * it. Blocking it would mean stopping the event above the target, which would
+ * also stop the editor from seeing it. That matters only where a key is still
+ * pressed, which after this change is `type`'s own characters and whatever
+ * `press_key` is told to press, and never a Delete.
+ */
+async function installWriteFence(target: FenceTarget, mode: WriteFenceMode): Promise<boolean> {
+  return target
+    .evaluate((raw: PageElement, fenceMode: string) => {
+      const el = raw as unknown as FenceElement;
+      const controller = new AbortController();
+      const state: { blocked: boolean; controller?: { abort(): void } } = { blocked: false, controller };
+      window.__harborageWriteFence = state;
+      const options = { capture: true, signal: controller.signal };
+
+      // Every handler below is an anonymous function expression passed
+      // straight to addEventListener, and the selection check is spelled out
+      // inside each one rather than shared. Both are forced: naming a function
+      // here, even by assigning it to a const, makes esbuild rewrite it into a
+      // `__name(...)` call that does not exist in the page. This exact block
+      // was written the readable way first and failed with "__name is not
+      // defined" on every call.
+      if (fenceMode !== 'none') {
+        const mustCover = fenceMode === 'covering';
+        document.addEventListener(
+          'keydown',
+          function (event: PageEvent) {
+            const selection = window.getSelection();
+            const range = selection && selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
+            const inside =
+              range !== null && el.contains(range.startContainer) && el.contains(range.endContainer);
+            if (inside && !(mustCover && range.collapsed === true)) return;
+            state.blocked = true;
+            event.preventDefault();
+            event.stopImmediatePropagation();
+          },
+          options
+        );
+        document.addEventListener(
+          'beforeinput',
+          function (event: PageEvent) {
+            const selection = window.getSelection();
+            const range = selection && selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
+            const inside =
+              range !== null && el.contains(range.startContainer) && el.contains(range.endContainer);
+            if (inside && !(mustCover && range.collapsed === true)) return;
+            state.blocked = true;
+            event.preventDefault();
+            event.stopImmediatePropagation();
+          },
+          options
+        );
+      }
+      el.addEventListener(
+        'keydown',
+        function (event: PageEvent) {
+          event.stopPropagation();
+        },
+        { signal: controller.signal }
+      );
+      el.addEventListener(
+        'keyup',
+        function (event: PageEvent) {
+          event.stopPropagation();
+        },
+        { signal: controller.signal }
+      );
+      return true;
+    }, mode)
+    .catch(() => false);
+}
+
+/** Takes the fence down and reports whether it had to cancel anything. Always safe to call. */
+async function removeWriteFence(page: Page): Promise<boolean> {
+  return page
+    .evaluate(() => {
+      const state = window.__harborageWriteFence;
+      state?.controller?.abort();
+      window.__harborageWriteFence = undefined;
+      return state?.blocked ?? false;
+    })
+    .catch(() => false);
+}
+
+/**
  * Selects exactly the contents of one element and nothing else, then reports
  * whether that actually took.
  *
@@ -1128,91 +1415,136 @@ async function selectorActionFailure(
  * A Range placed over the element's own contents cannot do either. It is
  * scoped structurally rather than by whatever happens to be focused, and it is
  * set in the same round trip that verifies it, so there is no window between
- * deciding and acting. The Delete after it is still a real key press, because
- * an editor with its own document model has to see a real one: CodeMirror 6 on
- * the live Acres app was checked directly through the editor's own
- * state.doc.toString() to confirm the deletion reaches the model, not just the
- * DOM.
+ * deciding and acting. What follows it is an insertText over that Range and no
+ * key at all: see setFieldValue for why the Delete that used to follow is gone
+ * and what was measured on the live CodeMirror 6 in Acres to retire it.
+ *
+ * Reports which of three things happened, not just whether it worked, because
+ * the write fence has to know what the selection looked like when it was
+ * placed to tell a page's interference from an ordinary empty element:
+ *
+ *   'covering'  the range took and covers something
+ *   'empty'     the range took and is collapsed, because the element has no
+ *               contents to cover, which is the legitimate case of filling an
+ *               empty contenteditable
+ *   null        the range did not take
  */
-async function selectElementContents(locator: Locator): Promise<boolean> {
+async function selectElementContents(locator: Locator): Promise<'covering' | 'empty' | null> {
   return locator.evaluate((el: PageElement) => {
-    const selection = window.getSelection();
-    if (!selection) return false;
-    const range = document.createRange();
-    range.selectNodeContents(el as unknown as never);
-    selection.removeAllRanges();
-    selection.addRange(range);
-    // Verified rather than assumed: an editor can normalize or reject a
-    // selection it does not like, and a deletion aimed at a selection that
-    // never took would fall through to whatever was selected before.
-    const now = selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
-    return now !== null && el.contains(now.startContainer) && el.contains(now.endContainer);
-  });
-}
-
-/**
- * Selects the contents of whatever currently holds the caret, and re-checks in
- * the SAME page round trip that the caret is still where the guard found it.
- *
- * The no-selector clear path used to press the platform select-all chord, and
- * that is a time-of-check-to-time-of-use bug as well as a scoping one. The
- * guard ran, two round trips passed, and only then did the chord go out, so an
- * ordinary global keyboard-shortcut handler that moves focus on the
- * accelerator could redirect the Delete that followed. Measured: focus was on
- * a plain <input> when the guard ran, the chord moved it to a canvas node, and
- * the Delete deleted that node while the input was untouched and the result
- * blamed the page for rewriting the input.
- *
- * Checking and selecting in one evaluate leaves no window between the two, and
- * a Range over the caret holder's own contents is scoped to that element
- * rather than to whatever the browser decides select-all means. Returns the
- * tag it acted on, or null when the caret is no longer on an element that owns
- * a scoped selection.
- */
-function selectFocusedContents(page: Page): Promise<string | null> {
-  return page.evaluate(() => {
-    let el = document.activeElement as TreeWalkElement | null;
-    for (let hops = 0; hops < 32; hops += 1) {
-      const inner = el?.shadowRoot?.activeElement;
-      if (!inner) break;
-      el = inner;
-    }
-    if (!el) return null;
-    // BODY and HTML are never a scoped target: the region would be the page.
-    if (el.tagName === 'BODY' || el.tagName === 'HTML') return null;
-    if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
-      if (el.readOnly === true || el.disabled === true) return null;
-      if (typeof el.setSelectionRange !== 'function') return null;
-      el.setSelectionRange(0, (el.value ?? '').length);
-      return el.tagName;
-    }
-    // Only an editing host owns its own region; a descendant of one does not,
-    // and deleting through it would take the whole host with it.
-    const attr = el.getAttribute('contenteditable');
-    const isHost = el.isContentEditable === true && (attr === '' || attr === 'true' || attr === 'plaintext-only');
-    if (!isHost) return null;
     const selection = window.getSelection();
     if (!selection) return null;
     const range = document.createRange();
     range.selectNodeContents(el as unknown as never);
     selection.removeAllRanges();
     selection.addRange(range);
+    // Verified rather than assumed: an editor can normalize or reject a
+    // selection it does not like, and a write aimed at a selection that never
+    // took would fall through to whatever was selected before.
     const now = selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
     if (now === null || !el.contains(now.startContainer) || !el.contains(now.endContainer)) return null;
-    return el.tagName;
+    return now.collapsed === true ? 'empty' : 'covering';
   });
+}
+
+/**
+ * Sets a form control's value without letting a Delete key out.
+ *
+ * This exists because of Finding 2, which is a fact about Playwright rather
+ * than about this code. Measured on a text input and on a textarea:
+ * `locator.fill('X')` dispatches beforeinput/textInput/input with inputType
+ * insertText and NO key event, while `locator.fill('')` dispatches a real
+ * `keydown: Delete`. So clearing an inline rename input inside a canvas node
+ * deleted the node, while the identical call with a non-empty value was
+ * harmless, through a key none of this code pressed. The 30 seconds Playwright
+ * then spent waiting for the element it had just caused to be removed is how
+ * the report came back as a timeout blaming the selector.
+ *
+ * A non-empty value keeps `locator.fill`, which is already keyless. An empty
+ * one selects the control's own text with `selectText`, which was measured to
+ * dispatch nothing at all, and empties it with `keyboard.insertText('')`,
+ * which was measured to dispatch beforeinput/input with inputType insertText
+ * and no key, on a text input, a number input, an email input and a textarea.
+ *
+ * insertText is inert on the inputs the browser renders as a picker rather
+ * than as text: on `<input type="date">` it dispatched nothing and left the
+ * value alone. So the result is READ BACK and the old `fill('')` is used as a
+ * fallback when it did not take. That fallback is not a hole: Playwright sets
+ * a date, time, colour or range input's value directly, and it was measured
+ * dispatching only input and change on a date input, no key. The keystroke is
+ * confined to the text-like controls, which are exactly the ones insertText
+ * handles, so the fallback is never the destructive path.
+ */
+async function clearOrFillFormControl(
+  page: Page,
+  field: ClearableField,
+  value: string,
+  toolName: string
+): Promise<void> {
+  const fenced = await installWriteFence(field, 'none');
+  try {
+    if (!fenced) {
+      throw new Error(
+        `${toolName} could not install the guard that keeps a write's keystrokes inside the target element, so it ` +
+          'stopped rather than writing unguarded. Nothing was written.'
+      );
+    }
+    if (value.length > 0) {
+      await field.fill(value);
+      return;
+    }
+    // selectText is allowed to fail rather than to throw. A control it cannot
+    // select is a control insertText cannot empty either, and both end at the
+    // same fallback. Measured succeeding on a text input, a number input, an
+    // email input, a date input and a textarea, so this guards the types not
+    // enumerated rather than a known failure.
+    const selected = await field
+      .selectText()
+      .then(() => true)
+      .catch(() => false);
+    if (selected) await page.keyboard.insertText('');
+    const after = await field.evaluate((el: PageElement) => el.value ?? '').catch(() => '');
+    if (after !== '') {
+      // Reached by a picker-style input, which Playwright empties by
+      // assignment rather than by a key. See the note above.
+      await field.fill('');
+    }
+  } finally {
+    await removeWriteFence(page);
+  }
 }
 
 /**
  * Replaces a field's contents for real.
  *
- * A contenteditable goes through real keyboard events rather than a plain
- * insertion, because CodeMirror and Monaco keep their own document model and
- * treat an insertion as an insert at their own cursor. That is how filling
- * `{{ $json.mode }}` over `result` produced `{{ $json.mode }}result`: the
- * editor never saw the old text go away. Deleting with a key press is what a
- * human does, so the editor handles it the way it handles a human. What is NOT
- * done the way a human does it is the selecting: see selectElementContents.
+ * A contenteditable is replaced by placing a Range over its own contents and
+ * writing over it with `keyboard.insertText`, which dispatches no key event of
+ * any kind. Two earlier attempts are worth recording, because the difference
+ * between them is the whole point of this path.
+ *
+ * Setting the text programmatically does not work. CodeMirror and Monaco keep
+ * their own document model and treat a DOM edit as something other than an
+ * edit: `document.execCommand('delete')` over a correctly placed Range on the
+ * live CodeMirror 6 in Acres reported success and left the old text in the
+ * model, so the insert that followed produced `{{ $json.mode }}1` out of `1`.
+ *
+ * Pressing Delete does work, and it is what this path used to do, and it is
+ * what destroyed user data: the key reaches every ancestor, so a canvas that
+ * treats Delete as "remove the selected node" removed one.
+ *
+ * insertText is the third answer and it is both. Measured on the live
+ * CodeMirror 6 in Acres, through the editor's own `state.doc.toString()`, with
+ * a Range over the whole content and no key pressed at all: a doc of
+ * `{{ $json.mode }}` became `1`, which is the case the Delete was kept for,
+ * and the case execCommand failed. Measured with a page-wide capture listener
+ * at the same time: the only event dispatched was `beforeinput: insertText`.
+ * An empty value goes the same way, verified on the same editor: `ABCDEF`
+ * became the empty string under `insertText('')`, again with no key. And the
+ * replacement stays inside the selection rather than taking the editing host:
+ * on `<span>AAA</span><span>BBB</span><span>CCC</span>` with only the middle
+ * span selected, the host read back `AAAZZZCCC`.
+ *
+ * What is NOT done the way a human does it is the selecting: see
+ * selectElementContents.
  *
  * Before any of that it asks whether the named element can hold typed text and
  * owns the region a deletion would clear, which is a different question from
@@ -1270,14 +1602,14 @@ async function setFieldValue(page: Page, locator: Locator, value: string): Promi
   }
 
   if (formControlTags.includes(target.tag)) {
-    await locator.fill(value);
+    await clearOrFillFormControl(page, locator as unknown as ClearableField, value, 'fill');
     return;
   }
 
   await locator.focus();
 
-  // Focus still has to have landed, because the Delete and the insert that
-  // follow go to whatever holds the caret. Read through inspectTextTarget's
+  // Focus still has to have landed, because the insert that follows goes to
+  // whatever holds the caret. Read through inspectTextTarget's
   // shadow-piercing walk: document.activeElement retargets to the shadow host,
   // so the identity test this replaces could not see focus that had genuinely
   // landed inside an open shadow root, and fill on a shadow-DOM contenteditable
@@ -1294,16 +1626,146 @@ async function setFieldValue(page: Page, locator: Locator, value: string): Promi
   }
 
   const selected = await selectElementContents(locator);
-  if (!selected) {
+  if (selected === null) {
     throw new Error(
-      'fill could not place a selection over the target element\'s own contents, so it stopped rather than pressing ' +
-        'Delete against whatever else happened to be selected. The element may be inside a widget that manages its ' +
-        'own selection. Nothing was written.'
+      'fill could not place a selection over the target element\'s own contents, so it stopped rather than writing ' +
+        'over whatever else happened to be selected. The element may be inside a widget that manages its own ' +
+        'selection. Nothing was written.'
     );
   }
-  await page.keyboard.press('Delete');
-  if (value.length > 0) {
+
+  // One insertText over the live selection, and no key. See this function's
+  // note for what was measured on the live CodeMirror 6 in Acres, for both an
+  // empty and a non-empty value.
+  //
+  // The fence is told what the selection looked like when it was placed. A
+  // range that covered something and is a bare caret by the time the write is
+  // dispatched has been moved by the page, and writing into a caret is an
+  // INSERT rather than a replacement: it leaves the old contents in place and
+  // puts the new value beside them. Measured on a page that collapses the
+  // selection on selectionchange: "ORIGINALCONTENT" filled with "NEW" became
+  // "NEWORIGINALCONTENT". An element that was empty to begin with is collapsed
+  // for an honest reason and is passed 'inside' instead, so filling an empty
+  // contenteditable still works.
+  const fenced = await installWriteFence(
+    locator as unknown as FenceTarget,
+    selected === 'covering' ? 'covering' : 'inside'
+  );
+  let blocked = false;
+  try {
+    if (!fenced) {
+      throw new Error(
+        'fill could not install the guard that keeps a replacement inside the target element, so it stopped rather ' +
+          'than writing unguarded. Nothing was written.'
+      );
+    }
     await page.keyboard.insertText(value);
+  } finally {
+    blocked = await removeWriteFence(page);
+  }
+
+  // The fence cancels rather than lets through, so this is a report of
+  // something that did NOT happen: the selection had moved out of the target
+  // between being placed and the write being dispatched, and the write was
+  // stopped before any handler saw it.
+  if (blocked) {
+    throw new Error(
+      'fill placed a selection over the target element and the page moved it somewhere else before the write ' +
+        'landed, so the write was cancelled rather than allowed to replace whatever was selected by then. This is ' +
+        'what a page that reasserts its own selection on selectionchange does. The element was not written to, and ' +
+        'nothing else was overwritten either. Try again, or set the value through evaluate if the page will not ' +
+        'leave a selection alone.'
+    );
+  }
+
+  return replaceKeylesslyOrFallBack(page, locator, target, value);
+}
+
+/**
+ * Checks that the keyless replacement actually replaced, and presses a key
+ * only when a page has proved it will not accept anything else.
+ *
+ * A page CAN refuse an insert. `beforeinput` is cancelable, so a handler may
+ * preventDefault it and apply its own edit, and one that inserts at the range
+ * START without removing the range CONTENTS turns a replacement into a
+ * prepend. That is the round-2 append bug, reachable again through a different
+ * door, and it is why this function exists rather than the write being trusted
+ * because it was dispatched.
+ *
+ * The retry is gated on the readback being trustworthy, and that gate is the
+ * whole design rather than caution. A virtualizing editor renders only what is
+ * on screen and a rich-text editor drops every line break, so their textContent
+ * disagrees with the requested value most of the time even when the write was
+ * perfect. Retrying on that disagreement would press a Delete on every write to
+ * exactly the editors this round exists to keep keys away from. So: where the
+ * readback can be believed, a mismatch is real and a key is worth pressing;
+ * where it cannot, nothing is inferred and no key is pressed.
+ *
+ * Note which pages this can and cannot reach. It cannot fire on the harmful
+ * shape, an inline contenteditable label inside a canvas that deletes nodes on
+ * Delete, because a plain contenteditable accepts the insertText and there is
+ * no mismatch to retry. Measured: that fixture reads back the requested value
+ * with beforeinput insertText as the only event dispatched. It fires on a page
+ * that actively rejected the insert, where a key is the only thing left, and
+ * the caller is told a key was pressed rather than left to assume none was.
+ */
+async function replaceKeylesslyOrFallBack(
+  page: Page,
+  locator: Locator,
+  target: TextTargetReport,
+  value: string
+): Promise<void> {
+  // Untrustworthy readback: nothing can be concluded from a comparison, so
+  // nothing is. See above.
+  if (readbackWarningFor(target) !== null) return;
+
+  const landed = await readFieldValue(page, locator).catch(() => value);
+  if (landed === value) return;
+
+  // Not "the readback disagrees", but "the readback disagrees in the specific
+  // shape of a refused insert": what was asked for is there, with the old
+  // content still hanging off one end of it. A refused insert prepends or
+  // appends, so it is one of those two, and an empty value is covered because
+  // anything starts with the empty string.
+  //
+  // The looser test cost a keystroke on writes that had in fact succeeded. A
+  // multi-line value is the ordinary case: insertText puts a line break into a
+  // contenteditable as a <br>, which textContent does not render as a newline,
+  // so "a\nb" reads back as "ab" and compares unequal to a correct write. Under
+  // the looser test that pressed a Delete, on a plain contenteditable, which is
+  // exactly the element inside a canvas node this round exists to protect.
+  if (!landed.startsWith(value) && !landed.endsWith(value)) return;
+
+  // Re-select first: the failed insert has already changed the contents, so
+  // the Range placed before it no longer covers them.
+  const reselected = await selectElementContents(locator);
+  if (reselected === null) return;
+
+  // Two fences rather than one, and the reason is the guard doing its job. The
+  // Delete gets 'covering', because a selection collapsed out from under it
+  // would make it eat a single character somewhere unintended. The insertText
+  // that follows CANNOT get 'covering': the Delete has just emptied the
+  // selection, so the range is legitimately a caret by then, and one fence
+  // spanning both cancelled the insert and left the element empty.
+  const deleteFenced = await installWriteFence(
+    locator as unknown as FenceTarget,
+    reselected === 'covering' ? 'covering' : 'inside'
+  );
+  if (!deleteFenced) return;
+  let deleteBlocked = false;
+  try {
+    await page.keyboard.press('Delete');
+  } finally {
+    deleteBlocked = await removeWriteFence(page);
+  }
+  if (deleteBlocked || value.length === 0) return;
+
+  const fenced = await installWriteFence(locator as unknown as FenceTarget, 'inside');
+  if (!fenced) return;
+  try {
+    await page.keyboard.insertText(value);
+  } finally {
+    await removeWriteFence(page);
   }
 }
 
@@ -2788,8 +3250,13 @@ export const interactionTools = defineTools({
   fill: defineTool({
     serializesInput: true,
     description:
-      'Set a field\'s contents in a session\'s tab, REPLACING whatever was there. Use type instead to append, or to fire per-character events. For an input, textarea or select this is Playwright\'s atomic fill. For a contenteditable, including rich editors like CodeMirror and Monaco, it focuses the element and replaces through real keyboard events (select-all, delete, insert), because those editors keep their own document model and treat a plain insertion as an insert at their cursor, appending onto the existing value instead of replacing it. ' +
-      'The selector has to name an element that can hold typed text AND own what a replacement would delete, and both are checked before anything is written. Replacing means selecting and deleting, and a selection is scoped by the browser: to a form control\'s own value, or to the whole contenteditable EDITING HOST, never to whatever element you happened to name. So this accepts a text-holding input, a textarea, or an element that is itself a contenteditable root. It refuses an element that merely SITS INSIDE an editable region, because isContentEditable is inherited and a deletion there destroys the whole region: measured on a page whose canvas sat inside one, a clear took it from three nodes and 91 characters to one node and 14. The refusal names the host so you can decide whether you meant it. It also refuses <body> and <html> even on a contenteditable or designMode page, a <select> (use select_option), a checkbox, radio, button or file input (click, or file_upload), a readonly or disabled control (said at once rather than after the full timeout), and a selector matching several elements. A selector matching nothing is waited for the way Playwright waits for any selector and then explained, saying what it measured and when. The deletion itself is scoped with a Range over the element\'s own contents rather than the platform select-all chord, so it cannot be redirected by a page that moves focus on that chord. ' +
+      'Set a field\'s contents in a session\'s tab, REPLACING whatever was there. Use type instead to append, or to fire per-character events. ' +
+      'This DISPATCHES NO KEY EVENT on any ordinary page, whatever the value and whatever the element, and that is worth relying on rather than being an implementation detail. A contenteditable, including a rich editor like CodeMirror or Monaco, gets a Range placed over its own contents and one insertText written over it: no select-all chord, no Delete. A form control with a non-empty value gets Playwright\'s fill, which is itself an insertText. A form control being CLEARED gets its own text selected and an empty insertText, because Playwright\'s own fill("") dispatches a real Delete key while fill("X") dispatches none, and that asymmetry is how clearing an inline rename input inside a canvas deleted the canvas node. An input the browser renders as a picker rather than as text (date, time, colour, range) is set by assignment, also without a key. ' +
+      'The reason this matters: a key event reaches every ancestor listening for it, in both the capture and the bubble phase, and an application that treats Delete as "remove the selected thing" will act on a Delete aimed at a text field inside it. That is not preventable once the key is dispatched, so it is not dispatched. ' +
+      'ONE CASE STILL PRESSES A KEY, and it is named here rather than left implied. `beforeinput` is cancelable, so a page can refuse the insert and apply its own edit, and one that inserts at the selection START without removing the selection CONTENTS turns a replacement into a prepend. Where the readback can be believed and it disagrees with what was asked for, that is what happened, so a real Delete is pressed once and the replacement is retried. It cannot fire on the shape that loses data, because an ordinary contenteditable accepts the insertText and there is nothing to retry, and it is deliberately not attempted at all on a virtualizing or rich-text editor, whose readback disagrees with the requested value most of the time even when the write was perfect. ' +
+      'Replacement also cannot reach outside the element you named: an insertText over a Range replaces exactly that Range. Verified on a contenteditable holding three spans with only the middle one selected, which read back with the outer two intact. ' +
+      'The selector still has to name an element that can hold typed text AND own the region a replacement would cover, and both are checked before anything is written, because a selection is scoped by the browser: to a form control\'s own value, or to the whole contenteditable EDITING HOST, never to whatever element you happened to name. So this accepts a text-holding input, a textarea, or an element that is itself a contenteditable root. It refuses an element that merely SITS INSIDE an editable region, because isContentEditable is inherited and a replacement there can take the whole region: measured on a page whose canvas sat inside one, a clear took it from three nodes and 91 characters to one node and 14. The refusal names the host so you can decide whether you meant it. It also refuses <body> and <html> even on a contenteditable or designMode page, a <select> (use select_option), a checkbox, radio, button or file input (click, or file_upload), a readonly or disabled control (said at once rather than after the full timeout), and a selector matching several elements. A selector matching nothing is waited for the way Playwright waits for any selector and then explained, saying what it measured and when. ' +
+      'A page that reasserts its own selection can still move it between the Range being placed and the write being dispatched. That window is checked inside the dispatch rather than before it, so when it happens the write is cancelled before any handler sees it and this says so, rather than writing somewhere else and reporting success. ' +
       'Reads the field back afterwards, but that readback is DOM textContent, which two families of editor defeat in different ways. Virtualizing code editors (Monaco, CodeMirror 5 and 6, Ace) keep only the lines currently on screen in the DOM, so a long document reads back truncated, with no newlines, and can carry gutter line numbers or a hidden measurement layer along with the text. Rich-text editors (Quill, ProseMirror, TipTap, Slate, Lexical) render everything and lose every line break, and anything that is not text contributes nothing at all. An element with an EditContext attached keeps its real text outside the DOM entirely. All of these markers are looked for at the named element, above it (out through any open shadow root), and ANYWHERE in its subtree, because a selector aimed at a wrapper is the ordinary case and how far above the editor it sits is not the question: whether the text about to be read back contains an editor\'s render is. When the target is one of these the result says so plainly: "readbackReliable" is false, "matched" is not claimed either way, and "note" names the editor\'s own API to read the value through instead. For an ordinary field the result carries "value" (what the field really contains now), "matched", "readbackReliable": true, and a "note" explaining the difference when value and the request disagree.',
     inputSchema: z.object({
       sessionId,
@@ -2850,8 +3317,9 @@ export const interactionTools = defineTools({
     serializesInput: true,
     description:
       'Type text into a session\'s tab character by character, with real key events, so per-character handlers, debounces, autocomplete and anything firing on a keystroke actually run. fill sets the value in one step and cannot exercise those. Does NOT clear the field first: it inserts at the caret, which is what a user typing does, so calling it twice types twice. Pass clear: true to replace the contents instead. Where the caret sits is the browser\'s call, not this tool\'s: focusing an input puts it after the existing text, focusing a contenteditable puts it before, so click the spot first if the insertion point matters. ' +
-      'With no selector the keystrokes go to whatever currently has focus, and this refuses unless that element can actually HOLD typed text: a text-holding input, a textarea, or a contenteditable root. Taking focus is not the same as taking text, and the difference is destructive. React Flow gives canvas nodes tabindex="0" so they can handle arrow keys, so an ordinary click on an Acres node leaves focus on a plain <div>; with clear: true the select-all and Delete that follow reach the canvas, which reads Delete as "remove the selected node". Measured on the real app: three nodes before the call, two after, reported as matched: false. Without clear, reading that same <div> back returns its rendered text and inline CSS rather than any field\'s value. ' +
-      'clear: true is refused outright when the caret sits in a contenteditable EDITING REGION rather than a form control, because with no selector nothing named what is about to be deleted and the region can be an entire document. Note that clicking a widget inside such a region focuses the REGION, not the widget: on a page whose canvas sat inside one this took it from three nodes and 91 characters to one node and 14. The message names the region, so passing it as "selector" is all the retry needs. Typing without clear is unaffected, since an insertion has no blast radius. The caret holder is resolved through open shadow roots, because document.activeElement reports the shadow HOST rather than the element that really has focus. A selector matching several elements is refused too, since choosing one of them would change the page, and one matching NOTHING is waited for and then explained rather than surfacing as a bare Playwright timeout. ' +
+      'THIS IS THE TOOL THAT PRESSES KEYS, and it is worth knowing exactly which. The characters of "text" go out as real keydown/keyup pairs, so they reach every ancestor listening for a keystroke, in the capture phase as well as the bubble phase, and nothing can stop that: capture reaches an ancestor before the event reaches the field at all. If the application binds a bare letter as a shortcut, typing that letter into a field inside it will fire the shortcut. That is what "real key events" means and it is usually what you want. What is NOT dispatched any more is a Delete: clear: true empties the field with a selection and an insertText, dispatching no key at all, so an application that treats Delete as "remove the selected thing" no longer sees one. The single exception is a page that cancels the insert and applies its own edit, where one Delete is pressed and the clear retried: see fill, which does the clearing. press_key is the tool for pressing anything else, and the same capture-phase reasoning applies to it. ' +
+      'With no selector the keystrokes go to whatever currently has focus, and this refuses unless that element can actually HOLD typed text: a text-holding input, a textarea, or a contenteditable root. Taking focus is not the same as taking text, and the difference is destructive. React Flow gives canvas nodes tabindex="0" so they can handle arrow keys, so an ordinary click on an Acres node leaves focus on a plain <div>; typing into it does not go where you meant. Reading that same <div> back returns its rendered text and inline CSS rather than any field\'s value. ' +
+      'clear: true is refused outright when the caret sits in a contenteditable EDITING REGION rather than a form control, because with no selector nothing named what is about to be replaced and the region can be an entire document. Note that clicking a widget inside such a region focuses the REGION, not the widget: on a page whose canvas sat inside one this took it from three nodes and 91 characters to one node and 14. The message names the region, so passing it as "selector" is all the retry needs. Typing without clear is unaffected, since an insertion has no blast radius. The caret holder is resolved through open shadow roots, because document.activeElement reports the shadow HOST rather than the element that really has focus. A selector matching several elements is refused too, since choosing one of them would change the page, and one matching NOTHING is waited for and then explained rather than surfacing as a bare Playwright timeout. ' +
       'With a selector, this does NOT refuse a target that cannot hold text, because routing real keystrokes at a focused widget is a legitimate thing to want and press_key alone does not cover it. What it will not do is let you believe the characters went where you aimed them. Playwright focuses the located element and then types at whatever holds the caret, so when the focus attempt does not land the text goes somewhere else entirely: the caret holder is compared against the named element before a single character is sent, and when they differ the result names the element that really received the text and does not claim "matched", since reading back an element nothing was typed into answers a different question. ' +
       'Reads the field back afterwards, but that readback is DOM textContent, which virtualizing code editors (Monaco, CodeMirror 5 and 6, Ace) defeat by rendering only what is on screen, and rich-text editors (Quill, ProseMirror, TipTap, Slate, Lexical) defeat by losing every line break and every non-text node. An element with an EditContext attached keeps its real text outside the DOM entirely. Those markers are looked for at the target, above it (out through any open shadow root) and anywhere in its subtree, so a wrapper any distance above the editor root is still recognised. When the target is one of these the result says so plainly: "readbackReliable" is false, "matched" is not claimed either way, and "note" names the editor\'s own API to read the value through instead. For an ordinary field the result carries "value" (what the field really contains now), "previousValue" (what it held BEFORE the call, clear included, so a clear cannot throw something away invisibly), "matched", "readbackReliable": true, and a "note" when what landed is not the typed text inserted into what was already there.',
     inputSchema: z.object({
@@ -2990,9 +3458,10 @@ export const interactionTools = defineTools({
               'The element only has focus because something gave it a tabindex, which is what a canvas, a tree or a ' +
               'list widget does so it can handle arrow keys; that is not the same as being a field.' +
               (args.clear
-                ? ' With clear: true the select-all and Delete would have gone to the document, and a widget that ' +
-                  'reads Delete as "remove the selected item" acts on it: this has been measured deleting a node from ' +
-                  'a React Flow canvas.'
+                ? ' With clear: true there is nothing here that scopes what would be replaced: with no selector ' +
+                  'nothing named the field, and a widget holding focus does not own an editing region of its own, so ' +
+                  'the region is whatever the browser decides, up to the whole document. Naming the field is what ' +
+                  'bounds it.'
                 : ' Reading it back would return its rendered text and inline CSS rather than any field\'s value.') +
               ' Pass "selector" to name the field, or click into the field itself first. Nothing was typed' +
               (args.clear ? ' and nothing was cleared.' : '.')
@@ -3018,20 +3487,48 @@ export const interactionTools = defineTools({
           if (locator) {
             await setFieldValue(target.page, locator, '');
           } else {
-            // Scoped to the caret holder's own contents and re-checked in the
-            // same round trip, rather than pressing the browser's select-all
-            // and hoping the caret has not moved since the guard ran. See
-            // selectFocusedContents for what that hope cost.
-            const cleared = await selectFocusedContents(target.page);
-            if (cleared === null) {
-              throw new Error(
-                'type could not place a selection over the focused element\'s own contents, so it stopped rather ' +
-                  'than pressing Delete against whatever else happened to be selected. Focus has moved since the ' +
-                  'check at the start of this call, or the element does not own its own editing region. Nothing ' +
-                  'was typed and nothing was cleared.'
-              );
+            // No key is pressed here, and that is the point. This path used to
+            // press Delete itself, which made it destructive while the SAME
+            // clear on the SAME element was safe with a selector. Measured on
+            // a canvas whose nodes hold an inline rename input, with an
+            // ordinary canvas-level Delete handler: the node was removed, and
+            // the result carried previousValue "two" and the whole page's text
+            // as "value", blaming the page for rewriting the input.
+            //
+            // Handing it to Playwright's fill was not the answer either, and
+            // that is Finding 2: fill('') dispatches a real Delete of its own.
+            // It goes through the same select-then-insertText clear the
+            // selector path uses, which was measured to dispatch no key at
+            // all. See clearOrFillFormControl.
+            //
+            // The handle comes from the same shadow-piercing descent
+            // readFieldValue uses, so a control inside an open shadow root is
+            // cleared rather than its host.
+            const focusedHandle = await target.page.evaluateHandle(() => {
+              let el = document.activeElement as TreeWalkElement | null;
+              for (let hops = 0; hops < 32; hops += 1) {
+                const inner = el?.shadowRoot?.activeElement;
+                if (!inner) break;
+                el = inner;
+              }
+              return el;
+            });
+            // Cast because the handle's generic comes from the callback's own
+            // return type, which is this file's hand-rolled element interface
+            // rather than a real Element, so asElement() cannot narrow to
+            // anything useful on its own.
+            const focusedElement = focusedHandle.asElement() as unknown as ClearableField | null;
+            try {
+              if (!focusedElement) {
+                throw new Error(
+                  'type could not resolve the focused element to clear it, so it stopped rather than clearing ' +
+                    'something it could not identify. Nothing was typed and nothing was cleared.'
+                );
+              }
+              await clearOrFillFormControl(target.page, focusedElement, '', 'type');
+            } finally {
+              await focusedHandle.dispose();
             }
-            await target.page.keyboard.press('Delete');
           }
         }
 
@@ -3109,6 +3606,7 @@ export const interactionTools = defineTools({
     serializesInput: true,
     description:
       'Press a key in a session\'s tab, dispatching a real trusted key event. This is the only way to establish keyboard modality, which matters for accessibility checks: Chrome will not set :focus-visible on a button a script focused with .focus(), so a focus ring measured after a programmatic focus reports absent even when it is perfectly fine for a real user pressing Tab. Key syntax is Playwright\'s: Tab, Enter, Escape, ArrowDown, Backspace, a, Control+A, Shift+Tab. With no selector the key goes to whatever currently has focus. Returns where focus ended up and whether that element matches :focus-visible, descending into OPEN shadow roots to get there: document.activeElement retargets to the shadow HOST, so a key press into an editor inside a shadow root would otherwise be reported as focus sitting on a plain host div with no text. "inShadowRoot" is true when the walk crossed a boundary to find the element. ' +
+      'The key reaches EVERY ancestor of the focused element, not just the element itself, and in the capture phase before it reaches the element at all. That is the DOM\'s dispatch order and nothing here can narrow it. So a Delete pressed while a text field inside a canvas has focus is also a Delete delivered to the canvas, and an application that treats it as "remove the selected node" will remove one. This tool presses what you name and reports where it landed; it does not and cannot bound what else hears it. If the intent is to change a field\'s contents rather than to exercise a key handler, use fill or type with clear: true, which replace text with a selection and an insertText and dispatch no key at all. ' +
       'One limit worth knowing, because it is the single case this field can be wrong: focus inside a CLOSED shadow root reports the HOST, not the element that actually received the key, and "inShadowRoot" reads false. A closed root is invisible to page JavaScript, and a host holding focus itself is indistinguishable from a host whose closed root holds it, so the case cannot be flagged rather than misreported. Read "inShadowRoot": false as "no open shadow boundary was crossed", not as "focus is not in a shadow root". If a page uses closed roots and it matters which element took the key, send_cdp_command can see inside them: DOM.getDocument with pierce: true, or Accessibility.getFullAXTree, whose nodes carry a "focused" property and a backendDOMNodeId to resolve with DOM.describeNode. That is deliberately not done here, because it costs an accessibility-tree query on every press, measured at about 10ms against 2ms for this call as it stands, on a field that reports where focus is rather than making a claim about text.',
     inputSchema: z.object({
       sessionId,
