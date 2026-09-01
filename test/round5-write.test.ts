@@ -101,6 +101,27 @@ const PAGES: Record<string, string> = {
   '/scope': `<!doctype html><html><body>
 <div id="host" contenteditable="true"><span id="a">AAA</span><span id="b">BBB</span><span id="c">CCC</span></div>
 <script>${LOGGER}</script>
+</body></html>`,
+
+  // A page that REFUSES an insert: it cancels beforeinput and applies its own
+  // edit, inserting at the range start without removing the range contents, so
+  // a replacement becomes a prepend. No shipping editor was found doing this,
+  // and the live CodeMirror 6 in Acres does not, but a page can be written this
+  // way and a keyless write cannot make it accept one. This is the only shape
+  // that still gets a Delete out of a write path.
+  '/refuses': `<!doctype html><html><body>
+<div id="editor" contenteditable="true">result</div>
+<script>
+  ${LOGGER}
+  document.getElementById('editor').addEventListener('beforeinput', function (e) {
+    if (!e.inputType || e.inputType.indexOf('insert') !== 0) return;
+    e.preventDefault();
+    var t = e.data != null ? e.data : '';
+    var range = window.getSelection().getRangeAt(0);
+    range.insertNode(document.createTextNode(t));
+    range.collapse(false);
+  });
+</script>
 </body></html>`
 };
 
@@ -354,4 +375,57 @@ test('fill, type and press_key descriptions say what is and is not dispatched', 
   for (const [name, def] of Object.entries(interactionTools)) {
     assert.ok(!def.description.includes('—'), `${name}'s description contains an em-dash`);
   }
+});
+
+test('a page that refuses the insert gets one Delete, and the write still lands', async () => {
+  // The trade this round makes, pinned in both directions. A keyless write
+  // cannot make a page accept an insert it has decided to cancel, so where the
+  // readback can be believed and disagrees, a real Delete is pressed once and
+  // the replacement is retried. Without this the round-2 append bug is
+  // reachable again through a different door.
+  const s = await open('/refuses');
+  await resetKeys(s);
+  const result = payload(await handlers.fill({ sessionId: s, selector: '#editor', value: '{{ $json.mode }}' }));
+  const log = await keys(s);
+
+  assert.equal(
+    await ev(s, 'document.getElementById("editor").textContent'),
+    '{{ $json.mode }}',
+    `the write appended instead of replacing: ${JSON.stringify(log)}`
+  );
+  assert.equal(result.value, '{{ $json.mode }}');
+  assert.equal(result.matched, true);
+  assert.deepEqual(
+    log.filter(e => e.startsWith('keydown:')),
+    ['keydown:Delete'],
+    `expected exactly one Delete on the fallback path, got ${JSON.stringify(log)}`
+  );
+  await sessions.releaseSession(s);
+});
+
+test('the fallback does NOT fire on the shape that loses data', async () => {
+  // The gate that makes the test above acceptable. An inline contenteditable
+  // label inside a Delete-handling canvas is the exact shape that took a real
+  // Acres canvas from three nodes to two, and it accepts the insertText, so
+  // there is no mismatch and no retry and no key. If a future change made the
+  // fallback fire more eagerly, this is what goes red.
+  const s = await open('/canvas-ce');
+  await resetKeys(s);
+  await handlers.fill({ sessionId: s, selector: '#l2', value: 'REPLACED' });
+  assertNoKeyDispatched(await keys(s), 'fill on an ordinary contenteditable inside a canvas');
+  assert.deepEqual((await canvasState(s)).nodes, ['n1', 'n2', 'n3']);
+  await sessions.releaseSession(s);
+});
+
+test('a refusing editor whose readback cannot be believed gets NO fallback key', async () => {
+  // A virtualizing editor renders only what is on screen, so its textContent
+  // disagrees with the requested value most of the time even when the write was
+  // perfect. Retrying on that disagreement would press a Delete on every write
+  // to exactly the editors this round exists to keep keys away from.
+  const s = await open('/refuses');
+  await ev(s, 'document.getElementById("editor").classList.add("cm-content"); 1');
+  await resetKeys(s);
+  await handlers.fill({ sessionId: s, selector: '#editor', value: 'ZZZ' });
+  assertNoKeyDispatched(await keys(s), 'fill on a refusing editor with an untrustworthy readback');
+  await sessions.releaseSession(s);
 });

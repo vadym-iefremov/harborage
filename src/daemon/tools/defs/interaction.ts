@@ -1534,8 +1534,8 @@ async function setFieldValue(page: Page, locator: Locator, value: string): Promi
 
   await locator.focus();
 
-  // Focus still has to have landed, because the Delete and the insert that
-  // follow go to whatever holds the caret. Read through inspectTextTarget's
+  // Focus still has to have landed, because the insert that follows goes to
+  // whatever holds the caret. Read through inspectTextTarget's
   // shadow-piercing walk: document.activeElement retargets to the shadow host,
   // so the identity test this replaces could not see focus that had genuinely
   // landed inside an open shadow root, and fill on a shadow-DOM contenteditable
@@ -1589,6 +1589,66 @@ async function setFieldValue(page: Page, locator: Locator, value: string): Promi
         'nothing else was overwritten either. Try again, or set the value through evaluate if the page will not ' +
         'leave a selection alone.'
     );
+  }
+
+  return replaceKeylesslyOrFallBack(page, locator, target, value);
+}
+
+/**
+ * Checks that the keyless replacement actually replaced, and presses a key
+ * only when a page has proved it will not accept anything else.
+ *
+ * A page CAN refuse an insert. `beforeinput` is cancelable, so a handler may
+ * preventDefault it and apply its own edit, and one that inserts at the range
+ * START without removing the range CONTENTS turns a replacement into a
+ * prepend. That is the round-2 append bug, reachable again through a different
+ * door, and it is why this function exists rather than the write being trusted
+ * because it was dispatched.
+ *
+ * The retry is gated on the readback being trustworthy, and that gate is the
+ * whole design rather than caution. A virtualizing editor renders only what is
+ * on screen and a rich-text editor drops every line break, so their textContent
+ * disagrees with the requested value most of the time even when the write was
+ * perfect. Retrying on that disagreement would press a Delete on every write to
+ * exactly the editors this round exists to keep keys away from. So: where the
+ * readback can be believed, a mismatch is real and a key is worth pressing;
+ * where it cannot, nothing is inferred and no key is pressed.
+ *
+ * Note which pages this can and cannot reach. It cannot fire on the harmful
+ * shape, an inline contenteditable label inside a canvas that deletes nodes on
+ * Delete, because a plain contenteditable accepts the insertText and there is
+ * no mismatch to retry. Measured: that fixture reads back the requested value
+ * with beforeinput insertText as the only event dispatched. It fires on a page
+ * that actively rejected the insert, where a key is the only thing left, and
+ * the caller is told a key was pressed rather than left to assume none was.
+ */
+async function replaceKeylesslyOrFallBack(
+  page: Page,
+  locator: Locator,
+  target: TextTargetReport,
+  value: string
+): Promise<void> {
+  // Untrustworthy readback: nothing can be concluded from a comparison, so
+  // nothing is. See above.
+  if (readbackWarningFor(target) !== null) return;
+
+  const landed = await readFieldValue(page, locator).catch(() => value);
+  if (landed === value) return;
+
+  // The element holds something other than what was asked for, and the
+  // readback is one that can be believed, so the page rejected the insert.
+  // Re-select first: the failed insert has already changed the contents, so
+  // the Range placed before it no longer covers them.
+  const reselected = await selectElementContents(locator);
+  if (!reselected) return;
+
+  const fenced = await installWriteFence(locator as unknown as FenceTarget, true);
+  if (!fenced) return;
+  try {
+    await page.keyboard.press('Delete');
+    if (value.length > 0) await page.keyboard.insertText(value);
+  } finally {
+    await removeWriteFence(page);
   }
 }
 
@@ -2959,8 +3019,9 @@ export const interactionTools = defineTools({
     serializesInput: true,
     description:
       'Set a field\'s contents in a session\'s tab, REPLACING whatever was there. Use type instead to append, or to fire per-character events. ' +
-      'This DISPATCHES NO KEY EVENT, whatever the value and whatever the element, and that is a guarantee worth relying on rather than an implementation detail. A contenteditable, including a rich editor like CodeMirror or Monaco, gets a Range placed over its own contents and one insertText written over it: no select-all chord, no Delete. A form control with a non-empty value gets Playwright\'s fill, which is itself an insertText. A form control being CLEARED gets its own text selected and an empty insertText, because Playwright\'s own fill("") dispatches a real Delete key while fill("X") dispatches none, and that asymmetry is how clearing an inline rename input inside a canvas deleted the canvas node. The one exception is an input the browser renders as a picker rather than as text (date, time, colour, range), where an insertText does nothing and Playwright sets the value by assignment, also without a key. If you need a key pressed, that is what press_key is for. ' +
+      'This DISPATCHES NO KEY EVENT on any ordinary page, whatever the value and whatever the element, and that is worth relying on rather than being an implementation detail. A contenteditable, including a rich editor like CodeMirror or Monaco, gets a Range placed over its own contents and one insertText written over it: no select-all chord, no Delete. A form control with a non-empty value gets Playwright\'s fill, which is itself an insertText. A form control being CLEARED gets its own text selected and an empty insertText, because Playwright\'s own fill("") dispatches a real Delete key while fill("X") dispatches none, and that asymmetry is how clearing an inline rename input inside a canvas deleted the canvas node. An input the browser renders as a picker rather than as text (date, time, colour, range) is set by assignment, also without a key. ' +
       'The reason this matters: a key event reaches every ancestor listening for it, in both the capture and the bubble phase, and an application that treats Delete as "remove the selected thing" will act on a Delete aimed at a text field inside it. That is not preventable once the key is dispatched, so it is not dispatched. ' +
+      'ONE CASE STILL PRESSES A KEY, and it is named here rather than left implied. `beforeinput` is cancelable, so a page can refuse the insert and apply its own edit, and one that inserts at the selection START without removing the selection CONTENTS turns a replacement into a prepend. Where the readback can be believed and it disagrees with what was asked for, that is what happened, so a real Delete is pressed once and the replacement is retried. It cannot fire on the shape that loses data, because an ordinary contenteditable accepts the insertText and there is nothing to retry, and it is deliberately not attempted at all on a virtualizing or rich-text editor, whose readback disagrees with the requested value most of the time even when the write was perfect. ' +
       'Replacement also cannot reach outside the element you named: an insertText over a Range replaces exactly that Range. Verified on a contenteditable holding three spans with only the middle one selected, which read back with the outer two intact. ' +
       'The selector still has to name an element that can hold typed text AND own the region a replacement would cover, and both are checked before anything is written, because a selection is scoped by the browser: to a form control\'s own value, or to the whole contenteditable EDITING HOST, never to whatever element you happened to name. So this accepts a text-holding input, a textarea, or an element that is itself a contenteditable root. It refuses an element that merely SITS INSIDE an editable region, because isContentEditable is inherited and a replacement there can take the whole region: measured on a page whose canvas sat inside one, a clear took it from three nodes and 91 characters to one node and 14. The refusal names the host so you can decide whether you meant it. It also refuses <body> and <html> even on a contenteditable or designMode page, a <select> (use select_option), a checkbox, radio, button or file input (click, or file_upload), a readonly or disabled control (said at once rather than after the full timeout), and a selector matching several elements. A selector matching nothing is waited for the way Playwright waits for any selector and then explained, saying what it measured and when. ' +
       'A page that reasserts its own selection can still move it between the Range being placed and the write being dispatched. That window is checked inside the dispatch rather than before it, so when it happens the write is cancelled before any handler sees it and this says so, rather than writing somewhere else and reporting success. ' +
@@ -3024,7 +3085,7 @@ export const interactionTools = defineTools({
     serializesInput: true,
     description:
       'Type text into a session\'s tab character by character, with real key events, so per-character handlers, debounces, autocomplete and anything firing on a keystroke actually run. fill sets the value in one step and cannot exercise those. Does NOT clear the field first: it inserts at the caret, which is what a user typing does, so calling it twice types twice. Pass clear: true to replace the contents instead. Where the caret sits is the browser\'s call, not this tool\'s: focusing an input puts it after the existing text, focusing a contenteditable puts it before, so click the spot first if the insertion point matters. ' +
-      'THIS IS THE TOOL THAT PRESSES KEYS, and it is worth knowing exactly which. The characters of "text" go out as real keydown/keyup pairs, so they reach every ancestor listening for a keystroke, in the capture phase as well as the bubble phase, and nothing can stop that: capture reaches an ancestor before the event reaches the field at all. If the application binds a bare letter as a shortcut, typing that letter into a field inside it will fire the shortcut. That is what "real key events" means and it is usually what you want. What is NOT dispatched any more is a Delete: clear: true empties the field with a selection and an insertText, dispatching no key at all, so an application that treats Delete as "remove the selected thing" no longer sees one. press_key is the tool for pressing anything else, and the same capture-phase reasoning applies to it. ' +
+      'THIS IS THE TOOL THAT PRESSES KEYS, and it is worth knowing exactly which. The characters of "text" go out as real keydown/keyup pairs, so they reach every ancestor listening for a keystroke, in the capture phase as well as the bubble phase, and nothing can stop that: capture reaches an ancestor before the event reaches the field at all. If the application binds a bare letter as a shortcut, typing that letter into a field inside it will fire the shortcut. That is what "real key events" means and it is usually what you want. What is NOT dispatched any more is a Delete: clear: true empties the field with a selection and an insertText, dispatching no key at all, so an application that treats Delete as "remove the selected thing" no longer sees one. The single exception is a page that cancels the insert and applies its own edit, where one Delete is pressed and the clear retried: see fill, which does the clearing. press_key is the tool for pressing anything else, and the same capture-phase reasoning applies to it. ' +
       'With no selector the keystrokes go to whatever currently has focus, and this refuses unless that element can actually HOLD typed text: a text-holding input, a textarea, or a contenteditable root. Taking focus is not the same as taking text, and the difference is destructive. React Flow gives canvas nodes tabindex="0" so they can handle arrow keys, so an ordinary click on an Acres node leaves focus on a plain <div>; typing into it does not go where you meant. Reading that same <div> back returns its rendered text and inline CSS rather than any field\'s value. ' +
       'clear: true is refused outright when the caret sits in a contenteditable EDITING REGION rather than a form control, because with no selector nothing named what is about to be replaced and the region can be an entire document. Note that clicking a widget inside such a region focuses the REGION, not the widget: on a page whose canvas sat inside one this took it from three nodes and 91 characters to one node and 14. The message names the region, so passing it as "selector" is all the retry needs. Typing without clear is unaffected, since an insertion has no blast radius. The caret holder is resolved through open shadow roots, because document.activeElement reports the shadow HOST rather than the element that really has focus. A selector matching several elements is refused too, since choosing one of them would change the page, and one matching NOTHING is waited for and then explained rather than surfacing as a bare Playwright timeout. ' +
       'With a selector, this does NOT refuse a target that cannot hold text, because routing real keystrokes at a focused widget is a legitimate thing to want and press_key alone does not cover it. What it will not do is let you believe the characters went where you aimed them. Playwright focuses the located element and then types at whatever holds the caret, so when the focus attempt does not land the text goes somewhere else entirely: the caret holder is compared against the named element before a single character is sent, and when they differ the result names the element that really received the text and does not claim "matched", since reading back an element nothing was typed into answers a different question. ' +
@@ -3165,9 +3226,10 @@ export const interactionTools = defineTools({
               'The element only has focus because something gave it a tabindex, which is what a canvas, a tree or a ' +
               'list widget does so it can handle arrow keys; that is not the same as being a field.' +
               (args.clear
-                ? ' With clear: true the select-all and Delete would have gone to the document, and a widget that ' +
-                  'reads Delete as "remove the selected item" acts on it: this has been measured deleting a node from ' +
-                  'a React Flow canvas.'
+                ? ' With clear: true there is nothing here that scopes what would be replaced: with no selector ' +
+                  'nothing named the field, and a widget holding focus does not own an editing region of its own, so ' +
+                  'the region is whatever the browser decides, up to the whole document. Naming the field is what ' +
+                  'bounds it.'
                 : ' Reading it back would return its rendered text and inline CSS rather than any field\'s value.') +
               ' Pass "selector" to name the field, or click into the field itself first. Nothing was typed' +
               (args.clear ? ' and nothing was cleared.' : '.')
