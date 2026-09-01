@@ -37,6 +37,44 @@ export interface NetworkEntry {
   status?: number;
   statusText?: string;
   timestamp: number;
+  /**
+   * Set on a REQUEST entry whose response the capture filter turned away.
+   *
+   * Without it, two opposite outcomes are byte-identical: a request the
+   * server never answered, and a request that was answered while the
+   * capture filter no longer wanted the answer (the filter was replaced
+   * mid-flight with set_network_capture_filter, or it excludes responses
+   * wholesale, e.g. direction: 'request' or a method filter). The first is a
+   * hung or dropped request and is usually the bug being hunted; the second
+   * is the caller's own filter working as asked. A request entry sitting
+   * with no matching response entry and no flag here really was never
+   * answered.
+   */
+  responseFilteredOut?: boolean;
+}
+
+/**
+ * One WebSocket connection a session's tab opened, with frame COUNTS only.
+ *
+ * Deliberately not entries in the network ring: a socket is a long-lived
+ * connection, not a request/response pair, and forcing it into that shape
+ * would either lie about `direction` or break every filter that assumes an
+ * entry is one half of one exchange. Deliberately counts rather than frame
+ * payloads, too: a realtime app can push thousands of frames a minute, and
+ * buffering their contents would evict the very HTTP traffic the ring
+ * exists to hold. Counts are what answers the question a caller actually
+ * has, which is "is anything flowing over this socket at all".
+ */
+export interface WebSocketEntry {
+  pageId: string;
+  url: string;
+  openedAt: number;
+  /** When the socket closed. Absent means it was still open when this was read. */
+  closedAt?: number;
+  framesSent: number;
+  framesReceived: number;
+  /** Playwright's socket-level error text, when the socket failed rather than closing cleanly. */
+  error?: string;
 }
 
 /** What a caller may do with a JavaScript dialog. */
@@ -95,6 +133,16 @@ export interface BufferLimits {
 const defaultBufferLimits: BufferLimits = { console: 200, network: 200, dialog: 200, pageError: 200 };
 
 /**
+ * How many WebSocket connections one session remembers.
+ *
+ * Not configurable like the other four buffers, because it is not the same
+ * kind of pressure: a page opens a handful of sockets over its whole life,
+ * not hundreds a second, so this bound exists to stop a pathological
+ * reconnect loop growing without limit rather than to ration a hot channel.
+ */
+const maxWebSocketsPerSession = 50;
+
+/**
  * Name of the page-side function the unhandled-rejection hook calls back
  * through. Deliberately unlikely to collide with anything a real page
  * defines, since it is a global this tool adds to every page it drives.
@@ -139,20 +187,55 @@ const defaultTimeouts: Required<SessionTimeouts> = {
 interface BoundedBuffer<T> {
   entries: T[];
   dropped: number;
+  /**
+   * The same evictions, attributed to the tab whose entry was lost.
+   *
+   * The ring is session-wide, so a read scoped to one quiet tab used to
+   * report every drop the session had ever suffered, most of them belonging
+   * to other tabs: measured on a real page, a read of one idle tab reported
+   * 58 drops, none of which were its own. A caller cannot act on a number
+   * that is not about the thing it asked about, so the scoped count is kept
+   * alongside the session-wide one rather than instead of it.
+   */
+  droppedByPage: Map<string, number>;
 }
 
 function newBoundedBuffer<T>(): BoundedBuffer<T> {
-  return { entries: [], dropped: 0 };
+  return { entries: [], dropped: 0, droppedByPage: new Map() };
 }
 
-/** Pushes onto a bounded ring, dropping the oldest entries once over `max` and counting the drop. */
-function pushBounded<T>(buffer: BoundedBuffer<T>, entry: T, max: number): void {
+/** Pushes onto a bounded ring, dropping the oldest entries once over `max` and counting the drop, session-wide and per tab. */
+function pushBounded<T extends { pageId: string }>(buffer: BoundedBuffer<T>, entry: T, max: number): void {
   buffer.entries.push(entry);
   if (buffer.entries.length > max) {
     const overflow = buffer.entries.length - max;
-    buffer.entries.splice(0, overflow);
+    const evicted = buffer.entries.splice(0, overflow);
     buffer.dropped += overflow;
+    for (const lost of evicted) {
+      buffer.droppedByPage.set(lost.pageId, (buffer.droppedByPage.get(lost.pageId) ?? 0) + 1);
+    }
   }
+}
+
+/**
+ * What one buffered read hands back.
+ *
+ * Two drop counts, not one, because the ring is session-wide while a read is
+ * often not: `droppedInScope` is about the tab the caller asked about (or
+ * the whole session, when it asked about the whole session), and
+ * `droppedInSession` is the session-wide total it sits inside. Reporting
+ * only the second is what made a read of one quiet tab claim 58 drops that
+ * all belonged to other tabs.
+ */
+export interface BufferRead<T> {
+  entries: T[];
+  droppedInScope: number;
+  droppedInSession: number;
+}
+
+/** Adds one to a per-tab tally, creating the entry on first use. */
+function bumpByPage(counts: Map<string, number>, pageId: string): void {
+  counts.set(pageId, (counts.get(pageId) ?? 0) + 1);
 }
 
 interface SessionRecord {
@@ -213,6 +296,10 @@ interface SessionRecord {
    * caller's problem.
    */
   networkFilteredOut: number;
+  /** The same exclusions attributed per tab, for the same reason `droppedByPage` exists. */
+  networkFilteredOutByPage: Map<string, number>;
+  /** WebSocket connections this session's tabs have opened, oldest first. */
+  websockets: BoundedBuffer<WebSocketEntry>;
 }
 
 /**
@@ -234,7 +321,8 @@ export interface CreateSessionOptions {
   /**
    * What to keep in this session's network ring from the moment it opens.
    * Same vocabulary as list_network_requests' own filters (urlIncludes,
-   * urlMatches, method, resourceType, direction), because a caller who found
+   * urlMatches, method, resourceType, direction, minStatus, maxStatus),
+   * every one of them, because a caller who found
    * the noise with a read-time filter should be able to paste the same
    * fields in here rather than learn a second vocabulary. Unset captures
    * everything, matching every session before this option existed. Also
@@ -410,9 +498,56 @@ export class SessionStore {
       };
       if (record.networkCaptureFilter !== undefined && !matchesNetworkEntry(entry, record.networkCaptureFilter)) {
         record.networkFilteredOut += 1;
+        bumpByPage(record.networkFilteredOutByPage, pageId);
+        // The request half may still be sitting in the ring, and if it is, it
+        // now looks exactly like a request nobody ever answered. Those mean
+        // opposite things to a caller (a hung endpoint versus their own
+        // filter doing its job), so the surviving request entry is marked
+        // rather than left ambiguous. Oldest unmarked match wins, which is
+        // the right pairing for repeated calls to the same URL as long as the
+        // server answers them in order, and is at worst off by one exchange
+        // between two identical URLs when it does not.
+        for (const buffered of record.networkBuffer.entries) {
+          if (
+            buffered.direction === 'request' &&
+            buffered.pageId === pageId &&
+            buffered.url === entry.url &&
+            buffered.responseFilteredOut !== true
+          ) {
+            buffered.responseFilteredOut = true;
+            break;
+          }
+        }
         return;
       }
       pushBounded(record.networkBuffer, entry, this.bufferLimits.network);
+    });
+
+    // WebSockets do not pass through page.on('request'/'response') at all, so
+    // before this a caller debugging a realtime app read an empty request
+    // list and concluded nothing was happening. Lifecycle and frame counts
+    // only: see WebSocketEntry for why not the frames themselves.
+    page.on('websocket', ws => {
+      const entry: WebSocketEntry = {
+        pageId,
+        url: ws.url(),
+        openedAt: Date.now(),
+        framesSent: 0,
+        framesReceived: 0
+      };
+      pushBounded(record.websockets, entry, maxWebSocketsPerSession);
+      ws.on('framesent', () => {
+        entry.framesSent += 1;
+      });
+      ws.on('framereceived', () => {
+        entry.framesReceived += 1;
+      });
+      ws.on('socketerror', err => {
+        entry.error = String(err);
+      });
+      ws.on('close', () => {
+        entry.closedAt = Date.now();
+      });
     });
   }
 
@@ -568,8 +703,47 @@ export class SessionStore {
     if (options.viewport !== undefined) contextOptions.viewport = options.viewport;
     if (options.deviceScaleFactor !== undefined) contextOptions.deviceScaleFactor = options.deviceScaleFactor;
 
+    // Compiled BEFORE the context exists, not while building the record after
+    // it. compileNetworkMatch throws on a regex that does not parse, and when
+    // it threw down there the BrowserContext had already been created and had
+    // not yet been stored anywhere, so it was orphaned: not in `sessions`, so
+    // nothing could release or reap it, and alive for the life of the daemon.
+    // Measured on the real Playwright browser: five rejected create_session
+    // calls left five extra contexts behind, and releasing the caller's real
+    // session did not take them with it. On a machine-wide shared daemon that
+    // is one leaked context per attempt for an agent iterating on a regex.
+    const networkCaptureFilter =
+      options.networkCaptureFilter !== undefined ? compileNetworkMatch(options.networkCaptureFilter) : undefined;
+
     const context = await browser.newContext(contextOptions);
 
+    // Everything from here to `this.sessions.set` runs with a context that
+    // exists but that nothing else can reach yet, so every failure in that
+    // window has to close it by hand. Validation moving above the context is
+    // what removes the KNOWN throw; this is what stops the next one (an
+    // exposeBinding or addInitScript that fails, a newPage on a browser
+    // that just died) becoming the same leak again.
+    try {
+      return await this.finishSession(context, networkCaptureFilter);
+    } catch (err) {
+      await context.close().catch(() => {
+        // Already gone, or the browser died under us. Either way there is
+        // nothing left to leak, and the original failure is what the caller
+        // needs to see, not this one.
+      });
+      throw err;
+    }
+  }
+
+  /**
+   * The half of session construction that runs with a live BrowserContext in
+   * hand. Split out purely so `buildSession` can wrap ALL of it in one
+   * close-on-failure guard rather than repeating cleanup at each throw site.
+   */
+  private async finishSession(
+    context: BrowserContext,
+    networkCaptureFilter: NetworkMatchCriteria | undefined
+  ): Promise<{ sessionId: string; pageId: string }> {
     const sessionId = randomUUID();
     const now = Date.now();
     const record: SessionRecord = {
@@ -587,9 +761,10 @@ export class SessionStore {
       dialogBuffer: newBoundedBuffer(),
       pageErrorBuffer: newBoundedBuffer(),
       dialogPolicy: undefined,
-      networkCaptureFilter:
-        options.networkCaptureFilter !== undefined ? compileNetworkMatch(options.networkCaptureFilter) : undefined,
-      networkFilteredOut: 0
+      networkCaptureFilter,
+      networkFilteredOut: 0,
+      networkFilteredOutByPage: new Map(),
+      websockets: newBoundedBuffer()
     };
 
     // A tab opened by the page itself (window.open, a target="_blank" link,
@@ -756,20 +931,30 @@ export class SessionStore {
     });
   }
 
-  /** One buffered read: what matched, how many are sitting in the ring, and how many the ring has ever dropped. */
+  /**
+   * One buffered read: what matched, how many the ring has dropped for the
+   * tab that was asked about, and how many it has dropped across the whole
+   * session.
+   *
+   * `match === undefined` is the load-bearing signal for whether the read
+   * NARROWED anything, and every caller above this store is responsible for
+   * passing `undefined` rather than a predicate that happens to accept
+   * everything. See the reset below for why.
+   */
   private readBuffer<T extends { pageId: string }>(
     buffer: BoundedBuffer<T>,
     pageId: string | undefined,
     clear: boolean,
     match: ((entry: T) => boolean) | undefined
-  ): { entries: T[]; dropped: number } {
+  ): { entries: T[]; droppedInScope: number; droppedInSession: number } {
     const matches = buffer.entries.filter(
       entry => (pageId === undefined || entry.pageId === pageId) && (match === undefined || match(entry))
     );
-    // dropped is read before any reset below applies, so a caller doing
+    // Both counts are read before any reset below applies, so a caller doing
     // `clear: true` still sees what was lost during the window that call is
     // about to close out, rather than the freshly-reset value.
-    const dropped = buffer.dropped;
+    const droppedInSession = buffer.dropped;
+    const droppedInScope = pageId === undefined ? droppedInSession : buffer.droppedByPage.get(pageId) ?? 0;
     if (clear) {
       // By identity, and not by re-deriving the filter, because `clear` used
       // to drop everything belonging to the page it was given. Any read that
@@ -779,24 +964,33 @@ export class SessionStore {
       // actually read.
       const removed = new Set<T>(matches);
       buffer.entries = buffer.entries.filter(entry => !removed.has(entry));
-      // Reset the drop counter exactly when a session-wide clear (no pageId
-      // scope) leaves NOTHING behind. That is the outcome that actually means
-      // "wipe the slate, tell me only what's new from here", whether it got
-      // there because no filter was given or because the filter happened to
-      // match everything that was there.
+      // Reset the drop counters ONLY for a clear that narrowed nothing at
+      // all: no pageId scope and no predicate. That, and only that, is the
+      // "wipe the slate, tell me only what's new from here" a fresh
+      // observation window means, and it is what every tool description
+      // promises.
       //
-      // This has to be judged by the outcome, not by whether the caller
-      // technically passed a match function: every tool handler above this
-      // store builds a predicate closure even for "no filters set" (it is
-      // always some function, never a literal `undefined`), so checking
-      // `match === undefined` never fired through the tool surface at all,
-      // only for a direct SessionStore call with no predicate. A clear
-      // scoped to one tab, or one that leaves other entries sitting unread,
-      // must never reset it: that would erase the "you lost N entries"
-      // warning for evidence still in the buffer nobody has seen yet.
-      if (pageId === undefined && buffer.entries.length === 0) buffer.dropped = 0;
+      // Judging it by the OUTCOME instead (buffer ended up empty) is the
+      // defect this replaced, and it was not a near miss. A narrowed clear
+      // whose filter happened to match everything currently in the ring hit
+      // the same branch: against a real Vite app, a capture filter had
+      // genuinely excluded 732 module-chunk requests, a read narrowed to
+      // "/api/" cleared the 26 entries it returned, and the very next call
+      // reported dropped 0 and filteredAtCapture 0. That is the silent false
+      // pass the capture filter exists to prevent, resurrected one call
+      // later.
+      //
+      // The other half of the fix lives in the tool handlers: they used to
+      // build a predicate closure even when the caller set no filters at
+      // all, so `match` was never `undefined` through the tool surface and
+      // this test could not have worked there whatever it checked. They now
+      // pass `undefined` when nothing was narrowed.
+      if (pageId === undefined && match === undefined) {
+        buffer.dropped = 0;
+        buffer.droppedByPage.clear();
+      }
     }
-    return { entries: matches, dropped };
+    return { entries: matches, droppedInScope, droppedInSession };
   }
 
   /**
@@ -811,7 +1005,7 @@ export class SessionStore {
     pageId?: string,
     clear = false,
     match?: (entry: ConsoleEntry) => boolean
-  ): { entries: ConsoleEntry[]; dropped: number } {
+  ): BufferRead<ConsoleEntry> {
     const record = this.getRecord(sessionId);
     return this.readBuffer(record.consoleBuffer, pageId, clear, match);
   }
@@ -822,16 +1016,35 @@ export class SessionStore {
     pageId?: string,
     clear = false,
     match?: (entry: NetworkEntry) => boolean
-  ): { entries: NetworkEntry[]; dropped: number; filteredOut: number } {
+  ): BufferRead<NetworkEntry> & { filteredOutInScope: number; filteredOutInSession: number } {
     const record = this.getRecord(sessionId);
-    const { entries, dropped } = this.readBuffer(record.networkBuffer, pageId, clear, match);
-    const filteredOut = record.networkFilteredOut;
-    // Same reasoning and same outcome-based test as the drop counter above,
-    // reset together with it: readBuffer has already applied the clear to
-    // record.networkBuffer.entries by the time this runs, so an empty result
-    // here means the same "genuine whole-buffer clear" that reset dropped.
-    if (clear && pageId === undefined && record.networkBuffer.entries.length === 0) record.networkFilteredOut = 0;
-    return { entries, dropped, filteredOut };
+    const read = this.readBuffer(record.networkBuffer, pageId, clear, match);
+    const filteredOutInSession = record.networkFilteredOut;
+    const filteredOutInScope =
+      pageId === undefined ? filteredOutInSession : record.networkFilteredOutByPage.get(pageId) ?? 0;
+    // Reset on exactly the same condition as the drop counters readBuffer
+    // just applied, and for exactly the same reason: only a clear that
+    // narrowed nothing starts a fresh observation window. Checking whether
+    // the ring ended up empty instead is what let a narrowed clear wipe a
+    // real "732 requests never entered this ring" warning one call later.
+    if (clear && pageId === undefined && match === undefined) {
+      record.networkFilteredOut = 0;
+      record.networkFilteredOutByPage.clear();
+    }
+    return { ...read, filteredOutInScope, filteredOutInSession };
+  }
+
+  /**
+   * WebSocket connections opened in this session, optionally narrowed to one
+   * tab. Never cleared by a `clear: true` read of the network ring: a socket
+   * is a live thing, not a past event, and dropping an open one from the
+   * report because somebody drained the HTTP buffer would be its own silent
+   * false pass.
+   */
+  getWebSockets(sessionId: string, pageId?: string): { sockets: WebSocketEntry[]; dropped: number } {
+    const record = this.getRecord(sessionId);
+    const sockets = record.websockets.entries.filter(entry => pageId === undefined || entry.pageId === pageId);
+    return { sockets, dropped: record.websockets.dropped };
   }
 
   /** Sets, replaces or (passing undefined) removes a session's network capture filter. */
@@ -851,7 +1064,7 @@ export class SessionStore {
     pageId?: string,
     clear = false,
     match?: (entry: DialogEntry) => boolean
-  ): { entries: DialogEntry[]; dropped: number } {
+  ): BufferRead<DialogEntry> {
     const record = this.getRecord(sessionId);
     return this.readBuffer(record.dialogBuffer, pageId, clear, match);
   }
@@ -862,7 +1075,7 @@ export class SessionStore {
     pageId?: string,
     clear = false,
     match?: (entry: PageErrorEntry) => boolean
-  ): { entries: PageErrorEntry[]; dropped: number } {
+  ): BufferRead<PageErrorEntry> {
     const record = this.getRecord(sessionId);
     return this.readBuffer(record.pageErrorBuffer, pageId, clear, match);
   }

@@ -96,10 +96,63 @@ function closestValidKey(key: string, validKeys: string[]): string | undefined {
   return bestDistance <= maxSuggestionDistance ? best : undefined;
 }
 
+/** How a nested path is written back to a caller: `cookies[0].maxAge` rather than `cookies,0,maxAge`. */
+function formatPath(path: readonly (string | number | symbol)[]): string {
+  return path
+    .map(segment => (typeof segment === 'number' ? `[${segment}]` : `.${String(segment)}`))
+    .join('')
+    .replace(/^\./, '');
+}
+
+/**
+ * Builds the "you passed a key that is not a parameter" message for one
+ * object level in a tool's schema.
+ *
+ * `topLevelKeys` is the tool's OWN parameter list, threaded down into every
+ * nested level for one specific reason: the most common nested mistake is a
+ * real parameter put one level too deep. `viewport: { width, height,
+ * deviceScaleFactor }` is the canonical case, since deviceScaleFactor is a
+ * genuine create_session parameter that simply does not belong inside
+ * viewport. Told only "unrecognized parameter deviceScaleFactor" a caller
+ * has no reason to think the name was right and the place was wrong, so
+ * that case says exactly that instead of guessing at a near-miss.
+ */
+function unknownKeysError(
+  validKeys: string[],
+  topLevelKeys: string[]
+): (issue: { code: string; keys?: string[]; path?: readonly (string | number | symbol)[] }) => string | undefined {
+  return issue => {
+    if (issue.code !== 'unrecognized_keys') return undefined;
+    const keys = issue.keys ?? [];
+    // Empty at the top level, and the path to the offending object anywhere
+    // below it. This is what makes a nested rejection say WHERE: without it,
+    // "unrecognized parameter offsetX" leaves a caller to work out which of
+    // drag's two endpoint objects it came from.
+    const path = formatPath(issue.path ?? []);
+    const scope = path === '' ? 'this tool' : `"${path}"`;
+    // No "in this tool" at the top level: that is where a caller already
+    // knows it is, and the original wording of this message is what every
+    // existing caller (and test) reads.
+    const where = path === '' ? '' : ` in ${scope}`;
+    const named = keys.map(key => {
+      if (path !== '' && topLevelKeys.includes(key)) {
+        return `"${key}" (that is a parameter of the tool itself, not of ${scope}: move it to the top level)`;
+      }
+      const suggestion = closestValidKey(key, validKeys);
+      return suggestion === undefined ? `"${key}"` : `"${key}" (did you mean "${suggestion}"?)`;
+    });
+    return (
+      `Unrecognized parameter${keys.length > 1 ? 's' : ''}${where}: ${named.join(', ')}. ` +
+      `Valid parameters for ${scope}: ${validKeys.join(', ')}.`
+    );
+  };
+}
+
 /**
  * Rejects any key a caller passes that is not one of a schema's own fields,
- * with a message that names the offending key and, when a real parameter
- * looks close enough to be the one that was meant, guesses which.
+ * at EVERY depth, with a message that names the offending key, says which
+ * object it appeared in, and, when a real parameter looks close enough to be
+ * the one that was meant, guesses which.
  *
  * A plain `z.object(...)` silently drops a key it does not recognize rather
  * than rejecting it, which is fine for a hand-written caller but not for an
@@ -110,32 +163,89 @@ function closestValidKey(key: string, validKeys: string[]): string | undefined {
  * actually asked for; a second call with an invented `wibble` key was
  * accepted without complaint. Applied once here, in the one place every
  * tool's schema passes through, rather than in 58 separate `z.object` calls.
+ *
+ * Depth matters as much as the top level, and for the same reason. Wrapping
+ * only the outermost object left every nested shape silently lossy, and the
+ * cases were not exotic: `create_session({ networkCaptureFilter: {
+ * urlIncludes, minStatus } })` dropped minStatus while the docs told callers
+ * to paste read filters straight in; `viewport: { ..., deviceScaleFactor }`
+ * dropped a real parameter put one level too deep; `cookies[].maxAge` and
+ * `drag.source.offsetX` both vanished. Each of those runs the tool with
+ * different arguments than the caller asked for and reports success.
+ *
+ * What is deliberately NOT touched: anything that is genuinely open-ended.
+ * `z.unknown()` (create_session's storageState, send_cdp_command's params)
+ * and `z.record()` (add_route_rule's headers and overrideHeaders) pass
+ * through untouched, because arbitrary keys ARE the payload there. The walk
+ * only rewrites object shapes, so an open-ended value stays open-ended
+ * however deeply it is nested.
  */
-function rejectUnknownKeys<S extends z.ZodObject<any>>(schema: S): S {
-  const validKeys = Object.keys(schema.shape);
-  return z.strictObject(schema.shape, {
-    error: issue => {
-      if (issue.code !== 'unrecognized_keys') return undefined;
-      const named = issue.keys.map(key => {
-        const suggestion = closestValidKey(key, validKeys);
-        return suggestion === undefined ? `"${key}"` : `"${key}" (did you mean "${suggestion}"?)`;
-      });
-      return (
-        `Unrecognized parameter${issue.keys.length > 1 ? 's' : ''}: ${named.join(', ')}. ` +
-        `Valid parameters for this tool: ${validKeys.join(', ')}.`
-      );
+function deepStrict<T extends z.ZodType>(schema: T, topLevelKeys: string[]): T {
+  const def = schema.def as unknown as Record<string, unknown> & { type: string };
+  // Rebuilding a schema loses its description (it lives in Zod's metadata
+  // registry, keyed by the instance), so it is reattached rather than
+  // silently dropped: these descriptions are the tool documentation a caller
+  // actually reads.
+  const withDescription = (next: z.ZodType): T => {
+    const description = schema.description;
+    return (description === undefined ? next : next.describe(description)) as T;
+  };
+  // clone() is used rather than rebuilding with z.array()/z.object(), because
+  // it carries every other part of the definition across: `.min(1)` on
+  // set_cookies' array, for one, which a naive rebuild would quietly discard.
+  const clone = (patch: Record<string, unknown>): T =>
+    withDescription((schema as unknown as { clone: (d: unknown) => z.ZodType }).clone({ ...def, ...patch }));
+
+  switch (def.type) {
+    case 'object': {
+      const shape = (schema as unknown as z.ZodObject<any>).shape;
+      const nextShape: Record<string, z.ZodType> = {};
+      for (const [key, value] of Object.entries(shape)) {
+        nextShape[key] = deepStrict(value as z.ZodType, topLevelKeys);
+      }
+      return clone({ shape: nextShape, catchall: z.never(), error: unknownKeysError(Object.keys(nextShape), topLevelKeys) });
     }
-  }) as unknown as S;
+    case 'array':
+      return clone({ element: deepStrict(def.element as z.ZodType, topLevelKeys) });
+    // Every single-wrapper type Zod expresses as an `innerType`. Listed
+    // explicitly rather than sniffed for an innerType property, so a wrapper
+    // added by a future Zod version falls through to the default and is left
+    // alone instead of being rebuilt on a guess.
+    case 'optional':
+    case 'nullable':
+    case 'default':
+    case 'prefault':
+    case 'nonoptional':
+    case 'readonly':
+    case 'catch':
+      return clone({ innerType: deepStrict(def.innerType as z.ZodType, topLevelKeys) });
+    case 'union':
+      return clone({ options: (def.options as z.ZodType[]).map(option => deepStrict(option, topLevelKeys)) });
+    case 'tuple':
+      return clone({
+        items: (def.items as z.ZodType[]).map(item => deepStrict(item, topLevelKeys)),
+        ...(def.rest ? { rest: deepStrict(def.rest as z.ZodType, topLevelKeys) } : {})
+      });
+    case 'record':
+      // The KEYS stay open (that is the point of a record); only an object
+      // sitting in the value position gets the same treatment as anywhere else.
+      return clone({ valueType: deepStrict(def.valueType as z.ZodType, topLevelKeys) });
+    default:
+      // Strings, numbers, enums, literals, unknown, any, and anything else
+      // with no object shape underneath it. Nothing to tighten.
+      return schema;
+  }
 }
 
 /**
  * Identity helper for everything except the schema, which it also makes
- * strict (see `rejectUnknownKeys`). Otherwise pins one tool's schema type so
+ * strict at every depth (see `deepStrict`). Otherwise pins one tool's schema
+ * type so
  * the handler's `args` is inferred from `inputSchema` instead of falling
  * back to the loose default.
  */
 export function defineTool<S extends z.ZodObject<any>>(def: ToolDef<S>): ToolDef<S> {
-  return { ...def, inputSchema: rejectUnknownKeys(def.inputSchema) };
+  return { ...def, inputSchema: deepStrict(def.inputSchema, Object.keys(def.inputSchema.shape)) };
 }
 
 /**

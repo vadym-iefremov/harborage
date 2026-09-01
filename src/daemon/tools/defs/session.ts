@@ -34,7 +34,25 @@ const networkCaptureFilterShape = {
       'Only capture entries of this Playwright resource type, e.g. "xhr", "fetch", "document". Same vocabulary as ' +
         'list_network_requests\' resourceType. Only request entries carry one.'
     ),
-  direction: z.enum(['request', 'response']).optional().describe('Only capture one side of each exchange.')
+  direction: z.enum(['request', 'response']).optional().describe('Only capture one side of each exchange.'),
+  minStatus: z
+    .number()
+    .int()
+    .optional()
+    .describe(
+      'Only capture response entries with a status at or above this, so minStatus 400 is "only the failures". ' +
+        'Requests carry no status, so this excludes EVERY request entry as well: a captured response then has no ' +
+        'request entry beside it, and the method and resourceType a request would have carried are not recorded ' +
+        'anywhere. Same field as list_network_requests\' minStatus.'
+    ),
+  maxStatus: z
+    .number()
+    .int()
+    .optional()
+    .describe(
+      'Only capture response entries with a status at or below this. Combine with minStatus for a range. Excludes ' +
+        'every request entry too, for the same reason minStatus does.'
+    )
 };
 
 const networkCaptureFilter = z
@@ -42,8 +60,10 @@ const networkCaptureFilter = z
   .optional()
   .describe(
     'What to keep in this session\'s network ring, evaluated BEFORE an entry is buffered rather than after, so ' +
-      'excluded noise can never evict traffic you do care about. Fields combine with AND, same as ' +
-      'list_network_requests\' own filters. Omit entirely to capture everything, which is the default and matches ' +
+      'excluded noise can never evict traffic you do care about. Fields combine with AND, and are the same seven ' +
+      'fields list_network_requests filters a read by (urlIncludes, urlMatches, method, resourceType, direction, ' +
+      'minStatus, maxStatus), so a read filter that found the noise can be pasted straight in here. An ' +
+      'unrecognized field is REJECTED rather than dropped, so a near-miss name cannot silently widen the filter. Omit entirely to capture everything, which is the default and matches ' +
       'every session created before this option existed. This is most useful against a page that runs its own dev ' +
       'server, where module-chunk requests can otherwise fill the whole buffer before the page has even finished ' +
       'loading: e.g. urlIncludes "/api/" keeps the calls an app makes to its own backend while a Vite or webpack ' +
@@ -226,7 +246,7 @@ export const sessionTools = defineTools({
       'The default is therefore to dismiss every dialog the moment it appears and record it here, which is what the page sees as confirm() returning false and prompt() returning null. ' +
       'That means you arm this tool BEFORE the click or navigation that raises the dialog, rather than calling it in response to one: by the time you could react, the dialog is already answered and logged. ' +
       'Call it with no action to just read the log, which is how you find out that a click you thought did nothing actually hit a confirm(). ' +
-      'The dialog log is a bounded buffer (HARBORAGE_DIALOG_BUFFER_SIZE, 200 by default), same as read_console and list_network_requests, so the result reports total (dialogs currently buffered), returned (dialogs this call is handing back) and dropped (dialogs evicted since the buffer was last fully cleared). clear: true without pageId drains the whole session-wide log and also resets dropped to 0, since that is a fresh observation window starting; clear: true scoped to one pageId only removes that tab\'s dialogs and leaves dropped as it was, since the rest of the log is still unread.',
+      'The dialog log is a bounded buffer (HARBORAGE_DIALOG_BUFFER_SIZE, 200 by default), same as read_console and list_network_requests, so the result reports total (dialogs currently buffered), returned (dialogs this call is handing back) and dropped (dialogs evicted since the buffer was last fully cleared). clear: true without pageId drains the whole session-wide log and also resets dropped to 0, since that is a fresh observation window starting; clear: true scoped to one pageId only removes that tab\'s dialogs and leaves dropped as it was, since the rest of the log is still unread. dropped is scoped the way the read is: with a pageId it counts only that tab\'s evicted dialogs, and droppedInSession comes back alongside it with the session-wide total, because the log is shared by every tab.',
     inputSchema: z.object({
       sessionId,
       action: z
@@ -265,7 +285,8 @@ export const sessionTools = defineTools({
         armed: ctx.sessions.getDialogPolicy(args.sessionId) ?? null,
         total: before.entries.length,
         returned: result.entries.length,
-        dropped: before.dropped,
+        dropped: before.droppedInScope,
+        ...(args.pageId !== undefined ? { droppedInSession: before.droppedInSession } : {}),
         dialogs: result.entries
       });
     }
@@ -277,7 +298,7 @@ export const sessionTools = defineTools({
       'This is a different channel from read_console: a script that throws produces no console message, so an error invisible to read_console shows up here. ' +
       'Buffering starts at create_session and at every tab opening, so this returns history rather than only what happens after you ask. ' +
       'Each entry carries the message and, where one exists, the stack. A rejection whose value is not an Error has no stack, so it carries valueType (the value\'s constructor, e.g. Event), eventType (an Event\'s own type) and detail (a JSON dump) instead, which is what makes an "[object Event]" rejection traceable. ' +
-      'This is a bounded buffer (HARBORAGE_PAGE_ERROR_BUFFER_SIZE, 200 by default), same as read_console and list_network_requests, so the result reports total (errors currently buffered), returned (errors this call is handing back) and dropped (errors evicted since the buffer was last fully cleared). clear: true without pageId drains the whole session-wide log and also resets dropped to 0, since that is a fresh observation window starting; clear: true scoped to one pageId only removes that tab\'s errors and leaves dropped as it was, since the rest of the log is still unread.',
+      'This is a bounded buffer (HARBORAGE_PAGE_ERROR_BUFFER_SIZE, 200 by default), same as read_console and list_network_requests, so the result reports total (errors currently buffered), returned (errors this call is handing back) and dropped (errors evicted since the buffer was last fully cleared). clear: true without pageId drains the whole session-wide log and also resets dropped to 0, since that is a fresh observation window starting; clear: true scoped to one pageId only removes that tab\'s errors and leaves dropped as it was, since the rest of the log is still unread. dropped is scoped the way the read is: with a pageId it counts only that tab\'s evicted errors, and droppedInSession comes back alongside it with the session-wide total, because the buffer is shared by every tab.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -289,7 +310,8 @@ export const sessionTools = defineTools({
       return text({
         total: before.entries.length,
         returned: result.entries.length,
-        dropped: before.dropped,
+        dropped: before.droppedInScope,
+        ...(args.pageId !== undefined ? { droppedInSession: before.droppedInSession } : {}),
         errors: result.entries
       });
     }
@@ -324,8 +346,11 @@ export const sessionTools = defineTools({
       'session that is already running rather than requiring a fresh create_session with networkCaptureFilter set ' +
       'up front. ' +
       'Same vocabulary as list_network_requests\' own filters: urlIncludes, urlMatches, method, resourceType, ' +
-      'direction, ANDed together. Call with none of them set to remove the filter and go back to capturing ' +
-      'everything, which is also the default for a session that never called this at all. ' +
+      'direction, minStatus, maxStatus, ANDed together. Call with none of them set to remove the filter and go ' +
+      'back to capturing everything, which is also the default for a session that never called this at all. ' +
+      'Changing a filter while requests are in flight is safe but visible: a request captured under the old filter ' +
+      'whose response the new one excludes is marked "responseFilteredOut": true in list_network_requests, so it ' +
+      'stays distinguishable from a request the server genuinely never answered. ' +
       'Takes effect immediately for every tab in the session and for tabs opened later, but does not retroactively ' +
       'touch what is already buffered: entries already in the ring stay there until read, cleared, or aged out by ' +
       'the ring filling up, whichever comes first. It also does not affect what has already been filtered out or ' +
@@ -335,22 +360,20 @@ export const sessionTools = defineTools({
       ...networkCaptureFilterShape
     }),
     async handler(ctx, args) {
-      const hasFilter =
-        args.urlIncludes !== undefined ||
-        args.urlMatches !== undefined ||
-        args.method !== undefined ||
-        args.resourceType !== undefined ||
-        args.direction !== undefined;
-
-      const raw = hasFilter
-        ? {
-            ...(args.urlIncludes !== undefined ? { urlIncludes: args.urlIncludes } : {}),
-            ...(args.urlMatches !== undefined ? { urlMatches: args.urlMatches } : {}),
-            ...(args.method !== undefined ? { method: args.method } : {}),
-            ...(args.resourceType !== undefined ? { resourceType: args.resourceType } : {}),
-            ...(args.direction !== undefined ? { direction: args.direction } : {})
-          }
-        : undefined;
+      const given = {
+        ...(args.urlIncludes !== undefined ? { urlIncludes: args.urlIncludes } : {}),
+        ...(args.urlMatches !== undefined ? { urlMatches: args.urlMatches } : {}),
+        ...(args.method !== undefined ? { method: args.method } : {}),
+        ...(args.resourceType !== undefined ? { resourceType: args.resourceType } : {}),
+        ...(args.direction !== undefined ? { direction: args.direction } : {}),
+        ...(args.minStatus !== undefined ? { minStatus: args.minStatus } : {}),
+        ...(args.maxStatus !== undefined ? { maxStatus: args.maxStatus } : {})
+      };
+      // Built from the object rather than repeated as a second boolean
+      // expression: the two used to be maintained separately, which is how
+      // minStatus and maxStatus could be added to one and forgotten in the other.
+      const hasFilter = Object.keys(given).length > 0;
+      const raw = hasFilter ? given : undefined;
 
       ctx.sessions.setNetworkCaptureFilter(args.sessionId, raw !== undefined ? compileNetworkMatch(raw) : undefined);
 
