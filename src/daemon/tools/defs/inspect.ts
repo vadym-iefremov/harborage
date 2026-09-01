@@ -1866,7 +1866,13 @@ export const inspectTools = defineTools({
       'dropped and filteredAtCapture are scoped the same way the read is: with a pageId they count only that ' +
       'tab\'s losses, and droppedInSession / filteredAtCaptureInSession come back alongside them with the ' +
       'session-wide totals. The ring is shared by every tab in the session, so a per-tab read reporting the ' +
-      'session-wide number was reporting mostly other tabs\' traffic. ' +
+      'session-wide number was reporting mostly other tabs\' traffic. TREAT A PER-TAB "dropped" AS A FLOOR, not ' +
+      'as the whole loss. Some entries are lost before Playwright can say which tab they belong to at all: a ' +
+      'request whose frame is never attached, or one still waiting for attribution when the holding area fills. ' +
+      'Those count in "droppedInSession" and against no tab, because filing them under a guessed tab would be ' +
+      'worse than leaving them visibly unattributed. So the per-tab numbers across a session can add up to LESS ' +
+      'than "droppedInSession", and that difference is exactly this. If "droppedInSession" is larger than you can ' +
+      'account for, some of it may belong to the tab you are reading. ' +
       'A request entry carrying "responseFilteredOut": true was ANSWERED, and its own response was excluded by the ' +
       'capture filter (either the filter was replaced mid-flight, or it excludes responses wholesale, e.g. ' +
       'direction "request" or a method filter). Without that flag, a request entry with no matching response entry ' +
