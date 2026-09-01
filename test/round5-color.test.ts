@@ -76,6 +76,19 @@ ${strokeCell('solid', CELL * 2, SOLID)}
   </svg>
 </div>
 
+<!-- Worst subpixel alignment: no viewBox so a user unit is a device pixel at
+     DPR 1, and the line sits at an integer y with width 1, so it splits evenly
+     across two pixel rows and each gets exactly half. Same geometry, two
+     nominal values, opposite outcomes. -->
+<div style="position:absolute;left:${CELL * 2}px;top:${CELL}px;width:${CELL}px;height:${CELL}px;background:rgb(255,255,255)">
+  <svg width="${CELL}" height="${CELL}" fill="none" stroke="rgb(118,118,118)" stroke-width="1">
+    <line id="midGreyThin" x1="0" y1="30" x2="${CELL}" y2="30"/></svg>
+</div>
+<div style="position:absolute;left:${CELL * 3}px;top:${CELL}px;width:${CELL}px;height:${CELL}px;background:rgb(255,255,255)">
+  <svg width="${CELL}" height="${CELL}" fill="none" stroke="rgb(0,0,0)" stroke-width="1">
+    <line id="blackThin" x1="0" y1="30" x2="${CELL}" y2="30"/></svg>
+</div>
+
 <!-- Batch mode: one ordinary element and one slotted into a CLOSED shadow
      root, both matching the same selector. -->
 <div style="position:absolute;left:0;top:${CELL}px;width:${CELL}px;height:${CELL}px;background:rgb(255,255,255)">
@@ -185,18 +198,20 @@ test('a stroke thinner than one device pixel is refused, because no pixel can re
   assert.equal(element.effective.layerChainIncomplete, true);
 });
 
-test('a stroke between one and two device pixels is answered but marked borderline', async () => {
+test('in the 1 to 2 band a stroke is answered only when its worst-case floor keeps the same verdict', async () => {
   const element = await styleOf('#partial');
 
-  // In this band it depends on the geometry and on where the edges land on the
-  // pixel grid, and the tool cannot know which without rasterising. Measured
-  // at 1.0 device pixel: a diagonal reaches the full colour, a circle and a
-  // Lucide-shaped path 20.5:1 of a nominal 21:1, an axis-aligned rectangle
-  // only 10.53:1. Refusing the whole band would refuse every icon on a real
-  // page, so it is answered with the uncertainty attached.
-  assert.ok(typeof element.contrast.ratio === 'number', 'this band must stay answerable');
+  // Width alone cannot decide this band, because the shortfall is
+  // proportional. This stroke is black, so even at the worst alignment it
+  // clears the 3:1 that governs a shape and the verdict holds either way.
+  assert.ok(typeof element.contrast.ratio === 'number', 'a high-contrast stroke must stay answerable');
   assert.equal(element.contrast.borderline, true);
   assert.match(String(element.contrast.borderlineNote), /device pixels/);
+  assert.ok(
+    element.effective.textPaint.worstCaseRatio < element.contrast.ratio,
+    'the floor has to be reported, and has to be below the nominal'
+  );
+  assert.ok(element.effective.textPaint.worstCaseRatio >= 3, 'and above the bar that applies to a shape');
   // And the payload has to carry the width, or a caller cannot tell this 21:1
   // from a solid one. stroke-width is not in the default property set.
   assert.equal(element.effective.textPaint.property, 'stroke');
@@ -319,10 +334,50 @@ test('the per-element tagging survives being run twice over different match sets
   assert.equal(thirdOrdinary.contrast.ratio, firstOrdinary.contrast.ratio, 'repeat calls must not drift');
 });
 
+test('the same geometry is refused when the nominal value puts its floor across a threshold', async () => {
+  // The case that decides the whole rule. #767676 on white is an ordinary UI
+  // icon grey at a nominal 4.54:1, comfortably past the 3:1 a shape has to
+  // meet. At 1.0 device pixels in the worst alignment it covers half a pixel
+  // and paints at about 1.9:1, which fails. A caveat on top of that would be a
+  // caveat on top of a wrong verdict, so the ratio is withheld instead.
+  const grey = await styleOf('#midGreyThin');
+  assert.equal(grey.contrast.ratio, null, `expected a refusal, got ${grey.contrast.ratio}`);
+  assert.equal(grey.contrast.passes, null);
+  assert.ok((grey.contrast.unaccountedFor as string[]).includes('strokeVerdictUnstable'));
+  assert.match(String(grey.contrast.ratioUnavailable), /other side of/);
+
+  // And the identical geometry at a nominal the shortfall cannot move across
+  // the bar is still answered, which is what keeps real icons usable.
+  const black = await styleOf('#blackThin');
+  assert.ok(
+    typeof black.contrast.ratio === 'number',
+    `the same 1.0px geometry at black must still answer, got ${JSON.stringify(black.contrast)}`
+  );
+  assert.equal(black.contrast.borderline, true);
+});
+
+test('the computed worst-case floor matches the pixel the browser paints at that alignment', async () => {
+  // The floor is not a safety margin, it is a prediction, so it has to be
+  // checked against paint like everything else here. The fixture is built at
+  // the worst alignment on purpose: an integer y with an odd width splits the
+  // line evenly across two pixel rows, so the darkest pixel on screen IS the
+  // half-coverage blend the floor is computed from.
+  const grey = await styleOf('#midGreyThin');
+  const painted = darkestInkRatio(2, 1);
+  const floor = grey.effective.textPaint.worstCaseRatio;
+  assert.equal(grey.effective.textPaint.worstCaseCoverage, 0.5, 'a 1.0px stroke is guaranteed only half a pixel');
+  assert.ok(
+    Math.abs(floor - painted) < 0.05,
+    `the predicted floor ${floor}:1 has to match the painted ${painted.toFixed(4)}:1 at this alignment`
+  );
+  // And the nominal it would otherwise have quoted is on the other side of 3.
+  assert.ok(painted < 3, `the fixture must actually paint below the bar, it painted ${painted.toFixed(3)}`);
+});
+
 test('computed_style documents the stroke boundaries and the new refusal codes', async () => {
   const { inspectTools } = await import('../src/daemon/tools/defs/inspect.js');
   const { description } = inspectTools.computed_style;
-  for (const code of ['strokeThinnerThanAPixel', 'notPainted', 'svgNoOwnGeometry', 'deviceStrokeWidth']) {
+  for (const code of ['strokeThinnerThanAPixel', 'strokeVerdictUnstable', 'notPainted', 'svgNoOwnGeometry', 'deviceStrokeWidth', 'worstCaseRatio']) {
     assert.match(description, new RegExp(code), `the description has to name ${code}`);
   }
   // The two numbers a caller needs to reason about a stroke answer, and the

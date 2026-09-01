@@ -800,6 +800,33 @@ const strokeAttainsNominalDevicePx = 2;
 const strokePaintsWholePixelDevicePx = 1;
 
 /**
+ * The least of a pixel a stroke of this device width is guaranteed to cover,
+ * or null when the question does not arise.
+ *
+ * A stroke of device width w laid across the pixel grid is worst off when it
+ * straddles a boundary evenly, giving each of the two pixels it touches w/2.
+ * That is a bound, not a fitted curve: no offset can do worse, because the
+ * two halves have to add up to w.
+ *
+ * Measured against it, sweeping ten subpixel offsets per width on an
+ * axis-aligned line, the minimum coverage observed was 0.502 at w=1.00,
+ * 0.624 at 1.25, 0.749 at 1.50 and 0.875 at 1.75, against a bound of 0.500,
+ * 0.625, 0.750 and 0.875. The bound is not merely safe, it is attained, and a
+ * diagonal reaches it too. So this is the honest floor rather than a
+ * pessimistic one, and it does not vary with geometry in a way that would
+ * make a single factor dishonest.
+ *
+ * Above `strokeAttainsNominalDevicePx` there is nothing to compute: every
+ * geometry reaches full coverage. Below `strokePaintsWholePixelDevicePx` the
+ * caller never gets here, because the stroke is refused outright.
+ */
+function worstCaseStrokeCoverage(paintProperty: string, deviceStrokeWidth: number): number | null {
+  if (paintProperty !== 'stroke') return null;
+  if (!(deviceStrokeWidth > 0) || deviceStrokeWidth >= strokeAttainsNominalDevicePx) return null;
+  return Math.min(1, deviceStrokeWidth / 2);
+}
+
+/**
  * Which CSS property actually paints the glyphs, and whether a single
  * contrast ratio can describe the result at all.
  *
@@ -1943,9 +1970,21 @@ export const inspectTools = defineTools({
       'the answer. Under 1 device pixel the stroke cannot fill a single pixel, so no pixel on screen ever reaches ' +
       'the stroke colour and the ratio is refused with strokeThinnerThanAPixel: measured on four geometries at 0.5 ' +
       'device pixels the darkest pixel painted is 3.2:1 to 4.0:1 where the stroke colour is 21:1. Between 1 and 2 ' +
-      'it depends on the shape and on where its edges fall on the pixel grid, measured at 1.0 as 21.00 for a ' +
-      'diagonal, 20.50 for a circle and a Lucide path, and 10.53 for an axis-aligned rectangle, so it is answered ' +
-      'and marked contrast.borderline. At 2 and above every geometry measured reaches the colour exactly. ' +
+      'the outcome depends on the NOMINAL value, not on the width alone, because the shortfall is proportional. ' +
+      'In the worst subpixel alignment a stroke of device width w covers w/2 of a pixel, which is a bound (the ' +
+      'two halves must add to w) and is also what happens: sweeping ten offsets per width, the minimum coverage ' +
+      'measured was 0.502 at 1.00, 0.624 at 1.25, 0.749 at 1.50 and 0.875 at 1.75 against a bound of 0.500, ' +
+      '0.625, 0.750 and 0.875, on axis-aligned lines and on diagonals alike. So the ratio that stroke would have ' +
+      'at that coverage is computed, and reported as effective.textPaint.worstCaseCoverage and worstCaseRatio. If ' +
+      'that floor sits on the SAME side of every threshold that applies, the verdict holds whatever the alignment ' +
+      'and the ratio is answered and marked contrast.borderline. If the floor crosses a threshold the ratio is ' +
+      'withheld with strokeVerdictUnstable, because the same stroke then passes or fails depending on where its ' +
+      'edges land on the pixel grid. Concretely: black on white at 1.0 device pixels falls from 21:1 to 4.0:1, ' +
+      'which still clears the 3:1 that governs a shape, so it is answered; an ordinary #767676 icon grey falls ' +
+      'from 4.54:1 to 1.93:1 on the identical geometry, which fails the 3:1 it was passing, so it is withheld. ' +
+      'The thresholds that apply are 1.4.11 non-text contrast at 3:1 for a shape, and the text bars only for SVG ' +
+      'text, so a dark icon is never refused for missing a rule it was never subject to. ' +
+      'At 2 and above every geometry measured reaches the colour exactly and none of this applies. ' +
       'effective.textPaint carries strokeWidth and deviceStrokeWidth whenever the stroke is what was measured, ' +
       'because stroke-width is not in the default property set and without it a 21:1 off a hairline is ' +
       'indistinguishable from a 21:1 off a solid stroke. A stroke whose stroke-dasharray dashes are all zero long ' +
@@ -1973,7 +2012,8 @@ export const inspectTools = defineTools({
       'in an all: true match set refuses only the elements whose own chain crosses it; forcedColors (the browser ' +
       'replaced every author colour with ' +
       'a system palette, so the cascade below is not what is on screen); detached (the element is not in the ' +
-      'document); notPainted; strokeThinnerThanAPixel; svgNoOwnGeometry; wideGamutOverflow (see below); ' +
+      'document); notPainted; strokeThinnerThanAPixel; strokeVerdictUnstable; svgNoOwnGeometry; ' +
+      'wideGamutOverflow (see below); ' +
       'backgroundClipTextImage, svgPaintServerFill and svgNoFill (the ' +
       'glyphs or the shape are painted in many colours, or in none). In every case screenshot the region and ' +
       'compare the worst part against its background. ' +
@@ -2656,12 +2696,57 @@ export const inspectTools = defineTools({
               'is quoted for it. Screenshot the region and read the pixels.'
           });
         }
-        const answerable = blockers.length === 0;
-        const foreground = answerable ? provisionalForeground : null;
         const largeText = isLargeText(probe.fontSizePx, probe.fontWeight);
         const aaText = largeText ? 3 : 4.5;
         const aaaText = largeText ? 4.5 : 7;
-        const ratio = foreground === null ? null : round(contrastRatio(foreground, background), 4);
+
+        // A stroke between one and two device pixels DOES reach its nominal
+        // colour on some geometries and at some subpixel offsets, and falls
+        // short on others, so the question is not "how thin" but "can the
+        // shortfall change the answer". Attenuation is proportional, not a
+        // fixed number of ratio points: the identical 1.0px geometry takes
+        // black on white from 21:1 to about 4:1, which still clears every bar
+        // that applies to a shape, and takes an ordinary #767676 icon grey
+        // from 4.54:1 to about 1.9:1, which fails the 3:1 it was passing.
+        // Width alone cannot tell those apart. So the floor is computed and
+        // the verdict is only quoted when the floor agrees with it.
+        const strokeCoverageFloor = worstCaseStrokeCoverage(glyph.property, probe.deviceStrokeWidth);
+        const floorForeground =
+          strokeCoverageFloor === null
+            ? null
+            : over({ ...provisionalForeground, a: strokeCoverageFloor }, background);
+        const provisionalRatio = round(contrastRatio(provisionalForeground, background), 4);
+        const floorRatio =
+          floorForeground === null ? null : round(contrastRatio(floorForeground, background), 4);
+        // Only the bars that actually govern this element. WCAG 1.4.11 is what
+        // applies to an icon or a rule; the text bars apply to SVG text and to
+        // nothing else, and testing an icon against them would refuse every
+        // dark icon on every page for failing a rule it was never subject to.
+        const strokedText = ['text', 'tspan', 'textpath'].includes(probe.tagName);
+        const applicableThresholds = strokedText ? [aaText, aaaText, 3] : [3];
+        const flippedThresholds =
+          floorRatio === null
+            ? []
+            : applicableThresholds.filter(threshold => provisionalRatio >= threshold !== floorRatio >= threshold);
+        if (flippedThresholds.length > 0) {
+          blockers.unshift({
+            code: 'strokeVerdictUnstable',
+            detail:
+              `This stroke is ${probe.deviceStrokeWidth.toFixed(2)} device pixels wide, so in the worst subpixel ` +
+              `alignment it covers ${(strokeCoverageFloor as number).toFixed(2)} of a pixel and the colour that ` +
+              `reaches the screen is a blend, not the stroke colour. That moves the ratio from ` +
+              `${provisionalRatio} to ${floorRatio}, which lands on the other side of ` +
+              `${flippedThresholds.map(value => `${value}:1`).join(' and ')}. The verdict is therefore not ` +
+              'decidable from the cascade: the same stroke passes or fails depending on where its edges fall on ' +
+              'the pixel grid. Screenshot the region and read the darkest ink pixel, or measure it at a larger ' +
+              'rendered size. A stroke whose floor stays on the same side of every bar that applies to it is ' +
+              'still answered, and marked borderline.'
+          });
+        }
+
+        const answerable = blockers.length === 0;
+        const foreground = answerable ? provisionalForeground : null;
+        const ratio = foreground === null ? null : provisionalRatio;
         // Chromium's text rasteriser applies its own gamma to glyph coverage,
         // so a TRANSLUCENT glyph lands up to one 8-bit step off what alpha
         // compositing alone predicts. Measured: a full-block glyph at
@@ -2682,11 +2767,7 @@ export const inspectTools = defineTools({
         // an axis-aligned rectangle only 10.53. That is far too wide a spread
         // to quote as a verdict, and far too narrow to refuse: every icon on
         // the live Acres page sits in this band, between 0.92 and 1.17.
-        const thinStroke =
-          ratio !== null &&
-          glyph.property === 'stroke' &&
-          probe.deviceStrokeWidth > 0 &&
-          probe.deviceStrokeWidth < strokeAttainsNominalDevicePx;
+        const thinStroke = ratio !== null && floorRatio !== null;
         const borderline = nearAThreshold || thinStroke;
 
         return {
@@ -2724,7 +2805,16 @@ export const inspectTools = defineTools({
                     ...(glyph.property === 'stroke'
                       ? {
                           strokeWidth: probe.strokeWidth,
-                          deviceStrokeWidth: round(probe.deviceStrokeWidth, 3)
+                          deviceStrokeWidth: round(probe.deviceStrokeWidth, 3),
+                          // The fact, not a derived verdict: how little of a
+                          // pixel this stroke is guaranteed to cover, and what
+                          // the ratio would be if it covered only that.
+                          ...(strokeCoverageFloor !== null
+                            ? {
+                                worstCaseCoverage: round(strokeCoverageFloor, 3),
+                                worstCaseRatio: floorRatio
+                              }
+                            : {})
                         }
                       : {}),
                     ...(probe.crossedSlot ? { crossedSlot: true } : {}),
@@ -2810,13 +2900,14 @@ export const inspectTools = defineTools({
                   borderline: true,
                   borderlineNote:
                     `This is a stroke ${probe.deviceStrokeWidth.toFixed(2)} device pixels wide, under the ` +
-                    `${strokeAttainsNominalDevicePx} at which every geometry measured reaches its nominal colour on ` +
-                    'at least one pixel. Between one and two device pixels it depends on the shape and on where its ' +
-                    'edges fall on the pixel grid: measured at 1.0, a diagonal reaches the full colour, a circle ' +
-                    'and a Lucide-shaped path get to 20.5:1 of a nominal 21:1, and an axis-aligned rectangle only ' +
-                    'to 10.53:1. The ratio below is the stroke colour composited correctly; what is uncertain is ' +
-                    'how much of it any pixel actually receives. Read the darkest ink pixel from a screenshot if ' +
-                    'the verdict matters.'
+                    `${strokeAttainsNominalDevicePx} at which every geometry measured reaches its nominal colour ` +
+                    'on at least one pixel. In the worst subpixel alignment it covers ' +
+                    `${(strokeCoverageFloor as number).toFixed(2)} of a pixel, which would put the ratio at ` +
+                    `${floorRatio} instead of ${ratio}. That floor stays on the same side of every threshold that ` +
+                    'applies here, so the verdict holds either way and this is a caveat rather than a refusal: ' +
+                    'where the floor DOES cross a threshold the ratio is withheld instead, with the ' +
+                    'strokeVerdictUnstable code. Read the darkest ink pixel from a screenshot if you need the ' +
+                    'number itself rather than the verdict.'
                 }
               : borderline
               ? {
