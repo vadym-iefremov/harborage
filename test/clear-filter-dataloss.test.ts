@@ -41,7 +41,7 @@ after(async () => {
 
 test('a filtered read_console with clear leaves the non-matching messages in the buffer', async () => {
   const { sessionId } = await sessions.createSession();
-  await handlers.navigate({ sessionId, url: page.url });
+  await handlers.navigate({ sessionId, url: page.url, settleMs: 0 });
   await handlers.evaluate({
     sessionId,
     expression: '(() => { console.log("keep me one"); console.error("drain me"); console.log("keep me two"); return 1; })()'
@@ -61,7 +61,7 @@ test('a filtered read_console with clear leaves the non-matching messages in the
 
 test('a filtered list_network_requests with clear leaves the non-matching entries in the buffer', async () => {
   const { sessionId } = await sessions.createSession();
-  await handlers.navigate({ sessionId, url: page.url });
+  await handlers.navigate({ sessionId, url: page.url, settleMs: 0 });
 
   const before = await handlers.list_network_requests({ sessionId });
   assert.ok((before.structuredContent as { total: number }).total > 0, 'the navigation should have produced traffic');
@@ -86,7 +86,7 @@ test('a filtered list_network_requests with clear leaves the non-matching entrie
 
 test('an unfiltered read_console with clear still drains everything', async () => {
   const { sessionId } = await sessions.createSession();
-  await handlers.navigate({ sessionId, url: page.url });
+  await handlers.navigate({ sessionId, url: page.url, settleMs: 0 });
   await handlers.evaluate({ sessionId, expression: '(() => { console.log("a"); console.log("b"); return 1; })()' });
 
   const drained = await handlers.read_console({ sessionId, clear: true });

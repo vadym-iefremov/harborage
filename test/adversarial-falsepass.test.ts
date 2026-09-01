@@ -156,7 +156,7 @@ function payload(result: unknown): Record<string, any> {
 
 async function sessionOn(path: string, options?: Record<string, unknown>): Promise<string> {
   const { sessionId } = await sessions.createSession(options as never);
-  await handlers.navigate({ sessionId, url: `${baseUrl}${path}` });
+  await handlers.navigate({ sessionId, url: `${baseUrl}${path}`, settleMs: 0 });
   return sessionId;
 }
 
@@ -319,21 +319,25 @@ test('element_box does not describe an element buried under an opaque overlay as
   await sessions.releaseSession(sessionId);
 });
 
-test('element_box says which point it hit-tested when the centre is off screen', async () => {
+test('element_box says which point it hit-tested when the centre is off screen, and blames nothing for the miss', async () => {
   const sessionId = await sessionOn('/offscreen');
   const box = payload(await handlers.element_box({ sessionId, selectors: ['#wide'] })).results[0].elements[0];
 
-  // #wide spans x -260..40, so its centre is at x -110, which is off screen and
-  // covered by nothing. The tool clamps into the viewport and hit-tests (0,320),
-  // where an unrelated fixed bar sits, then reports the element as occluded by
-  // it under a field named topmostAtCentre.
-  assert.equal(box.topmostAtCentre, false, 'the clamped point really is covered: the trap is real');
+  // #wide spans x -260..40, so its centre is at x -110, which is off screen and covered by
+  // nothing. The tool clamps into the viewport and hit-tests (0,320), where an unrelated fixed
+  // bar sits. This test used to assert that the bar was reported as an occluder, which was the
+  // trap rather than the fix: the point tested is somewhere else, so a miss there is not
+  // evidence about this element, and the remedy an occlusion implies (move the overlay) could
+  // not have helped. The honest answers are the point, the fact that it moved, and a reason.
   assert.deepEqual(
     box.hitTestPoint,
     { x: 0, y: 320 },
     'the point actually tested must be reported, because it is not the centre whenever the centre is off screen'
   );
   assert.equal(box.hitTestPointIsCentre, false, 'and it has to be flagged as not the centre');
+  assert.equal(box.topmostAtCentre, null, 'a hit test at a point that is not the element\'s own centre cannot answer this');
+  assert.equal(box.occludedBy, null, 'naming the unrelated bar at the clamped point as the occluder is the defect');
+  assert.match(String(box.topmostUnknownReason), /scroll/i, 'the caller has to be told to scroll it into view first');
 
   await sessions.releaseSession(sessionId);
 });

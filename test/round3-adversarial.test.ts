@@ -151,6 +151,39 @@ interface NetworkPayload {
 // Item 1: responseFilteredOut flagged the wrong exchange
 // ---------------------------------------------------------------------------
 
+test('the assumption the pairing rests on: context request and response name the SAME Request object', async () => {
+  // The whole item-1 fix is Request identity, and the buffers have since
+  // moved from page-level to context-level handlers. If identity did not
+  // survive that move the fix would be silently dead while every behavioural
+  // test still passed for the wrong reason, so the primitive is asserted here
+  // directly on a raw Playwright context rather than inferred from behaviour.
+  const browser: Browser = await browserManager.getBrowser();
+  const context: BrowserContext = await browser.newContext();
+  try {
+    const seenOnRequest = new Set<unknown>();
+    const pairs: { url: string; sameObject: boolean }[] = [];
+    context.on('request', request => seenOnRequest.add(request));
+    context.on('response', response => {
+      pairs.push({ url: response.url(), sameObject: seenOnRequest.has(response.request()) });
+    });
+
+    const page = await context.newPage();
+    await page.goto(`${base}/page`);
+    await page.evaluate("fetch('/one').then(r => r.text())");
+    await waitFor(() => pairs.some(pair => pair.url.endsWith('/one')), {
+      message: 'no response was observed at all'
+    });
+
+    assert.ok(pairs.length >= 2, `expected several exchanges, saw ${pairs.length}`);
+    assert.ok(
+      pairs.every(pair => pair.sameObject),
+      `response.request() must be the very object context.on('request') carried: ${JSON.stringify(pairs)}`
+    );
+  } finally {
+    await context.close();
+  }
+});
+
 test('a filter that excludes both halves of an exchange flags nothing, rather than an unrelated request', async () => {
   const { sessions, handlers } = makeStore();
   const created = structured<{ sessionId: string }>(await handlers.create_session({}));

@@ -66,7 +66,7 @@ function payload(result: unknown): Record<string, any> {
 /** A fresh session already sitting on the fixture page, served from `host`. */
 async function freshSession(host = '127.0.0.1'): Promise<string> {
   const { sessionId } = await sessions.createSession();
-  await handlers.navigate({ sessionId, url: urlFor(host) });
+  await handlers.navigate({ sessionId, url: urlFor(host), settleMs: 0 });
   return sessionId;
 }
 
@@ -124,7 +124,7 @@ test('set_cookies installs a cookie the page itself can then read', async () => 
   assert.equal(installed.value, 'abc123');
 
   // The real proof: a reload sends it, and document.cookie sees it.
-  await handlers.reload({ sessionId });
+  await handlers.reload({ sessionId, settleMs: 0 });
   const fromPage = await evaluate<string>(sessionId, 'document.cookie');
   assert.match(fromPage, /authToken=abc123/, 'the cookie must actually be in the browser, not just in our reply');
 
@@ -256,7 +256,7 @@ test('storage is per origin: a value written on one host is invisible on another
   const sessionId = await freshSession('127.0.0.1');
   await handlers.set_storage({ sessionId, area: 'localStorage', key: 'k', value: 'from-127' });
 
-  await handlers.navigate({ sessionId, url: urlFor('localhost') });
+  await handlers.navigate({ sessionId, url: urlFor('localhost'), settleMs: 0 });
   const other = payload(await handlers.get_storage({ sessionId, area: 'localStorage', key: 'k' }));
   assert.equal(other.present, false, 'a different origin is a different storage area');
   assert.ok(String(other.origin).includes('localhost'), 'the reply must name the origin it actually read');

@@ -109,7 +109,7 @@ async function evaluate<T>(sessionId: string, expression: string): Promise<T> {
 /** A fresh session already sitting on the fixture page. */
 async function freshSession(): Promise<string> {
   const { sessionId } = await sessions.createSession();
-  await handlers.navigate({ sessionId, url: baseUrl });
+  await handlers.navigate({ sessionId, url: baseUrl, settleMs: 0 });
   return sessionId;
 }
 
@@ -161,25 +161,40 @@ test('drag treats a hit on a descendant of the named element as a clean pass', a
   const body = payload(await handlers.drag({ sessionId, source: { selector: '#btn' }, target: { x: 300, y: 300 }, steps: 5 }));
 
   assert.equal(body.sourceHit.matchesTarget, true, 'a hit on a descendant of the target is still a hit on the target');
-  assert.equal(body.sourceHit.elementAtPoint, null);
+  assert.equal(
+    body.sourceHit.elementAtPoint.id,
+    'btnLabel',
+    'elementAtPoint names what is really topmost even on a MATCH, so a selector-based endpoint is never less informative than the same coordinates passed raw'
+  );
+  assert.equal(body.sourceHit.elementAtPoint.containsTarget, false, 'the label is a descendant of the button, not an ancestor of it');
   assert.equal(body.matched, true);
 
   await sessions.releaseSession(sessionId);
 });
 
-test('drag treats a hit on an ancestor of the named element as a clean pass', async () => {
+test('drag reports a hit that landed on an ancestor of the named element as a miss, and says it was an ancestor', async () => {
   const sessionId = await freshSession();
 
-  // #ancestorChild has pointer-events:none, so the browser's own hit test skips it and
-  // hands the point straight to #ancestorParent. The selector still names a real, sensible
-  // thing to press: a node nested inside the element that actually receives the gesture.
+  // This test used to assert the opposite, and it was wrong. #ancestorChild has
+  // pointer-events: none, so the browser's own hit test skips it and hands the point to
+  // #ancestorParent: a real pointerdown here never runs a single listener on #ancestorChild,
+  // which is exactly what the caller asked about. Round 2 accepted it because the predicate
+  // also allowed hit.contains(el), and that clause is what made <body>, <html> and every
+  // container on the page count as a clean hit on anything inside them. round3-pointer.test.ts
+  // proves the corrected answer against a real pointerdown listener on the element itself.
   const body = payload(
     await handlers.drag({ sessionId, source: { selector: '#ancestorChild' }, target: { x: 300, y: 300 }, steps: 5 })
   );
 
-  assert.equal(body.sourceHit.matchesTarget, true, 'a hit on an ancestor of the target is still a hit on the target');
-  assert.equal(body.sourceHit.elementAtPoint, null);
-  assert.equal(body.matched, true);
+  assert.equal(body.sourceHit.matchesTarget, false, 'the press provably goes to the parent, so this is not a hit on the child');
+  assert.equal(body.sourceHit.elementAtPoint.id, 'ancestorParent', 'what really received the press has to be named');
+  assert.equal(
+    body.sourceHit.elementAtPoint.containsTarget,
+    true,
+    'an ancestor taking the press is a different diagnosis from an overlay taking it, and the caller cannot tell from a tag name'
+  );
+  assert.equal(body.matched, false);
+  assert.match(String(body.note), /ANCESTOR/, 'the note has to give the remedy for this shape, not the z-index advice for an overlay');
 
   await sessions.releaseSession(sessionId);
 });
@@ -238,7 +253,6 @@ test('wheel reports a clean pass and a real scroll for an unoccluded container',
   const body = payload(await handlers.wheel({ sessionId, point: { selector: '#cleanScrollBox' }, deltaY: 50 }));
 
   assert.equal(body.pointHit.matchesTarget, true);
-  assert.equal(body.pointHit.elementAtPoint, null);
   assert.equal(body.matched, true);
   assert.equal(body.moved, true, 'an unoccluded scroll container really does scroll');
   assert.ok(!('note' in body), 'a clean pass that really scrolled needs no note');

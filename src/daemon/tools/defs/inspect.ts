@@ -2,11 +2,11 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import type { Frame, Locator, Page } from 'playwright';
+import type { ElementHandle, Frame, Locator, Page } from 'playwright';
 import * as z from 'zod/v4';
 
 import { sessionCacheDir } from '../../screenshotCache.js';
-import { parseCssColor, type ParsedCssColor, type Rgba } from '../color.js';
+import { paintedSrgb, parseCssColor, type ParsedCssColor, type Rgba } from '../color.js';
 import { compileNetworkMatch, matchesNetworkEntry } from '../../networkMatch.js';
 import type { NetworkEntry } from '../../sessions.js';
 import { defineTool, defineTools, text, type ToolResult } from '../types.js';
@@ -263,9 +263,62 @@ interface ProbeElement {
   // here only ever read .host off the result, and both a Document and a
   // ShadowRoot structurally satisfy "optionally has a host".
   getRootNode(): { host?: ProbeElement };
+  // The <slot> this node is assigned to, when it is light-DOM content being
+  // projected into a shadow tree. Climbed by BOTH flattened-tree walks in
+  // this file, computed_style's background compositing walk and
+  // element_box's topmostAtCentre hit test, and by the twin walk in
+  // interaction.ts; see the matching members on ShadowDrillElement there. Null when it is not slotted, and also null
+  // for a CLOSED shadow root, which is a limitation the walk that uses this
+  // has to own rather than paper over.
+  assignedSlot: ProbeElement | null;
+  // parentNode rather than parentElement, because the flattened-tree walk has
+  // to be able to see a ShadowRoot (node type 11) and step to its host. The
+  // three node types that turn up there are element (1), document (9) and
+  // document fragment (11). Typed as ProbeElement because a shim cannot
+  // usefully express "element, or one of two node kinds this code only reads
+  // nodeType and host off"; every property narrower than those two is read
+  // only after nodeType has been checked to be 1.
+  parentNode: ProbeElement | null;
+  nodeType: number;
+  // Present on a ShadowRoot, absent on an element and on a plain fragment.
+  host?: ProbeElement;
+  // "http://www.w3.org/2000/svg" for an SVG element. SVG text takes its
+  // colour from `fill`, not from `color`, so the walk has to know.
+  namespaceURI: string | null;
   // Present (possibly null, for a closed root) on any element that is
   // itself a shadow host. Absent entirely on one that is not.
   shadowRoot?: { elementFromPoint?(x: number, y: number): ProbeElement | null } | null;
+}
+
+/**
+ * An <iframe> element, as seen from its PARENT document.
+ *
+ * Reached only through a cast inside a callback, never as a callback's own
+ * `el` parameter, for the reason ProbeElement's own comments give: Playwright
+ * types frameElement() as ElementHandle<SVGElement | HTMLElement>, and under
+ * the test tsconfig (which does pull in lib.dom) a narrower declared parameter
+ * stops the callback type-checking. offsetWidth is the LAYOUT border box before
+ * any transform, getBoundingClientRect the same box after every ancestor
+ * transform, and the ratio is the scale a point crosses the boundary by.
+ */
+interface FrameHostElement extends ProbeElement {
+  offsetWidth?: number;
+  offsetHeight?: number;
+}
+
+/**
+ * One step of the flattened tree: an element, a ShadowRoot, or the Document.
+ *
+ * Not an element type, because the walk genuinely passes through nodes that
+ * are not elements. A ShadowRoot reports nodeType 11 and carries a host to
+ * step out through; a Document reports 9 and carries neither, which is where
+ * the walk stops. The twin of FlatNode in interaction.ts.
+ */
+interface FlatNode {
+  nodeType?: number;
+  host?: FlatNode | null;
+  assignedSlot?: FlatNode | null;
+  parentNode?: FlatNode | null;
 }
 
 declare const document: {
@@ -274,6 +327,10 @@ declare const document: {
   querySelectorAll(selector: string): ArrayLike<ProbeElement>;
   getElementsByTagName(tag: string): ArrayLike<ProbeElement>;
   elementFromPoint(x: number, y: number): ProbeElement | null;
+  // The whole hit-test stack at a point, nearest first, which is how the
+  // contrast walk finds things painting over the same pixels that are not on
+  // the ancestor chain it composited.
+  elementsFromPoint(x: number, y: number): ArrayLike<ProbeElement>;
 };
 declare const window: {
   innerWidth: number;
@@ -281,6 +338,9 @@ declare const window: {
   scrollX: number;
   scrollY: number;
   devicePixelRatio: number;
+  // Compared by reference only, which is allowed across origins, so this is
+  // the one iframe check that works in a cross-origin frame as well.
+  top: unknown;
 };
 declare function getComputedStyle(element: unknown, pseudoElement?: string | null): ProbeStyle;
 declare const CSS: { escape(value: string): string };
@@ -320,8 +380,41 @@ const forceablePseudoStates = ['hover', 'focus', 'focus-within', 'focus-visible'
  */
 const probeAttribute = 'data-harborage-probe';
 
+/**
+ * The attribute computed_style tags a POSSIBLE closed shadow host with, so a
+ * CDP pass can settle whether it really is one.
+ *
+ * A closed shadow root is designed to be invisible to page script:
+ * assignedSlot returns null inside one and the host's shadowRoot property is
+ * null, so from inside the page an ordinary <div> and a <div> hosting a closed
+ * root with a slot are indistinguishable. The consequence was concrete: text
+ * slotted into a closed root whose wrapper paints white, on a black page, is
+ * invisible at a true 1.0:1 and this tool reported 21:1 with no flag at all.
+ *
+ * CDP is not bound by that privacy rule. DOM.getDocument with pierce: true
+ * reports closed roots and their contents, so tagging the candidates here and
+ * looking them up there settles it. Removed again in a finally.
+ */
+const closedHostProbeAttribute = 'data-harborage-closed-host-probe';
+
 /** How many matches a diagnostics tool reports per selector unless told otherwise. */
 const defaultMatchLimit = 20;
+
+/**
+ * How far a ratio on TRANSLUCENT text can move for reasons alpha compositing
+ * does not model, in ratio points.
+ *
+ * Chromium's text rasteriser applies a gamma to glyph coverage that a <div>
+ * filled with the same colour does not get. Measured across 100 opacities: a
+ * solid box matches 255 - round(255 * opacity) exactly, every time, while a
+ * full-block glyph at the same opacity lands up to one 8-bit step darker.
+ * One step near the dark end of the scale is worth about a quarter of a ratio
+ * point, which is enough to move a result across a WCAG line. Rather than
+ * emulate a platform text rasteriser, whose behaviour depends on the font,
+ * the smoothing settings and the backdrop, the tool says when a ratio is
+ * close enough to a threshold for that to decide the verdict.
+ */
+const textGammaRatioSlack = 0.25;
 
 const opaqueWhite: Rgba = { r: 255, g: 255, b: 255, a: 1 };
 
@@ -362,17 +455,78 @@ const fullyTransparent: Rgba = { r: 0, g: 0, b: 0, a: 0 };
  */
 export { parseCssColor };
 
-/** An opaque "rgb(r, g, b)" string, rounded, which is what a caller can paste back into CSS. */
-function formatRgb(color: Rgba): string {
-  return `rgb(${Math.round(color.r)}, ${Math.round(color.g)}, ${Math.round(color.b)})`;
+/** Clamps one channel back into the 0 to 255 an sRGB screen can show. */
+function clampChannel(value: number): number {
+  return Math.min(255, Math.max(0, value));
 }
 
-/** Standard source-over compositing with straight (non-premultiplied) alpha. */
-function over(source: Rgba, backdrop: Rgba): Rgba {
+/** An opaque "rgb(r, g, b)" string, rounded, which is what a caller can paste back into CSS. */
+function formatRgb(color: Rgba): string {
+  return `rgb(${Math.round(clampChannel(color.r))}, ${Math.round(clampChannel(color.g))}, ${Math.round(clampChannel(color.b))})`;
+}
+
+/**
+ * Standard source-over compositing with straight (non-premultiplied) alpha,
+ * clamped where Chromium clamps.
+ *
+ * The clamp is on the PREMULTIPLIED channel, not the straight one, because
+ * that is the value Chromium's 8-bit sRGB paint surface has to hold. It is a
+ * no-op for every colour that started inside sRGB, which is almost all of
+ * them; it only bites once a wide-gamut colour has been let through
+ * unclipped by paintedSrgb, which is exactly when it is needed. Without it a
+ * channel that ran past the sRGB corner would keep running through every
+ * ancestor in the stack instead of stopping at the corner the way the screen
+ * does.
+ */
+function over(source: Rgba, backdrop: Rgba, report?: PaintReport): Rgba {
   const alpha = source.a + backdrop.a * (1 - source.a);
   if (alpha === 0) return { ...fullyTransparent };
-  const mix = (s: number, d: number): number => (s * source.a + d * backdrop.a * (1 - source.a)) / alpha;
+  const mix = (s: number, d: number): number => {
+    const premultiplied = s * source.a + d * backdrop.a * (1 - source.a);
+    if (premultiplied > 255 && report) report.ranPastTheCeiling = true;
+    return Math.min(255, Math.max(0, premultiplied)) / alpha;
+  };
   return { r: mix(source.r, backdrop.r), g: mix(source.g, backdrop.g), b: mix(source.b, backdrop.b), a: alpha };
+}
+
+/**
+ * What happened during one compositing walk that the caller needs to know
+ * about, as opposed to the colour it produced.
+ *
+ * `ranPastTheCeiling` records that a channel came out above the top of sRGB
+ * and had to be pinned there. On its own that is fine and matches the screen:
+ * across 588 wide-gamut cases the pinned value is what Chromium paints. It
+ * stops being fine in combination with an opacity group, and see
+ * `wideGamutOverflowRisk` for what Chromium does then.
+ */
+interface PaintReport {
+  ranPastTheCeiling: boolean;
+}
+
+/**
+ * Whether this stack can drive Chromium into painting a colour no colour
+ * model predicts.
+ *
+ * Measured, not theorised. A wide-gamut colour carrying alpha, inside an
+ * element with opacity below 1, over a light backdrop: Chromium WRAPS the
+ * overflowing channel instead of pinning it. color(display-p3 0 1 0 / .35)
+ * under opacity .7 over white is painted rgb(193, 1, 193), a magenta, where
+ * every model of compositing says rgb(193, 255, 193), a pale green. The green
+ * channel computes to 256.1 and comes out as 1.
+ *
+ * Isolated across 108 combinations: it needs the opacity group (0 of 36 cases
+ * at opacity 1 are affected, 18 of 72 below it), it needs the overflow (only
+ * the light backdrops break, never black), and it does NOT need two layers,
+ * which is what it first looked like. One is enough.
+ *
+ * This is emulatable and deliberately not emulated. It is a defect in an
+ * 8-bit write path, it will be fixed, and a tool that reproduced it would
+ * quietly start lying on the Chromium version that fixes it while claiming
+ * more precision than the round below it has. Refusing is correct in both
+ * worlds, and it costs only the cases that are genuinely unpredictable.
+ */
+function wideGamutOverflowRisk(report: PaintReport, layers: PaintLayer[]): boolean {
+  return report.ranPastTheCeiling && layers.some(layer => layer.opacity < 1);
 }
 
 interface PaintLayer {
@@ -389,10 +543,10 @@ interface PaintLayer {
  * have to be composited first, then the whole result faded, rather than each
  * layer's alpha being multiplied on the way down.
  */
-function paintGroup(layers: PaintLayer[], index: number, innermost: Rgba): Rgba {
+function paintGroup(layers: PaintLayer[], index: number, innermost: Rgba, report: PaintReport): Rgba {
   const layer = layers[index];
-  const inner = index + 1 < layers.length ? paintGroup(layers, index + 1, innermost) : innermost;
-  const painted = over(inner, layer.bg);
+  const inner = index + 1 < layers.length ? paintGroup(layers, index + 1, innermost, report) : innermost;
+  const painted = over(inner, layer.bg, report);
   return { ...painted, a: painted.a * layer.opacity };
 }
 
@@ -403,14 +557,14 @@ function paintGroup(layers: PaintLayer[], index: number, innermost: Rgba): Rgba 
  * canvas before this matters; it only shows through for a page that does not,
  * which is precisely the dark-mode case that used to come out white.
  */
-function flattenOntoCanvas(layers: PaintLayer[], innermost: Rgba, canvas: Rgba): Rgba {
-  if (layers.length === 0) return over(innermost, canvas);
-  return over(paintGroup(layers, 0, innermost), canvas);
+function flattenOntoCanvas(layers: PaintLayer[], innermost: Rgba, canvas: Rgba, report: PaintReport): Rgba {
+  if (layers.length === 0) return over(innermost, canvas, report);
+  return over(paintGroup(layers, 0, innermost, report), canvas, report);
 }
 
-/** WCAG 2.x sRGB channel transfer function. */
+/** WCAG 2.x sRGB channel transfer function. The clamp matters: WCAG luminance is defined on sRGB only. */
 function channelLuminance(value: number): number {
-  const scaled = value / 255;
+  const scaled = clampChannel(value) / 255;
   return scaled <= 0.03928 ? scaled / 12.92 : Math.pow((scaled + 0.055) / 1.055, 2.4);
 }
 
@@ -447,11 +601,254 @@ function round(value: number, places: number): number {
   return Math.round(value * factor) / factor;
 }
 
+/**
+ * A CSS opacity as Chromium actually applies it: quantised to an 8-bit alpha.
+ *
+ * Chromium renders an opacity group into an 8-bit surface, so the fraction it
+ * multiplies by is round(opacity * 255) / 255, not the author's float.
+ * Measured across 99 opacities from 0.01 to 0.99, black over white:
+ * 255 - round(255 * opacity) matches the painted pixel in 100 of 100 cases,
+ * while round(255 * (1 - opacity)) misses 4 of them by one 8-bit step. One
+ * step is small but it is one-directional, and near a WCAG threshold a
+ * one-directional error is the difference between a reported pass and a
+ * reported fail on the same pixel.
+ */
+function quantisedOpacity(raw: string): number {
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return 1;
+  return Math.round(Math.min(1, Math.max(0, value)) * 255) / 255;
+}
+
 interface RawLayer {
   tagName: string;
   id: string;
   backgroundColor: string;
   opacity: string;
+  /** "none", or a gradient or image this walk cannot reduce to a single colour. */
+  backgroundImage: string;
+  /** "none", or a filter that recolours everything this layer and its descendants paint. */
+  filter: string;
+  /** "none", or a filter applied to whatever is painted BEHIND this layer. */
+  backdropFilter: string;
+  /** "normal", or a blend mode that is not the source-over this composites with. */
+  mixBlendMode: string;
+  /**
+   * True for an SVG element that is not the <svg> root. Chromium never paints
+   * background-color on one, so compositing it in invents a backdrop that is
+   * not on screen: black text inside <g style="background-color: black"> on a
+   * white page is painted at 21:1 and was being reported as 1:1.
+   */
+  svgNonRoot: boolean;
+}
+
+/**
+ * One thing painting in the same place as the measured element that the
+ * ancestor walk has no way to account for.
+ *
+ * The walk composites ancestors. Anything else that paints over the same
+ * pixels, a positioned sibling, a <canvas> under a transparent container, an
+ * overlay, is simply not in that stack, and compositing without it produces a
+ * number with no relationship to the screen. Measured: black text in a
+ * transparent container over a white-painted <canvas> is a true 21:1 and was
+ * reported as 1:1 against the black page behind the canvas.
+ */
+interface ForeignPainter {
+  tagName: string;
+  id: string;
+  /** "over" when it hit-tests above the element, "behind" when it is an overlapping sibling further out. */
+  where: string;
+  /** What it paints: a colour, an image, or replaced content such as a canvas. */
+  paints: string;
+}
+
+/** One reason the composited answer cannot be trusted, with a code a caller can branch on. */
+interface Unaccounted {
+  code: string;
+  detail: string;
+}
+
+/**
+ * Everything painting behind or over the glyph that the ancestor walk cannot
+ * reduce to a colour.
+ *
+ * This function is the answer to the failure that produced it. The refusal
+ * machinery existed, and exactly one situation was wired to it (gradient text
+ * via background-clip), while six others quietly produced a confident 21:1 on
+ * text painted at 1.0:1 with `passes: {aaText: true}` and nothing to branch
+ * on. Prose in the tool description does not help a caller reading a number.
+ * So every situation where the walk genuinely cannot know reaches one signal
+ * here, and every one of them is measured against painted pixels in
+ * test/round4-color.test.ts rather than reasoned about.
+ *
+ * The occlusion rule is what keeps this from being noise. A background image
+ * or a backdrop-filter further out than an opaque colour cannot change the
+ * pixel behind the glyph, so it is not reported. A filter or a blend mode is
+ * reported wherever it sits, because both recolour their whole subtree, the
+ * glyph included, no matter what is painted in between.
+ */
+function unaccountedFor(layers: RawLayer[], paintLayers: PaintLayer[], foreign: ForeignPainter[]): Unaccounted[] {
+  const found: Unaccounted[] = [];
+  const add = (code: string, detail: string): void => {
+    if (!found.some(entry => entry.code === code)) found.push({ code, detail });
+  };
+
+  // True once everything between this layer and the glyph is opaque, walking
+  // inward from the element. Layers are outermost first, so the element is
+  // last and the scan runs backwards.
+  const coveredFromOutside: boolean[] = new Array(layers.length).fill(false);
+  let covered = false;
+  for (let index = layers.length - 1; index >= 0; index -= 1) {
+    coveredFromOutside[index] = covered;
+    const paint = paintLayers[index];
+    if (paint.opacity >= 1 && paint.bg.a >= 1) covered = true;
+  }
+
+  layers.forEach((layer, index) => {
+    const where = layer.id ? `<${layer.tagName} id="${layer.id}">` : `<${layer.tagName}>`;
+    if (layer.filter && layer.filter !== 'none') {
+      add(
+        'filter',
+        `${where} has filter: ${layer.filter}, which recolours everything it and its descendants paint, the text ` +
+          'included. The composited colours below are the ones before that filter ran.'
+      );
+    }
+    if (layer.mixBlendMode && layer.mixBlendMode !== 'normal') {
+      add(
+        'mixBlendMode',
+        `${where} has mix-blend-mode: ${layer.mixBlendMode}, so it is not composited with the source-over this ` +
+          'walk assumes. The painted result is a function of the backdrop that plain alpha compositing cannot express.'
+      );
+    }
+    if (coveredFromOutside[index]) return;
+    if (layer.backgroundImage && layer.backgroundImage !== 'none') {
+      add(
+        'backgroundImage',
+        `${where} paints ${layer.backgroundImage.slice(0, 80)}, and nothing opaque sits between it and the text. ` +
+          'An image or a gradient is many colours, so there is no single backdrop colour to measure against.'
+      );
+    }
+    if (layer.backdropFilter && layer.backdropFilter !== 'none') {
+      add(
+        'backdropFilter',
+        `${where} has backdrop-filter: ${layer.backdropFilter}, which recolours whatever is painted behind it ` +
+          'before the text goes on top. The stack below is what would have been there without it.'
+      );
+    }
+  });
+
+  for (const painter of foreign) {
+    const where = painter.id ? `<${painter.tagName} id="${painter.id}">` : `<${painter.tagName}>`;
+    add(
+      'foreignPainter',
+      `${where} paints ${painter.paints} ${painter.where === 'over' ? 'over' : 'behind'} this element but is not an ` +
+        'ancestor of it, so it is not in the stack composited below. Only ancestors can be composited: a ' +
+        'positioned sibling, an overlay or a <canvas> underneath is invisible to this walk.'
+    );
+  }
+
+  return found;
+}
+
+/** The subset of a style probe that decides which colour paints the glyphs. */
+interface GlyphPaintProbe {
+  color: string;
+  textFillColor: string;
+  isSvg: boolean;
+  fill: string;
+  stroke: string;
+  strokeWidth: string;
+  backgroundImage: string;
+}
+
+/**
+ * Which CSS property actually paints the glyphs, and whether a single
+ * contrast ratio can describe the result at all.
+ *
+ * `color` is the answer for ordinary HTML text and nothing else, which is why
+ * this exists. Three ways a page can move the paint somewhere else, all of
+ * them ordinary rather than exotic, all of them measured against painted
+ * pixels:
+ *
+ *   - SVG. An <svg> <text> takes its colour from `fill`; `color` is inherited
+ *     and irrelevant. Icons and chart labels are the everyday case. Text
+ *     painted at rgb(238, 238, 238) on white, a real 1.16:1, used to be
+ *     reported as 21:1 passing AA and AAA, because `color` was still black.
+ *   - -webkit-text-fill-color. It overrides `color` for the glyphs wherever
+ *     it is set. Its initial value is currentColor, so reading it
+ *     unconditionally costs nothing and is correct: on an element nobody
+ *     touched it comes back equal to `color`.
+ *   - background-clip: text with a background image, the gradient-text
+ *     pattern. The glyphs are painted with the image, so they are many
+ *     colours at once and no single ratio describes them. That one gets
+ *     refused rather than answered.
+ *
+ * Refusing is the point of the `unavailable` field. The failure this whole
+ * round exists to stop is a confident number nobody can check, so where the
+ * paint is genuinely not one colour the tool says so instead of quoting the
+ * nearest plausible figure.
+ */
+function resolveGlyphPaint(
+  probe: GlyphPaintProbe,
+  clipsBackgroundToText: boolean
+): { property: string; value: string | null; unavailable: string | null; code: string } {
+  if (probe.isSvg) {
+    const fill = probe.fill.trim();
+    if (fill === '' || fill === 'none') {
+      // A shape with no fill is not unpainted, it is OUTLINED, and the colour
+      // a viewer sees is the stroke. That is not a corner case: every Lucide,
+      // Feather and Heroicons outline icon is fill: none with a stroke, and on
+      // the live Acres page 26 of 117 elements are exactly this. Refusing them
+      // all is technically honest and practically useless, since the icon
+      // contrast question (1.4.11 non-text, 3:1) is precisely what a caller is
+      // asking. So the stroke is composited when it is a plain colour.
+      const stroke = probe.stroke.trim();
+      const strokeWidth = parseFloat(probe.strokeWidth);
+      if (stroke !== '' && stroke !== 'none' && !stroke.startsWith('url(') && !(strokeWidth === 0)) {
+        return { property: 'stroke', value: stroke, unavailable: null, code: '' };
+      }
+      return {
+        property: 'fill',
+        value: fill === '' ? null : fill,
+        code: 'svgNoFill',
+        unavailable:
+          'This is an SVG element with fill: none and no plain stroke colour either, so nothing single-valued is ' +
+          'painted for it to have contrast against. If it is stroked from a gradient or a pattern, screenshot the ' +
+          'region and compare the worst part against its background.'
+      };
+    }
+    if (fill.startsWith('url(')) {
+      return {
+        property: 'fill',
+        value: fill,
+        code: 'svgPaintServerFill',
+        unavailable:
+          'This is an SVG element filled from a paint server (a gradient or a pattern), so it is painted in many ' +
+          'colours and no single contrast ratio describes it. Screenshot the region and check the worst part of ' +
+          'the gradient against its background instead.'
+      };
+    }
+    return { property: 'fill', value: fill, unavailable: null, code: '' };
+  }
+
+  const hasBackgroundImage = probe.backgroundImage !== '' && probe.backgroundImage !== 'none';
+  if (clipsBackgroundToText && hasBackgroundImage) {
+    return {
+      property: '-webkit-text-fill-color',
+      value: probe.textFillColor === '' ? null : probe.textFillColor,
+      code: 'backgroundClipTextImage',
+      unavailable:
+        'This element uses background-clip: text with a background image, the gradient-text pattern, so the glyphs ' +
+        'are painted with that image rather than with one colour and no single contrast ratio describes them. ' +
+        'effective.backgroundColor below is still the real backdrop; screenshot the region and check the lightest ' +
+        'part of the gradient against it, since that is the part that fails first.'
+    };
+  }
+
+  const fillColor = probe.textFillColor.trim();
+  if (fillColor !== '' && fillColor !== probe.color.trim()) {
+    return { property: '-webkit-text-fill-color', value: fillColor, unavailable: null, code: '' };
+  }
+  return { property: 'color', value: probe.color, unavailable: null, code: '' };
 }
 
 /** One frame of a tab, with the id and the selector prefix an agent can act on. */
@@ -481,6 +878,128 @@ function frameTree(page: Page): FrameNode[] {
 }
 
 /** Resolves a frame id from list_frames, or explains which ids do exist. */
+/** How element_box names something in an ancestor frame that swallowed a click. */
+interface AncestorFrameOccluder {
+  tagName: string;
+  id: string;
+  classes: string | null;
+  containsTarget: boolean;
+  inAncestorFrame: true;
+}
+
+/**
+ * For each hit-test point inside a subframe, whatever in an ANCESTOR document is covering the
+ * iframe there, or null when the click really does reach the frame.
+ *
+ * element_box's own probe measures and hit-tests entirely inside one frame, which is right for
+ * its coordinate contract (documented: inside an iframe the coordinates are relative to that
+ * frame's own viewport) and is why it was immune to the coordinate-space bug drag and wheel had.
+ * But it also meant the probe could not see one document out: a modal in the PARENT covering the
+ * whole iframe swallowed every click while element_box reported topmostAtCentre true and
+ * occludedBy null, confirmed against a real pointerdown listener that never fired. A pointer
+ * event does not propagate across a frame boundary, so "would a click reach this element" is
+ * only answerable once every ancestor frame is known to receive it first.
+ *
+ * Costs nothing at all for the overwhelmingly common main-frame case, because the caller only
+ * reaches this when the probe itself reported window !== window.top. That check rides along in
+ * the probe that was already running, needs no round trip of its own, and works for a
+ * cross-origin frame too, unlike anything that would have to touch contentDocument.
+ */
+async function ancestorFrameOccluders(
+  locator: Locator,
+  points: ({ x: number; y: number } | null)[]
+): Promise<(AncestorFrameOccluder | null)[]> {
+  const blank = points.map(() => null);
+  const handle = await locator.first().elementHandle().catch(() => null);
+  if (!handle) return blank;
+
+  const chain: ElementHandle[] = [];
+  try {
+    let frame = await handle.ownerFrame();
+    while (frame && frame.parentFrame()) {
+      chain.unshift(await frame.frameElement());
+      frame = frame.parentFrame();
+    }
+  } catch {
+    for (const entry of chain) await entry.dispose().catch(() => {});
+    await handle.dispose().catch(() => {});
+    return blank;
+  }
+  await handle.dispose().catch(() => {});
+  if (chain.length === 0) return blank;
+
+  try {
+    // chain[i] is the <iframe> living in frame i's document, whose content is frame i+1, so its
+    // origin and scale map a point from frame i's space into frame i+1's. The element's own
+    // points arrive in the innermost frame's space, so they are mapped back OUT first, and the
+    // reachability checks then run from the outermost frame inwards.
+    const steps: { originX: number; originY: number; scaleX: number; scaleY: number }[] = [];
+    for (const frameElement of chain) {
+      steps.push(
+        await frameElement.evaluate((element: unknown) => {
+          const host = element as FrameHostElement;
+          const rect = host.getBoundingClientRect();
+          const style = getComputedStyle(host);
+          const scaleX = host.offsetWidth ? rect.width / host.offsetWidth : 1;
+          const scaleY = host.offsetHeight ? rect.height / host.offsetHeight : 1;
+          return {
+            originX: rect.left + ((parseFloat(style.getPropertyValue('border-left-width')) || 0) + (parseFloat(style.getPropertyValue('padding-left')) || 0)) * scaleX,
+            originY: rect.top + ((parseFloat(style.getPropertyValue('border-top-width')) || 0) + (parseFloat(style.getPropertyValue('padding-top')) || 0)) * scaleY,
+            scaleX: scaleX || 1,
+            scaleY: scaleY || 1
+          };
+        })
+      );
+    }
+
+    // perLevel[i] holds every point expressed in frame i's own coordinate space.
+    const perLevel: ({ x: number; y: number } | null)[][] = [];
+    let current = points;
+    for (let level = chain.length - 1; level >= 0; level -= 1) {
+      const step = steps[level]!;
+      current = current.map(point => (point ? { x: point.x * step.scaleX + step.originX, y: point.y * step.scaleY + step.originY } : null));
+      perLevel[level] = current;
+    }
+
+    const blocked: (AncestorFrameOccluder | null)[] = points.map(() => null);
+    for (let level = 0; level < chain.length; level += 1) {
+      const answers = await chain[level]!.evaluate(
+        (element: unknown, arg: { points: ({ x: number; y: number } | null)[] }) => {
+          const host = element as FrameHostElement;
+          return arg.points.map(point => {
+            if (!point) return null;
+            let hit = document.elementFromPoint(point.x, point.y);
+            let depth = 0;
+            while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function' && depth < 100) {
+              const deeper = hit.shadowRoot.elementFromPoint(point.x, point.y);
+              if (!deeper || deeper === hit) break;
+              hit = deeper;
+              depth += 1;
+            }
+            // An <iframe> has no rendered light-DOM children, so the only clean answer here is
+            // the iframe element itself. Anything else is the parent document taking the click
+            // before the frame ever sees it.
+            if ((hit as unknown) === (host as unknown)) return null;
+            return hit
+              ? { tagName: String(hit.tagName).toLowerCase(), id: hit.id || '', classes: hit.getAttribute('class'), containsTarget: false, inAncestorFrame: true as const }
+              : { tagName: 'html', id: '', classes: null, containsTarget: false, inAncestorFrame: true as const };
+          });
+        },
+        { points: perLevel[level]! }
+      );
+      answers.forEach((answer, index) => {
+        // First failing level wins: the outermost thing in the way is the one to deal with.
+        if (answer && !blocked[index]) blocked[index] = answer;
+      });
+    }
+    return blocked;
+  } catch {
+    return blank;
+  } finally {
+    for (const frameElement of chain) await frameElement.dispose().catch(() => {});
+  }
+}
+
 function resolveFrame(page: Page, frameId: string | undefined): Frame | undefined {
   if (frameId === undefined) return undefined;
   const nodes = frameTree(page);
@@ -539,12 +1058,111 @@ async function frameSelectorPrefix(page: Page, frame: Frame): Promise<string | u
   return segments.join('');
 }
 
+/** The positional frame id (`main`, `main/0`, `main/0/1`) of a live frame, or undefined if it has detached. */
+function frameIdOf(page: Page, frame: Frame): string | undefined {
+  return frameTree(page).find(node => node.frame === frame)?.frameId;
+}
+
+/**
+ * The frame whose document a locator's matches actually live in, asked of a
+ * resolved element rather than assumed from a `frame` argument.
+ *
+ * This is the difference between a selector that works and one that presses
+ * the wrong button. A Playwright selector can cross a frame boundary on its
+ * own, through the `>> internal:control=enter-frame >>` chunk that
+ * list_frames hands out as a selectorPrefix, so which document a match
+ * resolves in is a property of the SELECTOR, not of the `frame` argument.
+ * Two shapes defeat any guard that reads the argument alone: a prefix passed
+ * inside the selector with no `frame` argument at all, and a selector that
+ * steps one or more frames deeper than the `frame` argument reaches. Both
+ * were probed on a real page, and both used to come back certified against
+ * one document and then run by the caller against another.
+ *
+ * Chromium resolves one enter-frame chain to exactly one frame (an ambiguous
+ * `iframe >> internal:control=enter-frame` silently takes the first iframe
+ * rather than fanning out across all of them), so one resolved element
+ * settles it for the whole match set. `fallback` is used when nothing
+ * matched, or when no element handle could be taken.
+ */
+async function locatorResolutionFrame(matches: Locator, fallback: Frame): Promise<Frame> {
+  const handle = await matches
+    .first()
+    .elementHandle({ timeout: 1000 })
+    .catch(() => null);
+  if (handle === null) return fallback;
+  try {
+    return (await handle.ownerFrame()) ?? fallback;
+  } catch {
+    return fallback;
+  } finally {
+    await handle.dispose().catch(() => {});
+  }
+}
+
 interface CdpNode {
   nodeId: number;
   attributes?: string[];
   children?: CdpNode[];
   contentDocument?: CdpNode;
   shadowRoots?: CdpNode[];
+  /** "open", "closed", or "user-agent". Only present on a shadow root node. */
+  shadowRootType?: string;
+}
+
+function hasAttribute(node: CdpNode, name: string): boolean {
+  const attributes = node.attributes ?? [];
+  for (let index = 0; index < attributes.length; index += 2) {
+    if (attributes[index] === name) return true;
+  }
+  return false;
+}
+
+/** True if any node tagged with `attribute` anywhere in the pierced tree hosts a CLOSED shadow root. */
+function anyTaggedNodeHostsAClosedRoot(node: CdpNode, attribute: string): boolean {
+  const roots = node.shadowRoots ?? [];
+  for (const root of roots) {
+    if (root.shadowRootType === 'closed' && hasAttribute(node, attribute)) return true;
+  }
+  for (const root of roots) {
+    if (anyTaggedNodeHostsAClosedRoot(root, attribute)) return true;
+  }
+  for (const child of node.children ?? []) {
+    if (anyTaggedNodeHostsAClosedRoot(child, attribute)) return true;
+  }
+  if (node.contentDocument && anyTaggedNodeHostsAClosedRoot(node.contentDocument, attribute)) return true;
+  return false;
+}
+
+/**
+ * Whether any ancestor the contrast walk stepped through is really hosting a
+ * closed shadow root, answered over CDP because the page cannot answer it.
+ *
+ * Returns null when the question could not be settled at all (CDP refused, the
+ * page navigated mid-call), which the caller reports rather than swallowing:
+ * "I could not check" and "I checked and there is none" are different answers
+ * and only one of them justifies a confident ratio.
+ *
+ * Deliberately a single yes/no for the whole call rather than per element.
+ * Compositing THROUGH a closed root would mean reimplementing the flattened
+ * walk over CDP, with its own node-matching and a second CSS.getComputedStyle
+ * path, to serve a case that open shadow roots (the default mode, and what
+ * every mainstream component library emits) never reach. Refusing to quote a
+ * number is the whole point of this machinery, and it costs one CDP call.
+ */
+async function anyChainCrossesAClosedShadowRoot(page: Page): Promise<boolean | null> {
+  const cdpSession = await page.context().newCDPSession(page).catch(() => null);
+  if (cdpSession === null) return null;
+  try {
+    await cdpSession.send('DOM.enable');
+    const tree = (await cdpSession.send('DOM.getDocument', { depth: -1, pierce: true })) as unknown as {
+      root: CdpNode;
+    };
+    return anyTaggedNodeHostsAClosedRoot(tree.root, closedHostProbeAttribute);
+  } catch {
+    return null;
+  } finally {
+    await cdpSession.detach().catch(() => {});
+  }
 }
 
 /**
@@ -911,7 +1529,10 @@ export const inspectTools = defineTools({
   read_console: defineTool({
     description:
       'Read buffered browser console messages for a session (optionally filtered to one tab). Buffering starts at ' +
-      'create_session, so this returns history, not just future messages. The buffer is bounded ' +
+      'create_session and covers every tab the session ever has, including one a page opened itself, from that ' +
+      'tab\'s first line of script, so this returns history and not just future messages. The one thing it does ' +
+      'not carry is console output from a service worker, which belongs to no tab and so has no pageId to be read ' +
+      'back under. The buffer is bounded ' +
       '(HARBORAGE_CONSOLE_BUFFER_SIZE, 200 by default) and drops the oldest messages once full. Every result ' +
       'reports total (messages currently in the buffer), returned (messages this call\'s filters matched) and ' +
       'dropped (messages the buffer has evicted since it was last fully cleared). total: 200, returned: 0, ' +
@@ -986,7 +1607,10 @@ export const inspectTools = defineTools({
   list_network_requests: defineTool({
     description:
       'List buffered network requests and responses for a session (optionally filtered to one tab). Buffering ' +
-      'starts at create_session, and the buffer is bounded (HARBORAGE_NETWORK_BUFFER_SIZE, 400 by default): once ' +
+      'starts at create_session and covers every tab the session ever has, including one a page opened itself, ' +
+      'from that tab\'s own first request for its own document. Traffic a service worker generated on nobody\'s ' +
+      'behalf is not listed, because it belongs to no tab and so has no pageId to be read back under. ' +
+      'The buffer is bounded (HARBORAGE_NETWORK_BUFFER_SIZE, 400 by default): once ' +
       'it is full the oldest entries are dropped. Every result reports total (entries currently in the buffer), ' +
       'returned (entries this call\'s filters matched) and dropped (entries evicted from the buffer since it was ' +
       'last fully cleared). total: 400, returned: 0, dropped: 0 means the filter genuinely matched nothing that is ' +
@@ -1180,13 +1804,62 @@ export const inspectTools = defineTools({
       'an overlay paints on top (element_box\'s topmostAtCentre is what catches that last one). It composites ' +
       'background-color and opacity only, up to the document root of the frame the element is in, onto the canvas the ' +
       'browser really paints behind the page, and it reports colours it could not parse rather than guessing. ' +
-      'The ancestor walk crosses shadow boundaries: an element inside an open or closed shadow root has its chain ' +
-      'continued through the shadow host, not stopped at the shadow root, because that host is what genuinely ' +
-      'paints behind it. Measured against real Chromium: text at rgb(30, 30, 30) inside a shadow root on a page ' +
-      'painted rgb(10, 10, 10), a real ratio of about 1.1:1 and unreadable, used to stop at the shadow root and ' +
-      'report a confident 16.67:1 AA pass composited onto an assumed white canvas. On the rare occasion the chain ' +
-      'still cannot reach the document (a detached element being measured mid-mutation), effective.layerChainIncomplete ' +
-      'is true and the ratio should be read as unreliable rather than final. ' +
+      'The ancestor walk climbs the FLATTENED (composed) tree, which is what the browser paints, not the DOM tree. ' +
+      'Two places those differ, both measured against painted pixels rather than reasoned about. An element inside ' +
+      'an open or closed shadow root has its chain continued through the shadow host rather than stopped at the ' +
+      'shadow root, because that host is what genuinely paints behind it: text at rgb(30, 30, 30) inside a shadow ' +
+      'root on a page painted rgb(10, 10, 10), a real ratio of about 1.1:1 and unreadable, used to report a ' +
+      'confident 16.67:1 AA pass composited onto an assumed white canvas. And light-DOM content assigned to a ' +
+      '<slot> is painted inside the shadow tree\'s box hierarchy, so the walk steps onto the slot and up through ' +
+      'the shadow tree from there: white text slotted into a white shadow wrapper on a black page is invisible at ' +
+      'a true 1.0:1, and a DOM-tree walk missed the wrapper entirely and reported 21:1 passing AA and AAA. When ' +
+      'the walk crossed a slot, effective.textPaint.crossedSlot says so. ' +
+      'Content slotted into a CLOSED shadow root cannot be composited: assignedSlot is specified to return null ' +
+      'inside one, so the shadow tree that paints behind the text is invisible from the page. It is still ' +
+      'DETECTED, over CDP, which is not bound by that privacy rule, and the ratio is refused rather than guessed. '
+      + 'Which colour paints the GLYPHS is resolved rather than assumed to be "color", because assuming that is ' +
+      'how this tool used to certify invisible text. SVG text takes its colour from fill, not color, so an <svg> ' +
+      '<text> is measured on its fill (times fill-opacity): icons and chart labels are the everyday case, and ' +
+      'rgb(238, 238, 238) SVG text on white, a real 1.16:1, used to come back as 21:1 because color was still ' +
+      'black. -webkit-text-fill-color overrides color for the painted glyphs wherever it is set, and is used in ' +
+      'preference to color. background-clip: text moves the element\'s own background onto the glyphs and off the ' +
+      'page behind them, so that background is taken out of the layer stack and painted under the text fill ' +
+      'instead. effective.textPaint names the property the foreground actually came from whenever it is not plain ' +
+      'color. ' +
+      'An SVG shape with fill: none is not unpainted, it is OUTLINED, so its stroke (times stroke-opacity) is ' +
+      'what gets composited. Every Lucide, Feather and Heroicons outline icon is exactly that shape. ' +
+      'background-color on a non-root SVG element is NOT composited, because Chromium never paints it: only the ' +
+      '<svg> root paints a background. Compositing it was reporting black text inside <g style="background-color: ' +
+      'black"> on a white page as 1:1 where it is really painted at 21:1. ' +
+      'REFUSING TO ANSWER is a first-class result here, and the single thing to branch on is contrast.ratio being ' +
+      'null. When it is null, contrast.passes is null too, contrast.unaccountedFor carries machine-readable codes, ' +
+      'contrast.ratioUnavailable explains them in words, and effective.layerChainIncomplete is true. Do not read a ' +
+      'prose caveat and infer this: check the field. The codes: ' +
+      'backgroundImage (a gradient or image paints behind the text with nothing opaque in between, so there is no ' +
+      'single backdrop colour); filter (a filter on the element or an ancestor recolours everything inside it); ' +
+      'backdropFilter (a filter recolours what is behind before the text goes on top); mixBlendMode (not composited ' +
+      'with source-over at all); foreignPainter (something painting the same pixels that is not an ancestor, so it ' +
+      'cannot be in the stack: a positioned sibling, an overlay, a <canvas> under a transparent container); ' +
+      'closedShadowRoot and closedShadowRootUnchecked; forcedColors (the browser replaced every author colour with ' +
+      'a system palette, so the cascade below is not what is on screen); detached (the element is not in the ' +
+      'document); wideGamutOverflow (see below); backgroundClipTextImage, svgPaintServerFill and svgNoFill (the ' +
+      'glyphs or the shape are painted in many colours, or in none). In every case screenshot the region and ' +
+      'compare the worst part against its background. ' +
+      'A background image or a backdrop-filter further out than an opaque colour is NOT reported, because it ' +
+      'cannot change the pixel behind the glyph. A filter or a blend mode is reported wherever it sits, because ' +
+      'both recolour their whole subtree no matter what is painted in between. ' +
+      'contrast.borderline marks a ratio that is within 0.25 of a threshold it is being compared against while the ' +
+      'glyph is translucent. Chromium\'s text rasteriser applies a gamma to glyph coverage that alpha compositing ' +
+      'does not model, worth up to one 8-bit step: a full-block glyph at opacity 0.532 over white paints 118 where ' +
+      'the same colour in a <div> paints 119. Close to a line that is enough to decide the verdict, so treat a ' +
+      'borderline pass or fail as undecided and read the pixels. Group opacity itself IS modelled exactly, ' +
+      'quantised to round(opacity * 255) / 255 the way Chromium renders an opacity group into an 8-bit surface. ' +
+      'HOW CLOSE the number is, measured against painted pixels rather than claimed: on fully opaque colours it ' +
+      'lands on the painted pixel exactly, and 26 of 26 elements on a live Tailwind v4 app match to within one of ' +
+      '255. Where a glyph is translucent, or several translucent layers stack, expect up to about 0.09 of a ratio ' +
+      'point of drift from the browser\'s own rounding and text gamma, and up to 0.25 in the worst case the ' +
+      'borderline flag exists for. Anything larger than that is a bug, not rounding, and every refusal code above ' +
+      'exists because the alternative was an error of whole ratio points. ' +
       'Colour syntaxes understood: rgb()/rgba() and hsl()/hsla() in both the legacy comma form and the modern ' +
       'space form with a slash alpha, hwb(), lab(), lch(), oklab(), oklch(), color() in the predefined spaces ' +
       'srgb, srgb-linear, display-p3, a98-rgb, prophoto-rgb, rec2020, xyz, xyz-d50 and xyz-d65, and the keyword ' +
@@ -1285,11 +1958,49 @@ export const inspectTools = defineTools({
         // most often a detached element mid-mutation. See where this is
         // consumed for what that means for the reported ratio.
         reachedRoot: boolean;
+        /**
+         * -webkit-text-fill-color, which OVERRIDES color for the painted
+         * glyphs wherever it is set. Its initial value is currentColor, so on
+         * an ordinary element it comes back identical to color and changes
+         * nothing; there is no need to ask whether an author set it.
+         */
+        textFillColor: string;
+        /** True when the element is in the SVG namespace, where `fill` paints the glyphs and `color` does not. */
+        isSvg: boolean;
+        /** The SVG fill paint and its own opacity multiplier. Empty strings on an HTML element. */
+        fill: string;
+        fillOpacity: string;
+        /**
+         * The SVG stroke paint, its opacity and its width. An outlined shape
+         * (fill: none plus a stroke) is what every mainstream icon set emits,
+         * and the stroke is the only colour it puts on screen.
+         */
+        stroke: string;
+        strokeOpacity: string;
+        strokeWidth: string;
+        /** background-clip, falling back to -webkit-background-clip. "text" moves the background onto the glyphs. */
+        backgroundClip: string;
+        /** The background image, if any, which is what makes gradient text unanswerable with one ratio. */
+        backgroundImage: string;
+        /** True when the walk crossed a <slot>, which is the case a DOM-tree walk used to miss entirely. */
+        crossedSlot: boolean;
+        /** Things painting over the same pixels that the ancestor walk has no way to include. */
+        foreignPainters: ForeignPainter[];
+        /**
+         * How many ancestor steps landed on an element that MIGHT be hosting a
+         * closed shadow root. Each one is tagged in the page so the CDP pass,
+         * which can see closed roots, can settle it. Zero means the walk is
+         * provably complete on that front and no CDP call is needed.
+         */
+        ambiguousShadowHosts: number;
       }
 
       const read = (): Promise<StyleProbe[]> =>
         matches.evaluateAll(
-          (nodes, arg: { properties: string[]; pseudoElement: string | null; limit: number }) => {
+          (
+            nodes,
+            arg: { properties: string[]; pseudoElement: string | null; limit: number; shadowProbeAttribute: string }
+          ) => {
             const elements = Array.prototype.slice.call(nodes, 0, arg.limit) as ProbeElement[];
             const out: StyleProbe[] = [];
             for (const element of elements) {
@@ -1299,32 +2010,92 @@ export const inspectTools = defineTools({
 
               const layers: RawLayer[] = [];
               let node: ProbeElement | null = element;
+              let crossedSlot = false;
+              // This climbs the FLATTENED (composed) tree, not the DOM tree,
+              // because the flattened tree is what the browser paints.
+              //
+              // Two places they part company, and both used to produce a
+              // confidently wrong number:
+              //
+              // 1. A <slot>. Light-DOM content assigned to a slot is painted
+              //    inside the shadow tree's box hierarchy, so every
+              //    shadow-tree ancestor of that slot paints behind it. In the
+              //    DOM tree that content is still a child of the host, so a
+              //    parentElement walk jumps straight from the text to the
+              //    host and never sees the wrapper in between. Measured
+              //    against painted pixels: white text slotted into a shadow
+              //    wrapper painted white, on a page painted black, is
+              //    invisible at a true 1.0:1, and used to be reported as
+              //    21:1 passing both AA and AAA.
+              // 2. The shadow boundary itself. parentElement is null for the
+              //    top node of an open OR closed shadow root even though that
+              //    node paints directly on its host, so the walk has to step
+              //    from the ShadowRoot (a document fragment, node type 11) to
+              //    its .host and carry on from there.
+              //
+              // The one case still out of reach is content slotted into a
+              // CLOSED shadow root: assignedSlot is specified to return null
+              // there, and no DOM API outside the root can see the slot, so
+              // the walk falls back to the DOM parent. See the tool
+              // description, which says so rather than implying otherwise.
+              const svgNamespace = 'http://www.w3.org/2000/svg';
+              // Everything below is written without named inner functions on
+              // purpose. This body is serialised into the page, and the
+              // TypeScript runner the tests use injects a __name helper around
+              // any function it can infer a name for, which is not defined in
+              // the browser and throws on the first call.
+              // Every ancestor step taken through parentNode onto an element
+              // that could be hosting a CLOSED shadow root. assignedSlot is
+              // specified to return null inside one, so from the page there is
+              // no way to tell "ordinary parent" from "closed host whose slot
+              // I cannot see". These get tagged for a CDP pass that CAN see
+              // closed roots, which is the only way to settle it.
+              const shadowCapable = /^(?:[a-z]+-[a-z-]*|article|aside|blockquote|body|div|footer|h[1-6]|header|main|nav|p|section|span)$/;
+              const ambiguous: ProbeElement[] = [];
+              const chain: ProbeElement[] = [];
               while (node) {
+                chain.push(node);
                 const style = getComputedStyle(node);
                 layers.push({
                   tagName: String(node.tagName).toLowerCase(),
                   id: node.id || '',
                   backgroundColor: style.getPropertyValue('background-color'),
-                  opacity: style.getPropertyValue('opacity')
+                  opacity: style.getPropertyValue('opacity'),
+                  backgroundImage: style.getPropertyValue('background-image'),
+                  filter: style.getPropertyValue('filter'),
+                  backdropFilter:
+                    style.getPropertyValue('backdrop-filter') || style.getPropertyValue('-webkit-backdrop-filter'),
+                  mixBlendMode: style.getPropertyValue('mix-blend-mode'),
+                  // The <svg> ROOT does paint its background-color, confirmed
+                  // against pixels. Nothing inside it does.
+                  svgNonRoot: node.namespaceURI === svgNamespace && String(node.tagName).toLowerCase() !== 'svg'
                 });
-                const parent: ProbeElement | null = node.parentElement;
-                if (parent) {
+                const slot: ProbeElement | null = node.assignedSlot;
+                if (slot) {
+                  crossedSlot = true;
+                  node = slot;
+                  continue;
+                }
+                const parent: ProbeElement | null = node.parentNode;
+                if (parent && parent.nodeType === 1) {
+                  // shadowRoot non-null means an OPEN root, and an unslotted
+                  // child of an open host is not rendered at all, so a rendered
+                  // node here is genuinely an ordinary child. A null shadowRoot
+                  // is the ambiguous one: no root, or a closed one.
+                  if (parent.shadowRoot == null && shadowCapable.test(String(parent.tagName).toLowerCase())) {
+                    ambiguous.push(parent);
+                  }
                   node = parent;
                   continue;
                 }
-                // parentElement stops dead at a shadow boundary: the top node
-                // inside an open OR closed shadow root has parentElement null
-                // even though it is visually painted directly on top of its
-                // host. Measured against real Chromium: a <span> at
-                // rgb(30, 30, 30) inside a shadow root, on a page painted
-                // rgb(10, 10, 10) (a real ratio of about 1.1:1, unreadable),
-                // used to stop the walk right there and composite onto an
-                // assumed white canvas, reporting a confident 16.6712:1 AA
-                // pass. getRootNode().host steps across the boundary onto the
-                // host element, which is what actually paints behind the
-                // shadow tree, and the loop continues climbing from there.
-                const rootNode = node.getRootNode();
-                node = rootNode.host ?? null;
+                // Node type 11 is a document fragment, which is what a
+                // ShadowRoot is. Its .host is the element painting behind the
+                // whole shadow tree. A plain fragment has no host, and a
+                // Document (node type 9) is where the climb ends.
+                node = parent && parent.nodeType === 11 ? (parent.host ?? null) : null;
+              }
+              for (let index = 0; index < ambiguous.length; index += 1) {
+                ambiguous[index].setAttribute(arg.shadowProbeAttribute, '1');
               }
               layers.reverse();
               if (arg.pseudoElement) {
@@ -1332,11 +2103,100 @@ export const inspectTools = defineTools({
                   tagName: String(element.tagName).toLowerCase() + arg.pseudoElement,
                   id: element.id || '',
                   backgroundColor: own.getPropertyValue('background-color'),
-                  opacity: own.getPropertyValue('opacity')
+                  opacity: own.getPropertyValue('opacity'),
+                  backgroundImage: own.getPropertyValue('background-image'),
+                  filter: own.getPropertyValue('filter'),
+                  backdropFilter:
+                    own.getPropertyValue('backdrop-filter') || own.getPropertyValue('-webkit-backdrop-filter'),
+                  mixBlendMode: own.getPropertyValue('mix-blend-mode'),
+                  svgNonRoot:
+                    element.namespaceURI === svgNamespace && String(element.tagName).toLowerCase() !== 'svg'
                 });
               }
 
+              // Anything painting over the same pixels that is NOT on the
+              // chain just composited. Candidates come from two places because
+              // neither alone is enough: the hit-test stack catches overlays
+              // and hit-testable content underneath, and overlapping siblings
+              // catch what pointer-events: none hides from the hit test.
+              const rect = element.getBoundingClientRect();
+              const candidates: { node: ProbeElement; where: string }[] = [];
+              const midX = rect.left + rect.width / 2;
+              const midY = rect.top + rect.height / 2;
+              if (
+                rect.width > 0 && rect.height > 0 &&
+                midX >= 0 && midY >= 0 && midX < window.innerWidth && midY < window.innerHeight
+              ) {
+                const stack = document.elementsFromPoint(midX, midY);
+                for (let hitIndex = 0; hitIndex < stack.length; hitIndex += 1) {
+                  candidates.push({ node: stack[hitIndex], where: 'over' });
+                }
+              }
+              // Siblings are walked outward and the walk stops as soon as the
+              // chain nearer the glyph is already opaque, because anything
+              // further out is hidden behind it and cannot change the pixel.
+              // Without that stop this would fire on every page with a
+              // positioned sibling anywhere, which would make it noise.
+              for (let up = chain.length - 1; up >= 1; up -= 1) {
+                const inner = chain[up - 1];
+                const innerStyle = getComputedStyle(inner);
+                const innerBg = innerStyle.getPropertyValue('background-color');
+                if (
+                  innerBg.indexOf('rgba') !== 0 &&
+                  innerBg !== 'transparent' &&
+                  innerBg !== '' &&
+                  innerStyle.getPropertyValue('opacity') === '1' &&
+                  !(inner.namespaceURI === svgNamespace && String(inner.tagName).toLowerCase() !== 'svg')
+                ) {
+                  break;
+                }
+                const siblings = chain[up].children;
+                for (let sibIndex = 0; sibIndex < siblings.length; sibIndex += 1) {
+                  const sibling = siblings[sibIndex];
+                  if (sibling === inner) continue;
+                  const box = sibling.getBoundingClientRect();
+                  if (
+                    box.width > 0 && box.height > 0 &&
+                    box.left < rect.right && box.right > rect.left &&
+                    box.top < rect.bottom && box.bottom > rect.top
+                  ) {
+                    candidates.push({ node: sibling, where: 'behind' });
+                  }
+                }
+              }
+
+              const foreign: ForeignPainter[] = [];
+              const seenForeign: string[] = [];
+              for (let candidateIndex = 0; candidateIndex < candidates.length && foreign.length < 6; candidateIndex += 1) {
+                const candidate = candidates[candidateIndex].node;
+                if (candidate === element || chain.indexOf(candidate) !== -1) continue;
+                if (element.contains(candidate) || candidate.contains(element)) continue;
+                const tag = String(candidate.tagName).toLowerCase();
+                let paints: string | null = null;
+                if (tag === 'canvas' || tag === 'img' || tag === 'video' || tag === 'svg' || tag === 'iframe') {
+                  paints = `replaced content (<${tag}>)`;
+                } else {
+                  const candidateStyle = getComputedStyle(candidate);
+                  const image = candidateStyle.getPropertyValue('background-image');
+                  const colour = candidateStyle.getPropertyValue('background-color');
+                  if (image && image !== 'none') paints = 'a background image';
+                  else if (colour && colour !== 'rgba(0, 0, 0, 0)' && colour !== 'transparent') paints = colour;
+                }
+                if (paints === null) continue;
+                const key = `${candidates[candidateIndex].where}:${tag}:${candidate.id || ''}:${paints}`;
+                if (seenForeign.indexOf(key) !== -1) continue;
+                seenForeign.push(key);
+                foreign.push({ tagName: tag, id: candidate.id || '', where: candidates[candidateIndex].where, paints });
+              }
+
               const text = (element.textContent || '').replace(/\s+/g, ' ').trim();
+              const isSvg = element.namespaceURI === 'http://www.w3.org/2000/svg';
+              // background-clip is the standard property and is what modern
+              // Chromium reports; -webkit-background-clip is still what a lot
+              // of real stylesheets write, and on an older engine it is the
+              // only one with a value. Reading both costs nothing.
+              const backgroundClip =
+                own.getPropertyValue('background-clip') || own.getPropertyValue('-webkit-background-clip');
               out.push({
                 tagName: String(element.tagName).toLowerCase(),
                 id: element.id || '',
@@ -1345,6 +2205,18 @@ export const inspectTools = defineTools({
                 styles,
                 layers,
                 color: own.getPropertyValue('color'),
+                textFillColor: own.getPropertyValue('-webkit-text-fill-color'),
+                isSvg,
+                fill: isSvg ? own.getPropertyValue('fill') : '',
+                fillOpacity: isSvg ? own.getPropertyValue('fill-opacity') : '',
+                stroke: isSvg ? own.getPropertyValue('stroke') : '',
+                strokeOpacity: isSvg ? own.getPropertyValue('stroke-opacity') : '',
+                strokeWidth: isSvg ? own.getPropertyValue('stroke-width') : '',
+                backgroundClip,
+                backgroundImage: own.getPropertyValue('background-image'),
+                crossedSlot,
+                foreignPainters: foreign,
+                ambiguousShadowHosts: ambiguous.length,
                 fontSizePx: parseFloat(own.getPropertyValue('font-size')),
                 fontWeight: parseFloat(own.getPropertyValue('font-weight')),
                 // isConnected follows shadow trees the way the spec requires,
@@ -1358,7 +2230,12 @@ export const inspectTools = defineTools({
             }
             return out;
           },
-          { properties, pseudoElement: args.pseudoElement ?? null, limit }
+          {
+            properties,
+            pseudoElement: args.pseudoElement ?? null,
+            limit,
+            shadowProbeAttribute: closedHostProbeAttribute
+          }
         ) as Promise<StyleProbe[]>;
 
       const probes =
@@ -1380,29 +2257,165 @@ export const inspectTools = defineTools({
         return 'rgb(255, 255, 255)';
       });
       const parsedCanvas = parseCssColor(rawCanvas);
-      const canvasColor: Rgba = parsedCanvas ?? { ...opaqueWhite };
+      const canvasColor: Rgba = parsedCanvas === null ? { ...opaqueWhite } : paintedSrgb(parsedCanvas);
+
+      // Only worth a CDP round trip if the walk actually stepped onto
+      // something that could be hiding a closed root. On a page with none it
+      // is skipped entirely, so the ordinary call pays nothing for this.
+      const taggedAnyPossibleClosedHost = probes.some(probe => probe.ambiguousShadowHosts > 0);
+      const closedRootOnChain = taggedAnyPossibleClosedHost ? await anyChainCrossesAClosedShadowRoot(target.page) : false;
+      if (taggedAnyPossibleClosedHost) {
+        await root
+          .evaluate((attribute: string) => {
+            const tagged = document.querySelectorAll(`[${attribute}]`);
+            for (let index = 0; index < tagged.length; index += 1) tagged[index].removeAttribute(attribute);
+          }, closedHostProbeAttribute)
+          .catch(() => {});
+      }
+
+      // forced-colors replaces every author colour with a system palette
+      // before anything is painted, so the whole cascade this composited is
+      // not what is on screen. Asked once, of the frame the elements are in.
+      const forcedColors = await root
+        .evaluate<boolean>('matchMedia("(forced-colors: active)").matches')
+        .catch(() => false);
 
       const elements = probes.map((probe, index) => {
         const unparsed: string[] = [];
         const clipped: string[] = [];
         if (parsedCanvas?.outOfGamut === true) clipped.push(`canvas: ${rawCanvas}`);
-        const paintLayers: PaintLayer[] = probe.layers.map(layer => {
+        // background-clip: text lifts the element's own background off the
+        // page and paints it onto the glyphs instead, so that background is
+        // no longer behind the text and must come out of the stack. The
+        // element itself is always the last layer, the stack being reported
+        // outermost first.
+        const clipsBackgroundToText = /(^|[\s,])text([\s,]|$)/.test(probe.backgroundClip);
+        const ownLayerIndex = probe.layers.length - 1;
+        const paintLayers: PaintLayer[] = probe.layers.map((layer, layerIndex) => {
           const parsed = parseCssColor(layer.backgroundColor);
-          if (parsed === null) unparsed.push(`${layer.tagName}: ${layer.backgroundColor}`);
-          else if (parsed.outOfGamut) clipped.push(`${layer.tagName}: ${layer.backgroundColor}`);
-          const opacity = Number(layer.opacity);
-          return { bg: parsed ?? { ...fullyTransparent }, opacity: Number.isFinite(opacity) ? opacity : 1 };
+          // An SVG element that is not the <svg> root never paints its
+          // background-color, so its colour is not reported as unparseable or
+          // out of gamut either: it is simply not part of the picture.
+          if (!layer.svgNonRoot) {
+            if (parsed === null) unparsed.push(`${layer.tagName}: ${layer.backgroundColor}`);
+            else if (parsed.outOfGamut) clipped.push(`${layer.tagName}: ${layer.backgroundColor}`);
+          }
+          const liftedOntoGlyphs = clipsBackgroundToText && layerIndex === ownLayerIndex;
+          // paintedSrgb, not the parsed colour: a wide-gamut colour has to be
+          // clipped where Chromium clips it, on the premultiplied value,
+          // or a colour with alpha composites to the wrong pixel.
+          const bg =
+            parsed === null || liftedOntoGlyphs || layer.svgNonRoot ? { ...fullyTransparent } : paintedSrgb(parsed);
+          return { bg, opacity: quantisedOpacity(layer.opacity) };
         });
-        const textColor: ParsedCssColor | null = parseCssColor(probe.color);
-        if (textColor === null) unparsed.push(`color: ${probe.color}`);
-        else if (textColor.outOfGamut) clipped.push(`color: ${probe.color}`);
 
-        const background = flattenOntoCanvas(paintLayers, { ...fullyTransparent }, canvasColor);
-        const foreground = flattenOntoCanvas(paintLayers, textColor ?? { ...fullyTransparent }, canvasColor);
+        // WHICH colour paints the glyphs. `color` answers that only for
+        // ordinary HTML text, and quoting it regardless is how this tool used
+        // to report 21:1 on text painted at 1.16:1.
+        const glyph = resolveGlyphPaint(probe, clipsBackgroundToText);
+        const glyphColor: ParsedCssColor | null = glyph.value === null ? null : parseCssColor(glyph.value);
+        if (glyph.value !== null) {
+          if (glyphColor === null) unparsed.push(`${glyph.property}: ${glyph.value}`);
+          else if (glyphColor.outOfGamut) clipped.push(`${glyph.property}: ${glyph.value}`);
+        }
+
+        // fill-opacity and stroke-opacity fade their own paint, before the
+        // element's `opacity` (already in the layer stack) fades the group.
+        const paintOpacity = probe.isSvg
+          ? Number(glyph.property === 'stroke' ? probe.strokeOpacity : probe.fillOpacity)
+          : 1;
+        const fillOpacity = paintOpacity;
+        const painted: Rgba =
+          glyphColor === null
+            ? { ...fullyTransparent }
+            : { ...paintedSrgb(glyphColor), a: glyphColor.a * (Number.isFinite(fillOpacity) ? fillOpacity : 1) };
+        // With background-clip: text and no background image, the background
+        // colour is painted onto the glyph first and the text fill goes over
+        // it, so a transparent fill shows the background colour through.
+        const ownBackground = clipsBackgroundToText
+          ? parseCssColor(probe.layers[ownLayerIndex]?.backgroundColor ?? 'transparent')
+          : null;
+        const glyphPaint: Rgba =
+          ownBackground === null ? painted : over(painted, paintedSrgb(ownBackground));
+
+        // Every reason the composited answer cannot be trusted, gathered into
+        // one list so a caller has exactly one thing to branch on. The glyph
+        // refusals below are the same kind of statement and join the list.
+        const paintReport: PaintReport = { ranPastTheCeiling: false };
+        const blockers = unaccountedFor(probe.layers, paintLayers, probe.foreignPainters);
+        if (glyph.unavailable !== null) blockers.unshift({ code: glyph.code, detail: glyph.unavailable });
+        if (probe.reachedRoot === false) {
+          blockers.unshift({
+            code: 'detached',
+            detail:
+              'The ancestor walk did not reach the document, so the element is detached from the page (removed, or ' +
+              'measured mid-mutation). There is no real canvas behind it to composite onto.'
+          });
+        }
+        if (closedRootOnChain === true) {
+          blockers.unshift({
+            code: 'closedShadowRoot',
+            detail:
+              'An ancestor of this element hosts a CLOSED shadow root, confirmed over CDP. Content slotted into one ' +
+              'is painted inside that shadow tree, and assignedSlot returns null inside a closed root, so the walk ' +
+              'cannot see what the shadow tree paints behind the text. Screenshot the region instead.'
+          });
+        }
+        if (closedRootOnChain === null) {
+          blockers.unshift({
+            code: 'closedShadowRootUnchecked',
+            detail:
+              'An ancestor of this element might host a closed shadow root, and the CDP check that would have ' +
+              'settled it could not run. "Not checked" is not "not there", so the stack below may be missing a ' +
+              'shadow tree that paints behind the text.'
+          });
+        }
+        if (forcedColors) {
+          blockers.unshift({
+            code: 'forcedColors',
+            detail:
+              'This page is rendering under forced-colors: active, so the browser replaces author colours with a ' +
+              'system palette before anything is painted. Every colour in the cascade below is the one that was ' +
+              'overridden, not the one on screen. WCAG contrast is not assessed against author colours in forced ' +
+              'colours mode at all.'
+          });
+        }
+
+        const background = flattenOntoCanvas(paintLayers, { ...fullyTransparent }, canvasColor, paintReport);
+        // Computed before the answerability check so the overflow it detects
+        // can itself make the answer unavailable.
+        const provisionalForeground = flattenOntoCanvas(paintLayers, glyphPaint, canvasColor, paintReport);
+        if (wideGamutOverflowRisk(paintReport, paintLayers)) {
+          blockers.unshift({
+            code: 'wideGamutOverflow',
+            detail:
+              'A colour in this stack falls outside sRGB and carries alpha, and it sits inside an element with ' +
+              'opacity below 1. Measured against painted pixels, Chromium wraps the overflowing channel there ' +
+              'rather than pinning it to the top of the range: color(display-p3 0 1 0 / .35) under opacity .7 over ' +
+              'white is painted rgb(193, 1, 193), a magenta, where every model of compositing gives a pale green. ' +
+              'That is a defect in an 8-bit write path rather than a colour anyone can reason about, so no ratio ' +
+              'is quoted for it. Screenshot the region and read the pixels.'
+          });
+        }
+        const answerable = blockers.length === 0;
+        const foreground = answerable ? provisionalForeground : null;
         const largeText = isLargeText(probe.fontSizePx, probe.fontWeight);
         const aaText = largeText ? 3 : 4.5;
         const aaaText = largeText ? 4.5 : 7;
-        const ratio = round(contrastRatio(foreground, background), 4);
+        const ratio = foreground === null ? null : round(contrastRatio(foreground, background), 4);
+        // Chromium's text rasteriser applies its own gamma to glyph coverage,
+        // so a TRANSLUCENT glyph lands up to one 8-bit step off what alpha
+        // compositing alone predicts. Measured: a full-block glyph at
+        // opacity 0.532 over white paints 118 where the same colour in a <div>
+        // paints 119. One step is worth up to about 0.25 of a ratio point, so
+        // a ratio sitting inside that of a threshold cannot be called either
+        // way and says so rather than pretending to a verdict it cannot back.
+        const glyphIsTranslucent =
+          glyphPaint.a < 1 || paintLayers.some(layer => layer.opacity < 1);
+        const borderline =
+          ratio !== null &&
+          glyphIsTranslucent &&
+          [aaText, aaaText, 3].some(threshold => Math.abs(ratio - threshold) <= textGammaRatioSlack);
 
         return {
           index,
@@ -1413,15 +2426,31 @@ export const inspectTools = defineTools({
           ...(args.pseudoElement ? { pseudoElement: args.pseudoElement } : {}),
           styles: probe.styles,
           effective: {
-            color: formatRgb(foreground),
+            color: foreground === null ? null : formatRgb(foreground),
             backgroundColor: formatRgb(background),
             canvasColor: formatRgb(canvasColor),
             layers: probe.layers.map((layer, layerIndex) => ({
               tagName: layer.tagName,
               ...(layer.id ? { id: layer.id } : {}),
               backgroundColor: layer.backgroundColor,
-              opacity: paintLayers[layerIndex].opacity
+              opacity: paintLayers[layerIndex].opacity,
+              ...(clipsBackgroundToText && layerIndex === ownLayerIndex ? { clippedToText: true } : {})
             })),
+            // Only present when the glyphs are NOT simply painted in `color`,
+            // so an ordinary element's payload is unchanged and the presence
+            // of this block is itself the signal that something else is in play.
+            ...(glyph.property !== 'color' || glyph.unavailable !== null
+              ? {
+                  textPaint: {
+                    property: glyph.property,
+                    value: glyph.value,
+                    ...(probe.crossedSlot ? { crossedSlot: true } : {}),
+                    ...(glyph.unavailable !== null ? { ratioUnavailable: glyph.unavailable } : {})
+                  }
+                }
+              : probe.crossedSlot
+                ? { textPaint: { property: glyph.property, value: glyph.value, crossedSlot: true } }
+                : {}),
             ...(unparsed.length > 0
               ? {
                   unparsedColors: unparsed,
@@ -1434,30 +2463,77 @@ export const inspectTools = defineTools({
               ? {
                   outOfGamutColors: clipped,
                   gamutNote:
-                    'These colours fall outside sRGB and were clipped per channel on the way in, which is what ' +
-                    'Chromium paints on an sRGB screen. The ratio is right for that rendering. On a wide-gamut ' +
-                    'display the colour shown is not exactly this one.'
+                    'These colours fall outside sRGB and were clipped per channel. The clip is applied where ' +
+                    'Chromium applies it, to the PREMULTIPLIED colour as it lands in an 8-bit sRGB paint surface, ' +
+                    'rather than to the colour before compositing. That distinction is not cosmetic: clipping ' +
+                    'first moves the composited pixel by up to 47 of 255 over a dark backdrop, and used to flip ' +
+                    '44 of 588 WCAG threshold verdicts across a wide-gamut-with-alpha sweep. ' +
+                    'What this covers, and ONLY this: a wide-gamut colour composited at opacity 1, where the ratio ' +
+                    'matches what Chromium rasterises on an sRGB screen to within 0.08 of a ratio point across a ' +
+                    '588-case sweep against painted pixels, which is 8-bit rounding rather than a modelling gap. ' +
+                    'What breaks it: the same colour inside an element with opacity below 1, over a backdrop light ' +
+                    'enough to push a channel past the top of the range. Chromium WRAPS the overflow there instead ' +
+                    'of pinning it, so color(display-p3 0 1 0 / .35) under opacity .7 over white is painted ' +
+                    'rgb(193, 1, 193), a magenta, where compositing gives a pale green: a disagreement of 254 of ' +
+                    '255 on one channel and up to 8 ratio points. That combination is detected and REFUSED, with ' +
+                    'the wideGamutOverflow code, rather than answered, so it never reaches this note; if you are ' +
+                    'reading this note you are outside it. ' +
+                    'What it never covered: a wide-gamut display paints a colour this ratio was not computed for, ' +
+                    'so the contrast someone on a P3 screen experiences is a different number and this one should ' +
+                    'not be quoted as theirs; and the clip model is about background-color compositing only, so it ' +
+                    'says nothing about filters, blend modes or backdrop-filter, which are refused outright.'
                 }
               : {}),
-            ...(probe.reachedRoot === false
+            // Fires whenever the composited stack does not account for what is
+            // painted behind the glyph, which is the only thing it was ever
+            // meant to mean. It used to be driven by element.isConnected
+            // alone, and since computed_style resolves elements through
+            // Playwright locators, which only ever match the live document,
+            // nothing reachable through the tool could set it. One flag that
+            // never fired, sitting next to seven situations that should have.
+            ...(blockers.length > 0
               ? {
                   layerChainIncomplete: true,
-                  layerChainWarning:
-                    'The ancestor walk used to build this stack did not reach the document, most likely because ' +
-                    'the element is detached from the page (removed, or measured mid-mutation). There is no real ' +
-                    'canvas behind it to composite onto, so the ratio below is not reliable.'
+                  unaccountedFor: blockers.map(entry => entry.code),
+                  layerChainWarning: blockers.map(entry => entry.detail).join(' ')
                 }
               : {})
           },
           contrast: {
             ratio,
-            foreground: formatRgb(foreground),
+            foreground: foreground === null ? null : formatRgb(foreground),
             background: formatRgb(background),
             fontSizePx: Number.isFinite(probe.fontSizePx) ? probe.fontSizePx : null,
             fontWeight: Number.isFinite(probe.fontWeight) ? probe.fontWeight : null,
             largeText,
             thresholds: { aaText, aaaText, nonText: 3 },
-            passes: { aaText: ratio >= aaText, aaaText: ratio >= aaaText, nonText: ratio >= 3 }
+            // null, not a number, whenever the walk cannot account for what is
+            // painted. A ratio quoted here goes straight into an accessibility
+            // report, so "I cannot answer this" has to be sayable, and it has
+            // to be sayable in a field a program can branch on rather than in
+            // prose in the tool description.
+            passes:
+              ratio === null
+                ? null
+                : { aaText: ratio >= aaText, aaaText: ratio >= aaaText, nonText: ratio >= 3 },
+            ...(blockers.length > 0
+              ? {
+                  ratioUnavailable: blockers.map(entry => entry.detail).join(' '),
+                  unaccountedFor: blockers.map(entry => entry.code)
+                }
+              : {}),
+            ...(borderline
+              ? {
+                  borderline: true,
+                  borderlineNote:
+                    `This ratio is within ${textGammaRatioSlack} of a threshold it is being compared against, and ` +
+                    'the glyph is translucent (its own alpha, or an opacity group above it). Chromium\'s text ' +
+                    'rasteriser applies a gamma to glyph coverage that alpha compositing does not model, worth up ' +
+                    'to one 8-bit step: a full-block glyph at opacity 0.532 over white paints 118 where the same ' +
+                    'colour in a <div> paints 119. That is enough to move a ratio across a line this close to one, ' +
+                    'so treat the pass or fail below as undecided and read the pixels instead.'
+                }
+              : {})
           }
         };
       });
@@ -1497,18 +2573,37 @@ export const inspectTools = defineTools({
       'the coordinates are relative to that frame\'s own viewport, not the page\'s. ' +
       'visible is Chromium\'s own checkVisibility (so an ancestor being display:none counts) plus a non-zero box, ' +
       'and hiddenReasons says which test failed rather than leaving you to guess. topmostAtCentre is a HIT TEST, ' +
-      'not a paint test: false means something else would receive a click there, and occludedBy names it, which is ' +
-      'how a fully transparent overlay that swallows clicks gets caught. The mirror case is the one to watch: an ' +
+      'not a paint test: it asks whether a real click at the point would reach this element, by checking it ' +
+      'against the COMPOSED PATH of whatever is really topmost there, which is the path a click event actually ' +
+      'propagates along. false means something else would receive the click, and occludedBy names it, which is how ' +
+      'a fully transparent overlay that swallows clicks gets caught. The mirror case is the one to watch: an ' +
       'opaque overlay with pointer-events: none completely hides an element on screen while this still reports ' +
-      'topmostAtCentre true and occludedBy null, correctly, because the click does reach through it. The hit test ' +
-      'accounts for shadow DOM: an element inside an open or closed shadow root that is genuinely unoccluded ' +
-      'reports topmostAtCentre true and occludedBy null, not the shadow host, because the point is re-tested ' +
-      'against the shadow root itself rather than trusted at the host it retargets to first. An actual overlay ' +
-      'sitting on top of that element inside the same shadow root is still caught, at whatever nesting depth of ' +
-      'shadow roots it is at. For "is it actually visible to a human", take a screenshot. ' +
+      'topmostAtCentre true and occludedBy null, correctly, because the click does reach through it. For "is it ' +
+      'actually visible to a human", take a screenshot. ' +
+      'Read the asymmetry carefully: an ANCESTOR of the element that takes the click is on the composed path and ' +
+      'counts as a clean hit (a <button> whose centre is painted by its own inline label), while a DESCENDANT of ' +
+      'it is not. So an element inside a container that takes the click is NOT topmost, even though the container ' +
+      'contains it. occludedBy says which of the two it is with "containsTarget": true means the thing taking the ' +
+      'click is your element\'s own ancestor, so the point is inside your element\'s box but outside anything it ' +
+      'hit-tests. That is what pointer-events: none, visibility: hidden, a ::before or ::after scrim painted by a ' +
+      'wrapper, a clip-path or border-radius cut-out, and a wrapped inline whose box centre falls between its line ' +
+      'boxes all look like, and none of them are fixed by moving an overlay or changing a z-index. ' +
+      'The hit test accounts for shadow DOM in both directions: an element inside an open or closed shadow root ' +
+      'that is genuinely unoccluded reports topmostAtCentre true and occludedBy null rather than naming its own ' +
+      'host; a shadow HOST reports true when the click lands on its own shadow content, because the host is on ' +
+      'that content\'s composed path; a shadow-tree wrapper reports true when the click lands on light-DOM ' +
+      'children slotted into it, which no amount of DOM containment could ever see. An actual overlay sitting on ' +
+      'top of an element inside the same shadow root is still caught, at whatever nesting depth of shadow roots ' +
+      'it is at. ' +
       'The point tested comes back as hitTestPoint, with hitTestPointIsCentre alongside it, because an element ' +
-      'whose centre falls outside the viewport is tested at the nearest point inside it instead: without that, ' +
-      'occludedBy could name something sitting nowhere near the middle of the element. ' +
+      'whose centre falls outside the viewport is tested at the nearest point inside it instead. When that point ' +
+      'misses, nothing follows from it: topmostAtCentre is null, occludedBy stays null, and ' +
+      'topmostUnknownReason says why and what to do (scroll it into view, then ask again). Reporting whatever ' +
+      'unrelated element happens to sit at the clamped point as an occluder would be a fabricated diagnosis with ' +
+      'a remedy that cannot work. topmostUnknownReason is also filled in when no hit test ran at all, because the ' +
+      'element is not visible or is entirely outside the viewport, and when the DOM at that point is nested so ' +
+      'deep that the walk gave up: topmostAtCentre is null there too, because "we could not tell" is not the same ' +
+      'answer as "something is covering it". ' +
       'What it does NOT do: it never waits. A selector whose element has not rendered yet comes back as ' +
       'matched: 0, not as a timeout, so settle the page first. It hit-tests one point, so an element covered only ' +
       'at its edges still reports topmostAtCentre true. It does not tell you what an element looks like: use ' +
@@ -1605,69 +2700,181 @@ export const inspectTools = defineTools({
                   const inViewport = coverage > 0;
 
                   let topmostAtCentre: boolean | null = null;
-                  let occludedBy: { tagName: string; id: string; classes: string | null } | null = null;
+                  let occludedBy: { tagName: string; id: string; classes: string | null; containsTarget: boolean; inAncestorFrame?: true } | null = null;
                   let hitTestPoint: { x: number; y: number } | null = null;
                   let hitTestPointIsCentre: boolean | null = null;
-                  if (inViewport && visible) {
+                  let topmostUnknownReason: string | null = null;
+                  if (!inViewport || !visible) {
+                    topmostUnknownReason =
+                      'No hit test was run: the element is ' +
+                      (!visible ? 'not visible' : 'entirely outside the viewport') +
+                      ', so there is no point on screen where a click could reach it. Fix that first, then ask again.';
+                  } else {
                     // Clamped into the viewport, because elementFromPoint answers
                     // null outside it. That means the point tested is NOT the
-                    // centre whenever the centre is off screen, and an unrelated
-                    // element sitting at the clamped point would otherwise be
-                    // reported as occluding this one under a field called
-                    // topmostAtCentre. Both the point and the fact that it moved
-                    // are reported for that reason.
+                    // centre whenever the centre is off screen, which is why both
+                    // the point and the fact that it moved are reported, and why a
+                    // FAILED hit test at a clamped point is not reported as
+                    // occlusion at all: whatever sits at the nearest on-screen
+                    // point is very likely nowhere near the element and has no
+                    // bearing on whether the element is clickable. See below.
                     const trueX = rect.left + rect.width / 2;
                     const trueY = rect.top + rect.height / 2;
                     const centreX = Math.min(Math.max(trueX, 0), window.innerWidth - 1);
                     const centreY = Math.min(Math.max(trueY, 0), window.innerHeight - 1);
                     hitTestPoint = { x: Math.round(centreX * 100) / 100, y: Math.round(centreY * 100) / 100 };
                     hitTestPointIsCentre = centreX === trueX && centreY === trueY;
-                    // document.elementFromPoint retargets into the shadow host for
-                    // ANYTHING inside a shadow tree, open or closed, and
-                    // Node.contains() does not cross that boundary the other way:
-                    // confirmed directly against real Chromium, a shadow host does
-                    // not contain() its own shadow content, because a node's parent
-                    // inside a shadow tree is the shadow root, not the host. So a
-                    // plain unoccluded <button> inside an open shadow root, nothing
-                    // on top of it, came back with hit equal to its own host
-                    // <div id="host">, topmostAtCentre false and occludedBy naming
-                    // the host, a fabricated overlay on every web component on the
-                    // page. Loosening the check to also accept hit.contains(element)
-                    // would not have rescued that case either, for the same reason:
-                    // it still needs hit to actually BE (an ancestor of) element,
-                    // and the host never is. What actually fixes it is recovering
-                    // the real topmost node so the comparison has something true to
-                    // find, which is also what keeps a real overlay honest: an
-                    // overlay sitting on top of the element inside the SAME shadow
-                    // root drills down to become `hit` itself, a SIBLING of
-                    // element, not an ancestor, so it still fails every comparison
-                    // and is reported as the occluder. ShadowRoot.elementFromPoint,
-                    // unlike Document's, does not retarget, so re-querying the same
-                    // point against
-                    // hit.shadowRoot recovers what is actually topmost inside the
-                    // shadow tree, and repeating it handles shadow roots nested in
-                    // shadow roots. hitTestPointerPoint in interaction.ts (drag and
-                    // wheel's hit test) runs the identical drill for the identical
-                    // reason; kept as a second copy rather than a shared helper
-                    // because both run as in-page snippets under a tsconfig with no
-                    // dom lib, each with its own minimal element shim, so sharing
-                    // would cost more than it saves. If one changes, change the
-                    // other.
+
+                    // Step one: the true topmost node at the point.
+                    // document.elementFromPoint retargets to the shadow HOST for
+                    // anything inside a shadow tree, open or closed, so on its own
+                    // it never names what is really there: a plain unoccluded
+                    // <button> inside an open shadow root came back as its own
+                    // host. ShadowRoot.elementFromPoint does not retarget, so
+                    // re-querying the same point against hit.shadowRoot recovers
+                    // the real node, and repeating it handles shadow roots nested
+                    // in shadow roots. A closed root reports shadowRoot null, so
+                    // the drill stops at the host, which is the honest answer:
+                    // nothing outside can see into a closed root.
                     let hit = document.elementFromPoint(centreX, centreY);
                     let shadowDrillDepth = 0;
-                    while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function' && shadowDrillDepth < 20) {
+                    let truncated = false;
+                    while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function') {
+                      if (shadowDrillDepth >= 100) {
+                        truncated = true;
+                        break;
+                      }
                       const deeper = hit.shadowRoot.elementFromPoint(centreX, centreY);
                       if (!deeper || deeper === hit) break;
                       hit = deeper;
                       shadowDrillDepth += 1;
                     }
-                    if (hit) {
-                      topmostAtCentre = hit === element || element.contains(hit) || hit.contains(element);
-                      if (!topmostAtCentre) {
+
+                    if (!hit) {
+                      topmostUnknownReason =
+                        'elementFromPoint found nothing at the point tested, which normally means the page has no ' +
+                        'document element laid out there at all. Nothing can be concluded about occlusion from that.';
+                    } else {
+                      // Step two: climb the flattened tree from that node, which is
+                      // the path a real pointerdown propagates along, and look for
+                      // this element on it. That is the browser's own answer to
+                      // "would a click here reach this element", rather than an
+                      // approximation of it.
+                      //
+                      // The predicate this replaced asked hit === element ||
+                      // element.contains(hit) || hit.contains(element), and the
+                      // last of those three is backwards. An ANCESTOR of the hit
+                      // node is on the composed path and does match; a DESCENDANT
+                      // of it is not and must not. hit.contains(element) accepted
+                      // descendants, so <body> and <html> matched every element on
+                      // the page, and any container an element sits inside counted
+                      // as a clean hit on the element: a button under its own
+                      // wrapper's ::after scrim, a visibility: hidden element, a
+                      // pointer-events: none element, a clip-path cut-out and a
+                      // wrapped inline all reported topmostAtCentre true while a
+                      // real click provably went to the ancestor instead.
+                      //
+                      // The walk also fixes both shadow directions. Targeting a
+                      // shadow HOST used to fail, because the drill descends past
+                      // it into its own shadow content, which contains() cannot
+                      // reach from outside; the host is on the composed path of its
+                      // shadow content, so it matches now, with no "stop the drill
+                      // at the element" special case. Slotted content is the same
+                      // bug mirrored: a shadow-tree wrapper painting around light
+                      // DOM it slots in IS on the composed path of a press on that
+                      // content, but the slotted node's parentNode is the host, not
+                      // the wrapper. assignedSlot is tried FIRST for exactly that
+                      // reason, and the order matters: checking parentNode first
+                      // walks straight out to the host and skips every shadow-tree
+                      // element that paints around the slotted node. The nodeType
+                      // 11 step is the shadow root itself, which is not an element
+                      // and has no parent of its own; hopping to its host carries
+                      // the walk back out into the light DOM.
+                      //
+                      // hitTestPointerPoint in interaction.ts (drag and wheel's hit
+                      // test) runs the identical two steps for the identical
+                      // reason; kept as a second copy rather than a shared helper
+                      // because both run as in-page snippets under a tsconfig with
+                      // no dom lib, each with its own minimal element shim, so
+                      // sharing would cost more than it saves. If one changes,
+                      // change the other.
+                      let onComposedPath = false;
+                      let node: FlatNode | null = hit as FlatNode;
+                      let steps = 0;
+                      while (node) {
+                        if ((node as unknown) === (element as unknown)) {
+                          onComposedPath = true;
+                          break;
+                        }
+                        // A cap that is actually reached means the walk gave up, not that the
+                        // element is absent from the path. The previous cap of 200 was
+                        // reachable (measured: 199 intervening levels passed, 200 failed) and
+                        // produced a confident MISS naming the leaf, with the "an ancestor is
+                        // on top" remedy that cannot apply to a page whose only sin is being
+                        // deep. Both caps are guards against a malformed tree now, not limits
+                        // any real document meets, and reaching one is reported as unknown.
+                        if (steps >= 10000) {
+                          truncated = true;
+                          break;
+                        }
+                        node = node.assignedSlot ?? (node.nodeType === 11 ? (node.host ?? null) : (node.parentNode ?? null));
+                        steps += 1;
+                      }
+
+                      // The mirror walk, UP from this element, answering whether the thing that
+                      // took the click is an ancestor of it. Node.contains() was used here and
+                      // was wrong: it does not cross a shadow boundary, so a button inside an
+                      // open shadow root under its light-DOM wrapper's ::after scrim reported
+                      // containsTarget false and earned the overlay remedy, while the
+                      // byte-identical light-DOM shape on the same page reported true and
+                      // earned the right one. The verdict was correct in both cases; only the
+                      // diagnosis flipped, and only because a shadow root was in the way.
+                      let hitContainsElement = false;
+                      if (!onComposedPath) {
+                        let up: FlatNode | null = element as unknown as FlatNode;
+                        let upSteps = 0;
+                        while (up) {
+                          if ((up as unknown) === (hit as unknown)) {
+                            hitContainsElement = true;
+                            break;
+                          }
+                          if (upSteps >= 10000) {
+                            truncated = true;
+                            break;
+                          }
+                          up = up.assignedSlot ?? (up.nodeType === 11 ? (up.host ?? null) : (up.parentNode ?? null));
+                          upSteps += 1;
+                        }
+                      }
+
+                      if (!onComposedPath && truncated) {
+                        topmostUnknownReason =
+                          'The hit test gave up before it could answer: the DOM at this point is nested deeper ' +
+                          'than the walk is allowed to run, so whether a click here reaches this element is ' +
+                          'UNKNOWN rather than known to be false. Nothing here is evidence of an overlay.';
+                      } else if (onComposedPath) {
+                        topmostAtCentre = true;
+                      } else if (hitTestPointIsCentre === false) {
+                        // The point tested is NOT the element's centre, so a miss
+                        // here says nothing about the element. Reporting it as
+                        // occlusion, and naming whatever unrelated thing happens to
+                        // sit at the clamped point as the occluder, was a fabricated
+                        // diagnosis with a remedy that could not possibly work.
+                        topmostUnknownReason =
+                          'The element\'s centre is outside the viewport, so the hit test ran at the nearest point ' +
+                          'inside it instead (see hitTestPoint), and that point missed the element. Nothing follows ' +
+                          'from that about whether anything is covering it: the point is somewhere else. Scroll the ' +
+                          'element into view first, then ask again for an answer that means something.';
+                      } else {
+                        topmostAtCentre = false;
                         occludedBy = {
                           tagName: String(hit.tagName).toLowerCase(),
                           id: hit.id || '',
-                          classes: hit.getAttribute('class')
+                          classes: hit.getAttribute('class'),
+                          // An ancestor of this element taking the click is a
+                          // different diagnosis from an overlay taking it, and the
+                          // caller cannot tell them apart from a tag name.
+                          containsTarget: hitContainsElement
                         };
                       }
                     }
@@ -1701,15 +2908,43 @@ export const inspectTools = defineTools({
                     hiddenReasons,
                     topmostAtCentre,
                     occludedBy,
+                    topmostUnknownReason,
                     hitTestPoint,
                     hitTestPointIsCentre,
+                    // Whether this probe ran inside a subframe, so the caller knows to check
+                    // the ancestor documents too. Free: it rides along in the evaluate that
+                    // was already running, and unlike anything touching contentDocument it
+                    // works for a cross-origin frame. Stripped from the result below.
+                    frameLocal: window !== window.top,
                     position: style.getPropertyValue('position'),
                     zIndex: style.getPropertyValue('z-index')
                   };
                 });
               }, { limit });
 
-        results.push({ selector, matched, returned: elements.length, elements });
+        // Only when the probe itself said it ran in a subframe, so the main-frame path pays
+        // nothing at all for this: no handle, no owner-frame lookup, no extra round trip.
+        if (elements.some(element => element.frameLocal)) {
+          const occluders = await ancestorFrameOccluders(
+            root.locator(selector),
+            elements.map(element => element.hitTestPoint)
+          );
+          occluders.forEach((occluder, index) => {
+            if (!occluder) return;
+            const element = elements[index];
+            if (!element) return;
+            element.topmostAtCentre = false;
+            element.occludedBy = occluder;
+            element.topmostUnknownReason = null;
+          });
+        }
+
+        results.push({
+          selector,
+          matched,
+          returned: elements.length,
+          elements: elements.map(({ frameLocal, ...rest }) => rest)
+        });
       }
 
       return text({
@@ -1733,10 +2968,26 @@ export const inspectTools = defineTools({
       'stored, because harborage keeps no per-session state. The consequence is worth planning around: they ' +
       'shift when the page adds or removes an iframe, so read them again after a navigation rather than caching ' +
       'one. ' +
-      'What it does NOT do: it does not reach into shadow DOM (Playwright selectors already pierce open shadow ' +
-      'roots on their own, so no prefix is needed there), and a frame that is still loading may report ' +
-      'about:blank. A cross-origin frame is listed and reachable the same way as a same-origin one, but its ' +
-      'selectorPrefix is missing if its owning element could not be read.',
+      'A prefix is safe to paste in front of a selector you pass to find as well, and find will tell you where it ' +
+      'landed: its "resolvedFrame" is read back off the matched element rather than assumed, and the selectors it ' +
+      'returns are re-qualified from the main document, so they already carry the whole chain and must NOT be ' +
+      'prefixed a second time. Two prefixes in a row try to enter a frame twice and match nothing. ' +
+      'One trap worth knowing about the raw prefix form: "iframe >> internal:control=enter-frame" with several ' +
+      'iframes in the document silently enters the FIRST one rather than complaining, which is why the prefixes ' +
+      'here always pin an explicit "nth=". Keep the nth when you paste one. ' +
+      'THAT nth IS POSITIONAL, exactly like the frame ids, and it goes stale the same way: it means "the Nth iframe ' +
+      'in the document right now", so a page that inserts an iframe ahead of the target one leaves the prefix ' +
+      'pointing at a different frame, with no error, and a click through it presses whatever is in that one ' +
+      'instead. A prefix is a snapshot, not a handle. Re-read it after anything that could add or remove an ' +
+      'iframe, which includes ads, consent banners, embedded players and any lazy mount, and prefer acting soon ' +
+      'after reading rather than caching one across steps. ' +
+      'What it does NOT do: it does not reach into shadow DOM. For an ELEMENT that is fine, because Playwright ' +
+      'selectors already pierce open shadow roots on their own and need no prefix. For a FRAME it is the one case ' +
+      'that cannot be served at all: an iframe living inside a shadow root has no addressable owning element, so ' +
+      'no prefix can be built for it and selectorPrefixUnavailable is what comes back. Reach into such a frame ' +
+      'with evaluate, snapshot, computed_style, element_box or find using its frameId, which need no prefix. ' +
+      'A frame that is still loading may report about:blank. A cross-origin frame is listed and reachable the ' +
+      'same way as a same-origin one, but its selectorPrefix is missing if its owning element could not be read.',
     inputSchema: z.object({ sessionId, pageId }),
     async handler(ctx, args) {
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
@@ -1755,7 +3006,13 @@ export const inspectTools = defineTools({
               ? { selectorPrefix }
               : {
                   selectorPrefixUnavailable:
-                    'the owning iframe element could not be read, so this frame is reachable only by frameId'
+                    'the owning iframe element could not be read, so no selector can reach into this frame from ' +
+                    'outside and this frame is reachable only by frameId. The usual cause is an iframe living ' +
+                    'inside a shadow root: the prefix builder indexes iframes with document.getElementsByTagName, ' +
+                    'which does not pierce shadow roots. Do NOT substitute an empty prefix, since a bare selector ' +
+                    'resolves in the MAIN document instead of this frame and click would press whatever it happens ' +
+                    'to hit there. Use evaluate, snapshot, computed_style, element_box or find with frame set to ' +
+                    'this frameId, all of which take a frame id directly and need no prefix.'
                 })
           };
         })
@@ -1775,10 +3032,27 @@ export const inspectTools = defineTools({
       'resolvesToTarget (whether one of them is the element described here) and unique (both, exactly once). ' +
       'READ resolvesToTarget BEFORE USING A SELECTOR: false means it points somewhere else, or nowhere. That ' +
       'happens for an element inside a shadow root, which Playwright finds but a CSS path cannot reach, and the ' +
-      'result carries a note whenever it does. When frame is set and the owning iframe element itself could not ' +
-      'be read (for instance because the iframe sits inside a shadow root), no working selector can be composed ' +
-      'at all: every result comes back with selector null and a top-level frameSelectorUnavailable explaining why, ' +
-      'rather than a selector that looks fine but actually runs in the wrong document. Search by ' +
+      'result carries a note whenever it does. ' +
+      'FRAMES: every selector returned is absolute from the MAIN document, already carrying whatever ' +
+      '">> internal:control=enter-frame >>" chain is needed to reach the element, so hand it to click or fill as ' +
+      'it is and never prefix it a second time. How the search reached the frame does not matter: the frame ' +
+      'argument, a selectorPrefix from list_frames pasted inside the selector, or a selector that steps several ' +
+      'frames deeper than either. "resolvedFrame" reports the frame id the matches ACTUALLY resolved in, read ' +
+      'back off the element itself rather than assumed from the frame argument, and a "frameNote" appears ' +
+      'whenever that is not the frame you asked about, which is what a selector crossing a boundary of its own ' +
+      'looks like. This matters because resolvesToTarget is checked in the document the matches resolved in, so a ' +
+      'selector certified in one document and run by the caller in another certifies nothing: that is how a ' +
+      '"Confirm payment" button inside an iframe used to come back as a bare path that pressed "Delete account" ' +
+      'in the page behind it. When the owning iframe element cannot be read at all (for instance because the ' +
+      'iframe sits inside a shadow root), no working selector can be composed: every result comes back with ' +
+      'selector null and a top-level frameSelectorUnavailable explaining why, rather than a selector that looks ' +
+      'fine but actually runs in the wrong document. Reach those elements with evaluate, snapshot, computed_style ' +
+      'or element_box and a frame id instead. ONE CAVEAT ON THOSE FRAME-CROSSING SELECTORS: the "nth=" pinned into ' +
+      'the prefix is positional, so it means "the Nth iframe in the document right now". If the page inserts an ' +
+      'iframe ahead of the target one before you act, the same selector quietly enters a different frame and ' +
+      'clicks whatever is there, reporting a perfectly ordinary success. It is the same staleness the element ' +
+      'path below has, one level up. Act on a frame-crossing selector promptly, and re-run find rather than ' +
+      'reusing one across steps on a page that mounts iframes as it goes. Search by ' +
       'visible text, by ARIA role and accessible name, by test id, or by a raw selector, and combine a raw ' +
       'selector with the others to scope the search to part of the page. ' +
       'Each result also carries the element\'s tag, trimmed text, key attributes, box, and whether it is visible ' +
@@ -1796,8 +3070,10 @@ export const inspectTools = defineTools({
         .string()
         .optional()
         .describe(
-          'Frame id from list_frames to search inside. Returned selectors come back already carrying that ' +
-            'frame\'s prefix, so they work with click and fill as they are.'
+          'Frame id from list_frames to search inside. Returned selectors come back already carrying the prefix ' +
+            'for whichever frame the matches really landed in, so they work with click and fill as they are. ' +
+            'Optional even for a frame: a selectorPrefix pasted inside "selector" reaches the same place, and ' +
+            'either way "resolvedFrame" reports where the search actually ended up.'
         ),
       selector: z
         .string()
@@ -1848,25 +3124,6 @@ export const inspectTools = defineTools({
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
       const frame = resolveFrame(target.page, args.frame);
       const root: Page | Frame = frame ?? target.page;
-      // frameSelectorPrefix returns undefined when the owning iframe element
-      // could not be addressed (list_frames hits the same case, and reports
-      // it as selectorPrefixUnavailable rather than guessing). The most
-      // common cause is an iframe living inside a shadow root: the segment
-      // builder indexes it with document.getElementsByTagName, which does
-      // not pierce shadow roots. Falling back to '' here used to be silent:
-      // a selector meant to enter a frame would come back with no prefix at
-      // all, and click would then run it against the MAIN document instead.
-      // Probed with a shadow-hosted iframe holding "Confirm payment" and the
-      // main page holding "Delete account": find returned a bare
-      // "html > body > button" with resolvesToTarget true (that flag was
-      // only ever checked inside the frame's own document), and clicking it
-      // pressed Delete account. resolvesToTarget must never certify a
-      // selector that was verified in a different document from the one it
-      // will actually run in, so when the prefix is unavailable no usable
-      // selector is emitted at all: see frameSelectorUnavailable below.
-      const framePrefix = frame ? await frameSelectorPrefix(target.page, frame) : '';
-      const frameSelectorUnavailable = frame !== undefined && framePrefix === undefined;
-      const prefix = framePrefix ?? '';
       const limit = args.limit ?? defaultMatchLimit;
       const exact = args.exact ?? false;
 
@@ -1886,6 +3143,51 @@ export const inspectTools = defineTools({
       if (args.visibleOnly !== false) matches = matches.filter({ visible: true });
 
       const matched = await matches.count();
+
+      // WHICH DOCUMENT WILL THE RETURNED SELECTOR RUN IN? Everything below
+      // hangs off answering that honestly, because resolvesToTarget is
+      // computed by evaluateAll, which runs in whichever document the matches
+      // resolved in, while the selector it certifies is run by the caller
+      // wherever the emitted prefix points. When those two documents are not
+      // the same, resolvesToTarget certifies nothing.
+      //
+      // The `frame` ARGUMENT is not a safe answer to that question. A
+      // Playwright selector crosses frames on its own through
+      // ">> internal:control=enter-frame >>", which is exactly what
+      // list_frames tells agents to paste in front of a selector, so the
+      // matches can end up one or more frames away from wherever the argument
+      // pointed. Probed on a real page: `find` with the prefix inside the
+      // selector and no `frame` argument returned a bare
+      // "html > body > button", certified inside the iframe, and the
+      // follow-up click pressed "Delete account" in the main document. The
+      // same thing happened with `frame` set and the selector reaching one
+      // frame deeper than the prefix. So the frame is read back off a
+      // resolved element instead, and the prefix is rebuilt from THAT frame,
+      // which makes the emitted selector absolute from the main document and
+      // unambiguous (an ambiguous "iframe >> internal:control=enter-frame"
+      // silently takes the first iframe; the rebuilt prefix pins the index).
+      const searchRoot = frame ?? target.page.mainFrame();
+      const resolutionFrame = matched === 0 ? searchRoot : await locatorResolutionFrame(matches, searchRoot);
+      const resolvedFrame = frameIdOf(target.page, resolutionFrame);
+      // frameSelectorPrefix returns undefined when the owning iframe element
+      // could not be addressed (list_frames hits the same case, and reports
+      // it as selectorPrefixUnavailable rather than guessing). The most
+      // common cause is an iframe living inside a shadow root: the segment
+      // builder indexes it with document.getElementsByTagName, which does
+      // not pierce shadow roots. Falling back to '' here used to be silent:
+      // a selector meant to enter a frame came back with no prefix at all,
+      // and click then ran it against the MAIN document instead. When the
+      // prefix is unavailable no usable selector is emitted at all: see
+      // frameSelectorUnavailable below.
+      const framePrefix = await frameSelectorPrefix(target.page, resolutionFrame);
+      const frameSelectorUnavailable = framePrefix === undefined;
+      const prefix = framePrefix ?? '';
+      // The matches came from a different frame than the caller asked about,
+      // which is worth saying out loud: the caller's own selector took them
+      // there, and the selectors handed back are re-qualified from the main
+      // document rather than being the caller's prefix plus a path.
+      const crossedFrame = resolvedFrame !== (args.frame ?? 'main');
+
       const elements =
         matched === 0
           ? []
@@ -2032,25 +3334,35 @@ export const inspectTools = defineTools({
         return text({
           pageId: target.pageId,
           ...(args.frame !== undefined ? { frame: args.frame } : {}),
+          ...(resolvedFrame !== undefined ? { resolvedFrame } : {}),
           matched,
           returned: elements.length,
           frameSelectorUnavailable:
-            'the owning iframe element for this frame could not be read (often because it sits inside a shadow ' +
-            'root), so no selector can be built that reaches into it from outside. Every selector below is null ' +
-            'for that reason: do not substitute a bare or empty prefix, since that would resolve in the main ' +
-            'document instead of this frame and click would press whatever it happens to hit there. Use evaluate, ' +
-            'snapshot, computed_style or element_box with frame set to this id instead, which take a frame id ' +
-            'directly and need no prefix.',
+            `these elements resolved inside frame ${JSON.stringify(resolvedFrame ?? 'unknown')}, and the owning ` +
+            'iframe element for it could not be read (often because it sits inside a shadow root), so no selector ' +
+            'can be built that reaches into it from outside. Every selector below is null for that reason: do not ' +
+            'substitute a bare or empty prefix, since that would resolve in the main document instead of this ' +
+            'frame and click would press whatever it happens to hit there. Use evaluate, snapshot, computed_style ' +
+            'or element_box with frame set to this id instead, which take a frame id directly and need no prefix.',
           elements: elements.map(element => ({ ...element, selector: null, resolvesToTarget: false }))
         });
       }
 
       const unusable = elements.filter(element => !element.resolvesToTarget);
+      const crossedFrameNote = crossedFrame
+        ? `These elements resolved inside frame ${JSON.stringify(resolvedFrame ?? 'unknown')}, not ` +
+          `${JSON.stringify(args.frame ?? 'main')}: the selector you passed crossed a frame boundary of its own ` +
+          '(that is what ">> internal:control=enter-frame >>" does). Every selector below has been re-qualified ' +
+          'from the MAIN document to reach that frame, so hand them to click or fill as they are rather than ' +
+          'prefixing them again, which would try to enter a frame twice.'
+        : undefined;
       return text({
         pageId: target.pageId,
         ...(args.frame !== undefined ? { frame: args.frame } : {}),
+        ...(resolvedFrame !== undefined ? { resolvedFrame } : {}),
         matched,
         returned: elements.length,
+        ...(crossedFrameNote !== undefined ? { frameNote: crossedFrameNote } : {}),
         ...(unusable.length > 0
           ? {
               note:

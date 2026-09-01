@@ -35,6 +35,15 @@
  * reduction would give a different, prettier colour that nothing on an sRGB
  * screen actually shows. Every clipped conversion is flagged through
  * `outOfGamut` so a caller can tell the difference rather than guess.
+ *
+ * WHERE the clip happens matters as much as whether it happens. For a colour
+ * standing on its own, `r`, `g` and `b` carry the clipped value and that is
+ * the end of it. For a colour that is about to be composited over something
+ * else, clipping first gives the wrong pixel: Chromium clips the
+ * PREMULTIPLIED colour, because that is what its 8-bit sRGB paint surface can
+ * hold. `extended` keeps the unclipped channels for exactly that reason, and
+ * `paintedSrgb` applies the clip in the right place. The measurements behind
+ * that claim are on `paintedSrgb`.
  */
 
 export interface Rgba {
@@ -47,9 +56,16 @@ export interface Rgba {
 /**
  * A parsed colour in sRGB, with a flag saying whether reaching sRGB required
  * clipping a channel that fell outside the gamut.
+ *
+ * `r`, `g` and `b` are the CLIPPED channels: the colour on its own, as an
+ * sRGB screen shows it. `extended` is the same colour before clipping, in the
+ * same gamma-encoded 0-to-255 scale but free to fall outside it, and it is
+ * what anything compositing this colour must use. See `paintedSrgb` for why
+ * the difference changes the answer.
  */
 export interface ParsedCssColor extends Rgba {
   outOfGamut: boolean;
+  extended: { r: number; g: number; b: number };
 }
 
 const fullyTransparent: Rgba = { r: 0, g: 0, b: 0, a: 0 };
@@ -277,14 +293,7 @@ function clipToGamut(rgb: Vector3): { rgb: Vector3; outOfGamut: boolean } {
 
 function finish(linear: Vector3, alpha: number): ParsedCssColor {
   const encoded: Vector3 = [linearToSrgb(linear[0]), linearToSrgb(linear[1]), linearToSrgb(linear[2])];
-  const { rgb, outOfGamut } = clipToGamut(encoded);
-  return {
-    r: rgb[0] * 255,
-    g: rgb[1] * 255,
-    b: rgb[2] * 255,
-    a: Math.min(1, Math.max(0, alpha)),
-    outOfGamut
-  };
+  return finishEncoded(encoded, alpha);
 }
 
 /** Already gamma-encoded sRGB in 0 to 1, so only clipping and scaling are left. */
@@ -295,7 +304,8 @@ function finishEncoded(encoded: Vector3, alpha: number): ParsedCssColor {
     g: rgb[1] * 255,
     b: rgb[2] * 255,
     a: Math.min(1, Math.max(0, alpha)),
-    outOfGamut
+    outOfGamut,
+    extended: { r: encoded[0] * 255, g: encoded[1] * 255, b: encoded[2] * 255 }
   };
 }
 
@@ -397,7 +407,7 @@ function hslToEncodedSrgb(hueDegrees: number, saturation: number, lightness: num
  */
 export function parseCssColor(value: string): ParsedCssColor | null {
   const raw = value.trim().toLowerCase();
-  if (raw === 'transparent') return { ...fullyTransparent, outOfGamut: false };
+  if (raw === 'transparent') return { ...fullyTransparent, outOfGamut: false, extended: { r: 0, g: 0, b: 0 } };
 
   const match = /^([a-z-]+)\(([^()]*)\)$/.exec(raw);
   if (match === null) return null;
@@ -504,4 +514,44 @@ export function parseCssColor(value: string): ParsedCssColor | null {
     default:
       return null;
   }
+}
+
+/**
+ * The straight-alpha colour Chromium actually deposits when it paints this
+ * colour, which is what anything compositing it has to start from.
+ *
+ * This is not the same as the clipped colour, and the difference is not
+ * academic. Measured against painted pixels across 180 wide-gamut swatches
+ * over four backdrops, three models were compared:
+ *
+ *   - clip the colour to sRGB, then composite: exact over white, wrong by up
+ *     to 47 of 255 over black;
+ *   - composite in unclipped extended sRGB and clip the result: exact over
+ *     black, wrong by up to 66 of 255 over white;
+ *   - clip the PREMULTIPLIED colour, then composite: mean error 0.19 of 255,
+ *     worst 1, which is rounding.
+ *
+ * The third is what Chromium does, and the reason is mundane: it rasterises
+ * into an 8-bit premultiplied sRGB surface, so the value that cannot escape
+ * 0 to 1 is `channel * alpha`, not `channel`. A wide-gamut colour whose blue
+ * channel is negative loses that negativity before it ever meets the
+ * backdrop, while a red channel above 1 survives in proportion to its alpha
+ * and keeps pushing past the sRGB corner.
+ *
+ * Getting this wrong is what let a wide-gamut colour with alpha flip 44 of
+ * 588 WCAG threshold verdicts in an earlier sweep: not a rounding wobble, a
+ * pass reported as a failure and back again. Fully opaque colours are
+ * unaffected, since at alpha 1 clipping the premultiplied value and clipping
+ * the colour are the same operation, so nothing about ordinary sRGB pages
+ * changes.
+ */
+export function paintedSrgb(color: ParsedCssColor): Rgba {
+  if (color.a <= 0) return { r: 0, g: 0, b: 0, a: 0 };
+  const channel = (value: number): number => Math.min(255, Math.max(0, value * color.a)) / color.a;
+  return {
+    r: channel(color.extended.r),
+    g: channel(color.extended.g),
+    b: channel(color.extended.b),
+    a: color.a
+  };
 }

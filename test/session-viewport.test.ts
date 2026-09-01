@@ -78,8 +78,8 @@ test('concurrent sessions keep their own viewport and scale factor, with no stat
     const large = (largeResult.structuredContent as { sessionId: string }).sessionId;
 
     await Promise.all([
-      handlers.navigate({ sessionId: small, url: page.url }),
-      handlers.navigate({ sessionId: large, url: page.url })
+      handlers.navigate({ sessionId: small, url: page.url, settleMs: 0 }),
+      handlers.navigate({ sessionId: large, url: page.url, settleMs: 0 })
     ]);
 
     assert.deepEqual(await screenshotSize(small), { width: 320, height: 480 });
@@ -108,7 +108,7 @@ test('storageState seeding still works alongside the new options', async () => {
   try {
     const source = await handlers.create_session({});
     const sourceId = (source.structuredContent as { sessionId: string }).sessionId;
-    await handlers.navigate({ sessionId: sourceId, url: page.url });
+    await handlers.navigate({ sessionId: sourceId, url: page.url, settleMs: 0 });
     await handlers.evaluate({ sessionId: sourceId, expression: 'localStorage.setItem("seeded", "yes"), "ok"' });
 
     const exported = await handlers.export_state({ sessionId: sourceId });
@@ -120,7 +120,7 @@ test('storageState seeding still works alongside the new options', async () => {
       deviceScaleFactor: 2
     });
     const seededId = (seeded.structuredContent as { sessionId: string }).sessionId;
-    await handlers.navigate({ sessionId: seededId, url: page.url });
+    await handlers.navigate({ sessionId: seededId, url: page.url, settleMs: 0 });
 
     const value = await handlers.evaluate({ sessionId: seededId, expression: 'localStorage.getItem("seeded")' });
     assert.equal((value.structuredContent as { result: string }).result, 'yes');

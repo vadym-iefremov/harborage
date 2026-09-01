@@ -85,7 +85,16 @@ test('the values that used to be the whole problem now parse, and rgba still doe
   assert.deepEqual(rounded('oklab(0.374973 -0.00218269 -0.0273316 / 0.3)'), [58, 65, 80, 0.3]);
   assert.deepEqual(rounded('rgba(0, 0, 0, 0)'), [0, 0, 0, 0]);
   assert.deepEqual(rounded('rgb(18, 18, 18)'), [18, 18, 18, 1]);
-  assert.deepEqual(parseCssColor('transparent'), { r: 0, g: 0, b: 0, a: 0, outOfGamut: false });
+  // extended carries the same colour before gamut clipping, which anything
+  // compositing this has to use; for transparent it is trivially the same.
+  assert.deepEqual(parseCssColor('transparent'), {
+    r: 0,
+    g: 0,
+    b: 0,
+    a: 0,
+    outOfGamut: false,
+    extended: { r: 0, g: 0, b: 0 }
+  });
 });
 
 test('a colour outside sRGB is clipped per channel and says so', () => {

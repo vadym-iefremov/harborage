@@ -1,6 +1,12 @@
 import * as z from 'zod/v4';
 
 import { compileNetworkMatch } from '../../networkMatch.js';
+import {
+  documentChangedNote,
+  documentChangedPayload,
+  pendingNavigationPayload,
+  performNavigation
+} from '../navigation.js';
 import { defineTool, defineTools, text } from '../types.js';
 import { clear, pageId, sessionId } from './common.js';
 
@@ -126,18 +132,89 @@ export const sessionTools = defineTools({
 
   new_tab: defineTool({
     description:
-      'Open a new tab in an existing session, optionally navigating it to a URL. The new tab becomes the session\'s active tab, so later calls that omit pageId target it. Console, network and page-error buffering are wired up before the tab loads anything, exactly as for the session\'s first tab. Returns the new pageId. ' +
-      'If the URL cannot be reached, this is an error AND the session\'s active tab is left exactly as it was, so later calls that omit pageId are unaffected. It used to leave the active tab pointing at the blank tab it had just opened, which silently redirected everything after it to about:blank. The blank tab is left open rather than closed, since a navigation that timed out may still have loaded something worth looking at, and the error names its pageId so you can navigate it or close it.',
+      'Open a new tab in an existing session, optionally navigating it to a URL. The new tab becomes the session\'s active tab, so later calls that omit pageId target it. Console, network and page-error buffering are wired up before the tab loads anything, exactly as for the session\'s first tab. ' +
+      'When a url is given the navigation is measured exactly the way navigate measures its own, through the same code: the result carries "status" and "ok" for the document actually on screen, a "documentChanged" block when the page redirected itself after the response was measured, and a "pendingNavigation" when it was still moving or holds a meta refresh that has not fired. Opening a tab on a URL that answers 404, or on a shell that bounces to a login page, therefore cannot come back looking like an ordinary success, and the "url" returned is where the tab really ended up rather than where it was pointed. Without a url none of those fields appear, because nothing was fetched. Returns the new pageId either way. ' +
+      'If the URL cannot be reached at all, this is an error AND the session\'s active tab is left exactly as it was, so later calls that omit pageId are unaffected. It used to leave the active tab pointing at the blank tab it had just opened, which silently redirected everything after it to about:blank. The blank tab is left open rather than closed, since a navigation that got part way may still have loaded something worth looking at, and the error names its pageId so you can navigate it or close it. A navigation that merely TIMED OUT is not this case: that comes back as a normal result with "timedOut": true, and the new tab stays active, because the tab is real and the caller has its pageId.',
     inputSchema: z.object({
       sessionId,
       url: z
         .string()
         .optional()
-        .describe('URL to open the new tab at. Omit to get a blank tab you can navigate separately.')
+        .describe('URL to open the new tab at. Omit to get a blank tab you can navigate separately.'),
+      settleMs: z
+        .number()
+        .int()
+        .min(0)
+        .max(30_000)
+        .optional()
+        .describe(
+          'How long to keep watching for the page to move itself before measuring it, in milliseconds. Defaults to 500, and means exactly what it means on navigate: a real window, watched in full, because no page can signal that it will NOT navigate again. Set it to 0 for speed on a page you know is static, accepting that a redirect fired afterwards will then be missed and that "status" will describe the document as of the moment the response arrived. Ignored when no url is given, since nothing is fetched.'
+        ),
+      timeoutMs: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe(
+          'How long the navigation may take before this call gives up on it, in milliseconds. Defaults to 30000. Giving up is reported, with "timedOut": true and a "pendingNavigation", not thrown. Ignored when no url is given.'
+        )
     }),
     async handler(ctx, args) {
-      const opened = await ctx.sessions.newTab(args.sessionId, args.url);
-      return text(opened);
+      // The tab is opened blank and navigated here rather than inside the
+      // session store, so that the navigation goes through the SAME
+      // measurement navigate and reload use. It previously did its goto in
+      // the store and returned page.url() read immediately afterwards, which
+      // is the identical staleness those two were fixed for: a shell that
+      // bounces would report the address it was pointed at, not the one it
+      // landed on. Buffering is still wired before anything loads, because
+      // adoptPage happens first.
+      // Read BEFORE the tab is opened, because opening it makes it active.
+      // This is what gets put back if the navigation below throws: moving the
+      // goto out of the store to get the shared measurement also moved it out
+      // of the store's own guard against exactly that, so a new_tab to an
+      // unreachable URL went back to leaving the session pointed at a blank
+      // tab the caller never received an id for. performNavigation reports a
+      // TIMEOUT rather than throwing, so only a real failure (a refused
+      // connection, an unresolvable host, a blocked port) lands here.
+      const previousActive = ctx.sessions.getActivePageId(args.sessionId);
+      const opened = await ctx.sessions.newTab(args.sessionId);
+      if (args.url === undefined) return text(opened);
+
+      const target = ctx.sessions.resolve(args.sessionId, opened.pageId);
+      let outcome;
+      try {
+        outcome = await performNavigation(
+          target.page,
+          timeout => target.page.goto(args.url as string, { timeout }),
+          { settleMs: args.settleMs, timeoutMs: args.timeoutMs }
+        );
+      } catch (err) {
+        ctx.sessions.restoreActivePage(args.sessionId, previousActive);
+        const message = err instanceof Error ? err.message : String(err);
+        throw new Error(
+          `new_tab opened tab "${opened.pageId}" but could not navigate it to ${args.url}: ${message}. The ` +
+            `session's active tab is unchanged (still "${ctx.sessions.getActivePageId(args.sessionId)}"), so calls ` +
+            `that omit pageId are not affected. Tab "${opened.pageId}" is open and blank: navigate it with the ` +
+            'navigate tool, or close it with close_tab.'
+        );
+      }
+
+      const notes: string[] = [];
+      if (outcome.documentChanged) notes.push(documentChangedNote(outcome, 'navigation'));
+      if (outcome.pending) notes.push(`This answer may already be out of date: ${outcome.pending.reason}.`);
+
+      return text({
+        pageId: opened.pageId,
+        url: outcome.settled.url,
+        title: outcome.settled.title,
+        status: outcome.status,
+        ok: outcome.ok,
+        ...(outcome.timedOut ? { timedOut: true } : {}),
+        ...(outcome.blocked ? { blocked: true } : {}),
+        ...documentChangedPayload(outcome),
+        ...pendingNavigationPayload(outcome.pending),
+        ...(notes.length ? { note: notes.join(' ') } : {})
+      });
     }
   }),
 

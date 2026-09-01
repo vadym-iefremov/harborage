@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { BrowserContext, BrowserContextOptions, Dialog, Page, Request as PlaywrightRequest } from 'playwright';
+import type { BrowserContext, BrowserContextOptions, Dialog, Page, Request } from 'playwright';
 
 import { noopLogger, type Logger } from '../shared/logger.js';
 import type { BrowserManager } from './browserManager.js';
@@ -38,7 +38,7 @@ export interface NetworkEntry {
   statusText?: string;
   timestamp: number;
   /**
-   * Set on a REQUEST entry whose own response the capture filter turned away.
+   * Set on a REQUEST entry whose response the capture filter turned away.
    *
    * Without it, two opposite outcomes are byte-identical: a request the
    * server never answered, and a request that was answered while the
@@ -156,6 +156,15 @@ const defaultBufferLimits: BufferLimits = { console: 200, network: 200, dialog: 
 const maxWebSocketsPerSession = 50;
 
 /**
+ * How many requests may be waiting for Playwright to name their frame at
+ * once. In practice this is one per tab being opened, and only for the
+ * moment between the browser starting a tab's top-level document request and
+ * attaching the frame that owns it. The cap exists so a request that never
+ * ends cannot hold an entry forever.
+ */
+const maxPendingNetworkAttribution = 50;
+
+/**
  * Name of the page-side function the unhandled-rejection hook calls back
  * through. Deliberately unlikely to collide with anything a real page
  * defines, since it is a global this tool adds to every page it drives.
@@ -262,16 +271,44 @@ export interface WebSocketRead {
   droppedOpenInSession: number;
 }
 
-/** Adds one to a per-tab tally, creating the entry on first use. */
-function bumpByPage(counts: Map<string, number>, pageId: string): void {
-  counts.set(pageId, (counts.get(pageId) ?? 0) + 1);
-}
-
 /** Session-wide total of a per-tab tally. */
 function totalOf(counts: Map<string, number>): number {
   let total = 0;
   for (const count of counts.values()) total += count;
   return total;
+}
+
+/** Adds one to a per-tab tally, creating the entry on first use. */
+function bumpByPage(counts: Map<string, number>, pageId: string): void {
+  counts.set(pageId, (counts.get(pageId) ?? 0) + 1);
+}
+
+/**
+ * The tab a context-wide network event belongs to.
+ *
+ * `request.frame()` THROWS rather than returning null when Playwright cannot
+ * name a frame, so the guard has to be a try, not a null check, and the two
+ * reasons it throws need opposite handling:
+ *
+ * - A request a service worker made on nobody's behalf has no tab and never
+ *   will. There is nowhere to file it, since every read on the network ring
+ *   is scoped by pageId, and the per-page listeners this replaced never saw
+ *   them either. Reported as 'none'.
+ * - A tab's OWN top-level document request is announced before the frame
+ *   that will own it is attached, so the frame is merely not available YET.
+ *   For a popup that is the first and most important thing the tab ever
+ *   fetches, and dropping it leaves a caller unable to tell a popup that
+ *   loaded the wrong URL from one that loaded nothing. Reported as
+ *   'not-yet', and attributed later: see `parkUnattributed`.
+ */
+type RequestOwner = { kind: 'page'; page: Page } | { kind: 'none' } | { kind: 'not-yet' };
+
+function ownerOfRequest(request: Request): RequestOwner {
+  try {
+    return { kind: 'page', page: request.frame().page() };
+  } catch {
+    return request.serviceWorker() !== null ? { kind: 'none' } : { kind: 'not-yet' };
+  }
 }
 
 interface SessionRecord {
@@ -335,18 +372,39 @@ interface SessionRecord {
   /** The same exclusions attributed per tab, for the same reason `droppedByPage` exists. */
   networkFilteredOutByPage: Map<string, number>;
   /**
+   * Network entries built but not yet filed, because Playwright could not
+   * name the frame they belong to at the moment it announced them.
+   *
+   * Only a tab's own top-level document request lands here, and only for the
+   * moment between the browser starting that request and the frame that owns
+   * it being attached. `requestfinished` and `requestfailed` both resolve the
+   * frame, so the entry is filed from there under the tab it really belongs
+   * to, carrying the timestamp it was created with rather than the later one.
+   * Held per Request, so a request that never completes cannot strand an
+   * entry under a guessed tab.
+   */
+  pendingNetworkByRequest: Map<Request, NetworkEntry[]>;
+  /**
    * The buffered request entry each Playwright `Request` produced, for the
    * requests that actually made it into the ring.
    *
    * This is the handle that identifies one exchange. A URL does not: two
    * calls to the same URL are indistinguishable by it, and pairing on it
-   * marked the wrong request (see `NetworkEntry.responseFilteredOut`). A
-   * WeakMap rather than a Map because Playwright's Request objects outlive
-   * nothing here: once Playwright drops one, the entry it pointed at is
-   * either still in the ring and already flagged or long evicted, and either
-   * way there is nothing left to pair.
+   * marked the wrong request (see `NetworkEntry.responseFilteredOut`).
    */
-  networkEntryByRequest: WeakMap<PlaywrightRequest, NetworkEntry>;
+  networkEntryByRequest: WeakMap<Request, NetworkEntry>;
+  /**
+   * Requests whose response the capture filter turned away BEFORE their own
+   * request entry had been filed.
+   *
+   * That ordering is real here rather than theoretical: an entry whose owning
+   * frame Playwright has not attached yet is parked and only filed once the
+   * request ends, so its response can be excluded while the request itself is
+   * still waiting to be attributed to a tab. Remembering the exclusion
+   * against the Request means the flag still lands when the parked entry is
+   * finally filed, instead of the entry appearing later looking unanswered.
+   */
+  responseFilteredRequests: WeakSet<Request>;
   /** WebSocket connections this session's tabs have opened, oldest first. */
   websockets: BoundedBuffer<WebSocketEntry>;
   /**
@@ -462,46 +520,91 @@ export class SessionStore {
   }
 
   /**
-   * Wires up console/network buffering for one page. Called for the initial
-   * page at session creation and again for every tab the page itself opens
-   * (`window.open`, `target="_blank"`), so a subagent that never calls
-   * `list_tabs` first still gets buffered activity for tabs it didn't
-   * explicitly create.
+   * Wires up console / network / dialog / page-error buffering for a whole
+   * BrowserContext, once, before its first page exists.
+   *
+   * These listeners used to live on each Page, attached from
+   * `context.on('page')`. That lost a popup's opening console.log outright,
+   * roughly one full-suite run in eight, and the mechanism is worth writing
+   * down because it is not the obvious one. Playwright only sends a page's
+   * console / dialog / request / response events over the wire if the client
+   * has SUBSCRIBED to them, and `page.on('console')` requests that
+   * subscription with a fire-and-forget `Page.updateSubscription` call. Until
+   * that round trip completes, Playwright's own dispatcher drops the event on
+   * its side. So the message is not delivered late, it is never sent, and no
+   * deadline on the reading end can recover it. Measured directly: on a
+   * popup whose inline script runs `console.log(...)` and then `fetch(...)`,
+   * the fetch was captured and attributed correctly while the console.log
+   * one statement earlier was absent from the session-wide buffer entirely.
+   *
+   * A BrowserContext subscription has no such window here, because this runs
+   * at create_session, before any page exists. Playwright checks the
+   * context's subscription first and dispatches on that alone, and it
+   * replays a page's buffered console messages and page errors to the
+   * context the moment that page is initialised. Every tab a session ever
+   * gets, including one the page opened itself, is therefore covered from
+   * its first line of script.
+   *
+   * Each event is attributed by asking `adoptPage` for the id of the page it
+   * came from, which mints one if this is the first the session has heard of
+   * that tab. Adoption stays idempotent, so an event that beats
+   * `context.on('page')` is filed under the same id that event will report.
    */
-  private attachBuffers(record: SessionRecord, page: Page, pageId: string): void {
-    page.on('console', msg => {
+  private attachContextBuffers(record: SessionRecord, context: BrowserContext): void {
+    context.on('console', msg => {
+      const page = msg.page();
+      // A console message from a service worker belongs to no tab. Every
+      // read on this buffer is scoped by pageId, so there is nowhere to file
+      // it, and the page-level listener this replaced never saw them either.
+      if (!page) return;
+      const pageId = this.pageIdFor(record, page);
+      if (pageId === undefined) return;
       pushBounded(
         record.consoleBuffer,
         { pageId, type: msg.type(), text: msg.text(), timestamp: Date.now() },
         this.bufferLimits.console
       );
     });
-    page.on('request', req => {
-      const entry: NetworkEntry = {
-        pageId,
+
+    context.on('request', req => {
+      this.fileNetworkEntry(record, req, {
         direction: 'request',
         url: req.url(),
         method: req.method(),
         resourceType: req.resourceType(),
         timestamp: Date.now()
-      };
-      if (record.networkCaptureFilter !== undefined && !matchesNetworkEntry(entry, record.networkCaptureFilter)) {
-        record.networkFilteredOut += 1;
-        return;
-      }
-      pushBounded(record.networkBuffer, entry, this.bufferLimits.network);
-      // Only for entries that really reached the ring. A request the filter
-      // turned away has no entry to flag later, and remembering it would be
-      // how a filtered response ends up marking something that is not there.
-      record.networkEntryByRequest.set(req, entry);
+      });
     });
+
+    context.on('response', res => {
+      this.fileNetworkEntry(record, res.request(), {
+        direction: 'response',
+        url: res.url(),
+        status: res.status(),
+        statusText: res.statusText(),
+        timestamp: Date.now()
+      });
+    });
+
+    // The two ways a request ends, and the first moment Playwright can name
+    // the frame behind a tab's own top-level document request. Anything
+    // parked for that request is filed here, under the tab it turned out to
+    // belong to.
+    context.on('requestfinished', req => this.flushParked(record, req));
+    context.on('requestfailed', req => this.flushParked(record, req));
+
     // Registering ANY dialog listener switches Playwright's own auto-dismiss
     // off, which makes this handler the only thing that can ever unblock a
     // page showing a modal. Verified directly against real Chromium: with a
     // listener that does not resolve the dialog, the triggering click and
     // every later call on that tab hang forever. So this handler resolves
     // the dialog on every path it can take, and decides afterwards.
-    page.on('dialog', dialog => {
+    //
+    // On the context rather than the page for the subscription reason above,
+    // which mattered more here than anywhere else: a dialog raised inside
+    // that window was auto-dismissed by Playwright AND never buffered, so a
+    // handle_dialog policy the caller had already set silently did not run.
+    context.on('dialog', dialog => {
       let action: DialogAction = 'dismiss';
       let promptText: string | undefined;
       try {
@@ -511,19 +614,26 @@ export class SessionStore {
           promptText = policy.promptText;
           if (policy.appliesTo === 'next') record.dialogPolicy = undefined;
         }
-        pushBounded(
-          record.dialogBuffer,
-          {
-            pageId,
-            type: dialog.type(),
-            message: dialog.message(),
-            defaultValue: dialog.defaultValue(),
-            action,
-            promptText,
-            timestamp: Date.now()
-          },
-          this.bufferLimits.dialog
-        );
+        const page = dialog.page();
+        // A dialog with no page cannot be filed under a tab, but it still
+        // has to be resolved or whatever raised it stays wedged, which is
+        // what the unconditional resolve below is for.
+        const pageId = page ? this.pageIdFor(record, page) : undefined;
+        if (pageId !== undefined) {
+          pushBounded(
+            record.dialogBuffer,
+            {
+              pageId,
+              type: dialog.type(),
+              message: dialog.message(),
+              defaultValue: dialog.defaultValue(),
+              action,
+              promptText,
+              timestamp: Date.now()
+            },
+            this.bufferLimits.dialog
+          );
+        }
       } catch {
         // Swallowed on purpose. Bookkeeping failing is a lost log line;
         // leaving the modal open is a wedged tab, so the resolve below runs
@@ -532,10 +642,16 @@ export class SessionStore {
       void this.resolveDialog(dialog, action, promptText);
     });
 
-    // Uncaught exceptions. Unhandled rejections come in through the init
-    // script instead, which marks them handled so they do not also surface
-    // here as a duplicate.
-    page.on('pageerror', err => {
+    // Uncaught exceptions. `weberror` is the context-wide form of a page's
+    // `pageerror`, carrying the page it came from. Unhandled rejections come
+    // in through the init script instead, which marks them handled so they
+    // do not also surface here as a duplicate.
+    context.on('weberror', webError => {
+      const page = webError.page();
+      if (!page) return;
+      const pageId = this.pageIdFor(record, page);
+      if (pageId === undefined) return;
+      const err = webError.error();
       const stack = typeof err.stack === 'string' && err.stack.trim() !== '' ? err.stack : undefined;
       pushBounded(
         record.pageErrorBuffer,
@@ -550,77 +666,79 @@ export class SessionStore {
         this.bufferLimits.pageError
       );
     });
-
-    page.on('response', res => {
-      const entry: NetworkEntry = {
-        pageId,
-        direction: 'response',
-        url: res.url(),
-        status: res.status(),
-        statusText: res.statusText(),
-        timestamp: Date.now()
-      };
-      if (record.networkCaptureFilter !== undefined && !matchesNetworkEntry(entry, record.networkCaptureFilter)) {
-        record.networkFilteredOut += 1;
-        bumpByPage(record.networkFilteredOutByPage, pageId);
-        // The request half may still be sitting in the ring, and if it is, it
-        // now looks exactly like a request nobody ever answered. Those mean
-        // opposite things to a caller (a hung endpoint versus their own
-        // filter doing its job), so THAT EXACT request entry is marked.
-        this.markResponseFiltered(record, res.request());
-        return;
-      }
-      pushBounded(record.networkBuffer, entry, this.bufferLimits.network);
-    });
-
-    // WebSockets do not pass through page.on('request'/'response') at all, so
-    // before this a caller debugging a realtime app read an empty request
-    // list and concluded nothing was happening. Lifecycle and frame counts
-    // only: see WebSocketEntry for why not the frames themselves.
-    page.on('websocket', ws => {
-      const entry: WebSocketEntry = {
-        pageId,
-        url: ws.url(),
-        openedAt: Date.now(),
-        framesSent: 0,
-        framesReceived: 0
-      };
-      this.pushWebSocket(record, entry);
-      ws.on('framesent', () => {
-        entry.framesSent += 1;
-      });
-      ws.on('framereceived', () => {
-        entry.framesReceived += 1;
-      });
-      ws.on('socketerror', err => {
-        entry.error = String(err);
-      });
-      ws.on('close', () => {
-        entry.closedAt = Date.now();
-      });
-    });
   }
 
   /**
-   * Flags the buffered request entry belonging to one filtered-out response,
-   * if that request was buffered at all.
+   * Files one network entry under the tab it belongs to, or parks it until
+   * that tab can be named.
    *
-   * Keyed on Playwright's own `Request` object, which is the same instance
-   * `page.on('request')` was handed and `response.request()` gives back, so
-   * it names one exchange exactly. Two consequences worth stating, because
-   * the URL-matching version this replaced got both wrong: repeated calls to
-   * one URL are flagged individually and in the right order however the
-   * server interleaves its answers, and a response whose request the filter
-   * ALSO excluded flags nothing, rather than borrowing an unrelated entry
-   * that has its own response sitting in the ring.
-   *
-   * Marking an entry that has since been evicted or cleared is harmless and
-   * deliberately not guarded against: it is unreachable, so nothing reads it.
+   * Everything the capture filter does happens here rather than at the two
+   * call sites, so a parked entry is filtered on exactly the same terms as a
+   * filed one, and both halves of an exchange count against the same per-tab
+   * tally.
    */
-  private markResponseFiltered(record: SessionRecord, request: PlaywrightRequest): void {
-    const entry = record.networkEntryByRequest.get(request);
-    if (entry === undefined) return;
-    entry.responseFilteredOut = true;
+  private fileNetworkEntry(
+    record: SessionRecord,
+    request: Request,
+    partial: Omit<NetworkEntry, 'pageId'>
+  ): void {
+    const owner = ownerOfRequest(request);
+    if (owner.kind === 'none') return;
+    if (owner.kind === 'not-yet') {
+      this.parkUnattributed(record, request, partial);
+      return;
+    }
+    const pageId = this.pageIdFor(record, owner.page);
+    if (pageId === undefined) return;
+    this.pushNetworkEntry(record, request, { ...partial, pageId });
+  }
+
+  /**
+   * Holds an entry whose owning frame Playwright has not attached yet.
+   *
+   * Bounded, because a request that never finishes never comes back to claim
+   * its entry. Overflow is counted as a session-wide drop rather than thrown
+   * away quietly: a caller reading a short list needs to be able to tell it
+   * is short. It has no per-tab count for the same reason it is here at all,
+   * which is that nothing yet knows which tab it belongs to.
+   */
+  private parkUnattributed(record: SessionRecord, request: Request, partial: Omit<NetworkEntry, 'pageId'>): void {
+    const held = record.pendingNetworkByRequest.get(request);
+    if (held) {
+      held.push({ ...partial, pageId: '' });
+      return;
+    }
+    if (record.pendingNetworkByRequest.size >= maxPendingNetworkAttribution) {
+      const oldest = record.pendingNetworkByRequest.keys().next();
+      if (!oldest.done) {
+        record.networkBuffer.dropped += record.pendingNetworkByRequest.get(oldest.value)?.length ?? 0;
+        record.pendingNetworkByRequest.delete(oldest.value);
+      }
+    }
+    record.pendingNetworkByRequest.set(request, [{ ...partial, pageId: '' }]);
+  }
+
+  /**
+   * Files everything parked for one request, now that the request has ended
+   * and Playwright can finally name its frame.
+   *
+   * If it still cannot, the entries are dropped and counted, because a row
+   * filed under a guessed tab is worse than a row that is visibly missing.
+   */
+  private flushParked(record: SessionRecord, request: Request): void {
+    const held = record.pendingNetworkByRequest.get(request);
+    if (!held) return;
+    record.pendingNetworkByRequest.delete(request);
+
+    const owner = ownerOfRequest(request);
+    const pageId = owner.kind === 'page' ? this.pageIdFor(record, owner.page) : undefined;
+    if (pageId === undefined) {
+      record.networkBuffer.dropped += held.length;
+      return;
+    }
+    for (const entry of held) {
+      this.pushNetworkEntry(record, request, { ...entry, pageId });
+    }
   }
 
   /**
@@ -653,6 +771,105 @@ export class SessionStore {
       buffer.dropped += 1;
       bumpByPage(buffer.droppedByPage, lost!.pageId);
     }
+  }
+
+  /**
+   * Applies the capture filter, then rings the entry or counts the exclusion.
+   *
+   * Takes the Playwright `Request` the entry came from, because that object,
+   * and not the URL, is what identifies one exchange. Two calls to the same
+   * URL are indistinguishable by URL, and pairing on it marked the wrong
+   * request: see `NetworkEntry.responseFilteredOut` for the measured failure.
+   */
+  private pushNetworkEntry(record: SessionRecord, request: Request, entry: NetworkEntry): void {
+    if (record.networkCaptureFilter === undefined || matchesNetworkEntry(entry, record.networkCaptureFilter)) {
+      if (entry.direction === 'request') {
+        // Only for entries that really reach the ring. A request the filter
+        // turned away has no entry to flag later, and remembering it is how a
+        // filtered response ends up marking something that is not there.
+        record.networkEntryByRequest.set(request, entry);
+        // Its response may already have been excluded, if this entry was
+        // parked waiting to learn its tab. Carry the verdict across rather
+        // than filing an entry that looks unanswered.
+        if (record.responseFilteredRequests.has(request)) entry.responseFilteredOut = true;
+      }
+      pushBounded(record.networkBuffer, entry, this.bufferLimits.network);
+      return;
+    }
+    record.networkFilteredOut += 1;
+    // Counted per tab for BOTH directions. Bumping this only for responses
+    // made a scoped list_network_requests report a filteredAtCapture that
+    // counted the tab's filtered-out responses and none of its filtered-out
+    // requests, so a caller reading one tab saw about half the exclusions its
+    // own filter had actually made, with nothing to say the number was short.
+    bumpByPage(record.networkFilteredOutByPage, entry.pageId);
+    if (entry.direction !== 'response') return;
+
+    // The request half may still be sitting in the ring, and if it is, it now
+    // looks exactly like a request nobody ever answered. Those mean opposite
+    // things to a caller (a hung endpoint versus their own filter doing its
+    // job), so THAT EXACT request entry is marked.
+    this.markResponseFiltered(record, request);
+  }
+
+  /**
+   * Records that one request's response was excluded, and flags its request
+   * entry if that entry exists yet.
+   *
+   * Keyed on Playwright's own `Request` object, which is the same instance
+   * the request event carried and `response.request()` gives back, so it
+   * names one exchange exactly. Two consequences the URL-matching version
+   * this replaced got wrong: repeated calls to one URL are flagged
+   * individually and in the right order however the server interleaves its
+   * answers, and a response whose request the filter ALSO excluded flags
+   * nothing rather than borrowing an unrelated entry that has its own
+   * response sitting in the ring.
+   *
+   * Marking an entry that has since been evicted or cleared is harmless and
+   * deliberately not guarded against: it is unreachable, so nothing reads it.
+   */
+  private markResponseFiltered(record: SessionRecord, request: Request): void {
+    record.responseFilteredRequests.add(request);
+    const entry = record.networkEntryByRequest.get(request);
+    if (entry !== undefined) entry.responseFilteredOut = true;
+  }
+
+  /**
+   * The one buffer with no context-wide channel to move to.
+   *
+   * Playwright exposes `websocket` on Page only, so this stays per-page and
+   * is attached from `adoptPage`. It was never exposed to the loss window
+   * the others were: Playwright dispatches a page's websocket events
+   * unconditionally rather than gating them on a client subscription, so
+   * there is no round trip for the page's own script to beat.
+   */
+  private attachPageBuffers(record: SessionRecord, page: Page, pageId: string): void {
+    // WebSockets do not pass through the request/response channels at all, so
+    // before this a caller debugging a realtime app read an empty request
+    // list and concluded nothing was happening. Lifecycle and frame counts
+    // only: see WebSocketEntry for why not the frames themselves.
+    page.on('websocket', ws => {
+      const entry: WebSocketEntry = {
+        pageId,
+        url: ws.url(),
+        openedAt: Date.now(),
+        framesSent: 0,
+        framesReceived: 0
+      };
+      this.pushWebSocket(record, entry);
+      ws.on('framesent', () => {
+        entry.framesSent += 1;
+      });
+      ws.on('framereceived', () => {
+        entry.framesReceived += 1;
+      });
+      ws.on('socketerror', err => {
+        entry.error = String(err);
+      });
+      ws.on('close', () => {
+        entry.closedAt = Date.now();
+      });
+    });
   }
 
   /**
@@ -690,10 +907,14 @@ export class SessionStore {
   private async installRejectionHook(record: SessionRecord, context: BrowserContext): Promise<void> {
     await context.exposeBinding(rejectionBindingName, (source, payload) => {
       const entry = payload as Omit<PageErrorEntry, 'pageId' | 'type' | 'timestamp'>;
+      // Same close-aware lookup the other buffers use: a rejection reported
+      // as its tab tears down must not resurrect that tab in list_tabs.
+      const pageId = this.pageIdFor(record, source.page);
+      if (pageId === undefined) return;
       pushBounded(
         record.pageErrorBuffer,
         {
-          pageId: this.adoptPage(record, source.page),
+          pageId,
           type: 'unhandled-rejection',
           valueType: entry.valueType,
           message: entry.message,
@@ -765,6 +986,27 @@ export class SessionStore {
    * than minting a second one is what stops `new_tab` from reporting a tab id
    * that no longer matches the one `list_tabs` shows.
    */
+  /**
+   * The id a buffered event should be filed under, or undefined when there is
+   * no tab to file it under any more.
+   *
+   * The buffer handlers use this rather than `adoptPage` directly, because
+   * they can run for a page the session has already lost. A tab's id is
+   * retired when the tab closes, and an event that arrives after that (a
+   * request failing as the tab goes away is the ordinary case) would
+   * otherwise mint a SECOND id for a tab that no longer exists and put it
+   * back in `list_tabs`, where nothing would ever remove it again. Adopting
+   * is still right for a page that is merely new: that is what lets an event
+   * which beats `context.on('page')` be filed under the id that event will
+   * go on to report.
+   */
+  private pageIdFor(record: SessionRecord, page: Page): string | undefined {
+    for (const [existingId, existing] of record.pages) {
+      if (existing === page) return existingId;
+    }
+    return page.isClosed() ? undefined : this.adoptPage(record, page);
+  }
+
   private adoptPage(record: SessionRecord, page: Page, preferredId?: string): string {
     for (const [existingId, existing] of record.pages) {
       if (existing === page) return existingId;
@@ -772,7 +1014,7 @@ export class SessionStore {
 
     const id = preferredId ?? String(record.nextPageSeq++);
     record.pages.set(id, page);
-    this.attachBuffers(record, page, id);
+    this.attachPageBuffers(record, page, id);
     page.on('close', () => {
       record.pages.delete(id);
     });
@@ -868,7 +1110,9 @@ export class SessionStore {
       networkCaptureFilter,
       networkFilteredOut: 0,
       networkFilteredOutByPage: new Map(),
+      pendingNetworkByRequest: new Map(),
       networkEntryByRequest: new WeakMap(),
+      responseFilteredRequests: new WeakSet(),
       websockets: newBoundedBuffer(),
       websocketsDroppedOpenByPage: new Map()
     };
@@ -881,10 +1125,13 @@ export class SessionStore {
       record.activePageId = this.adoptPage(record, newPage);
     });
 
-    // Both of these happen before the first page exists, which is the whole
-    // point: buffering that starts at create_session is what lets a caller
-    // read back what a page did while loading, rather than only what it did
-    // after somebody thought to look.
+    // All three of these happen before the first page exists, which is the
+    // whole point: buffering that starts at create_session is what lets a
+    // caller read back what a page did while loading, rather than only what
+    // it did after somebody thought to look. For the context-wide buffers it
+    // is also what closes the subscription race described on
+    // attachContextBuffers, which silently lost a popup's first console line.
+    this.attachContextBuffers(record, context);
     await this.installRejectionHook(record, context);
     const page = await context.newPage();
 
@@ -935,6 +1182,17 @@ export class SessionStore {
     if (pageId === undefined || record.pages.has(pageId)) return;
     if (/^\d+$/.test(pageId) && Number(pageId) < record.nextPageSeq) return;
     throw new PageNotFoundError(record.id, pageId);
+  }
+
+  /**
+   * Which tab a call omitting pageId will currently target.
+   *
+   * Public because a tool that opens a tab and then navigates it OUTSIDE the
+   * store has to be able to put this back when its navigation fails. See
+   * `newTab` for why that matters and how it was reintroduced once already.
+   */
+  getActivePageId(sessionId: string): string {
+    return this.getRecord(sessionId).activePageId;
   }
 
   /**
@@ -999,7 +1257,14 @@ export class SessionStore {
         // path. The tab is left OPEN rather than closed, because a goto that
         // timed out may have loaded something worth looking at, and it is
         // named here so it can be reached instead of merely existing.
-        if (record.pages.has(previousActive)) record.activePageId = previousActive;
+        //
+        // The new_tab TOOL no longer takes this path: it opens the tab here
+        // with no url and navigates it itself, so the measurement is the same
+        // one navigate and reload use. That move reintroduced this exact
+        // defect at the tool, which is why the same guard now also lives in
+        // the handler. Anything that opens a tab and then navigates it needs
+        // it; this copy covers every direct caller of the store.
+        this.restoreActivePage(record, previousActive);
         const message = err instanceof Error ? err.message : String(err);
         throw new Error(
           `new_tab opened tab "${pageId}" but could not navigate it to ${url}: ${message}. The session's active ` +
@@ -1010,6 +1275,20 @@ export class SessionStore {
     }
     this.logger.log('tab.open', { sessionId, pageId, tabs: record.pages.size });
     return { pageId, url: page.url() };
+  }
+
+  /**
+   * Puts the active tab back after an operation that speculatively moved it
+   * failed, provided that tab is still open.
+   *
+   * Guarded rather than assigned blindly: the previous tab can have closed
+   * itself (window.close) while the navigation was running, and pointing the
+   * session at an id `resolve` would then reject is worse than leaving it on
+   * the new tab, which at least exists.
+   */
+  restoreActivePage(sessionId: string | SessionRecord, previousActive: string): void {
+    const record = typeof sessionId === 'string' ? this.getRecord(sessionId) : sessionId;
+    if (record.pages.has(previousActive)) record.activePageId = previousActive;
   }
 
   /**

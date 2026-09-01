@@ -1,9 +1,23 @@
 import { existsSync } from 'node:fs';
 import { basename, isAbsolute } from 'node:path';
 
-import type { Locator, Page } from 'playwright';
+import type { ElementHandle, Frame, Locator, Page, Response } from 'playwright';
 import * as z from 'zod/v4';
 
+import {
+  documentChangedNote,
+  documentChangedPayload,
+  isAbortedError,
+  isTimeoutError,
+  NAVIGATION_SETTLE_MS,
+  NAVIGATION_TIMEOUT_MS,
+  type PageSnapshot,
+  type PendingNavigation,
+  pendingNavigationPayload,
+  performNavigation,
+  settleAfterNavigation,
+  watchNavigationActivity
+} from '../navigation.js';
 import { defineTool, defineTools, text, type ToolContext, type ToolResult } from '../types.js';
 import { pageId, sessionId } from './common.js';
 
@@ -85,34 +99,169 @@ interface ShadowDrillElement extends PageElement {
   // here only ever read .host off the result, and both a Document and a
   // ShadowRoot structurally satisfy "optionally has a host".
   getRootNode(): { host?: ShadowDrillElement };
+  // The three members the flattened-tree walk in hitTestPointerPoint climbs
+  // by. assignedSlot is what makes slotted content work: a light-DOM node
+  // distributed into a <slot> is PAINTED inside the shadow tree, so its
+  // flattened parent is that slot, while its DOM parentNode stays the host.
+  // Walking parentNode alone skips every element of the shadow tree that
+  // wraps it, which is the half of Cause B that contains() can never see.
+  assignedSlot?: FlatNode | null;
+  parentNode?: FlatNode | null;
+  nodeType?: number;
 }
+
+/**
+ * One step of the flattened tree: an element, a ShadowRoot, or the Document.
+ *
+ * Deliberately not an element type, because the walk genuinely passes through
+ * nodes that are not elements. A ShadowRoot reports nodeType 11 and carries a
+ * host to step out through; a Document reports 9 and carries neither, which is
+ * where the walk stops.
+ */
+interface FlatNode {
+  nodeType?: number;
+  host?: FlatNode | null;
+  assignedSlot?: FlatNode | null;
+  parentNode?: FlatNode | null;
+}
+/**
+ * PageElement widened with what a DOM walk needs to go UP, DOWN and across a
+ * shadow boundary, plus the one member that answers "is this an editing host".
+ *
+ * Kept off PageElement itself for the reason ShadowDrillElement's comment
+ * gives at length: getRootNode()'s declared return type here has no property
+ * in common with the real Node a live getRootNode() returns, TypeScript's
+ * weak type check rejects that pairing outright, and the one time such a
+ * member was added to PageElement directly it broke every OTHER
+ * locator.evaluate callback in this file rather than just the walking ones.
+ * So this type is only ever reached through a cast INSIDE a callback, never
+ * as a callback's own `el` parameter.
+ */
+interface TreeWalkElement extends PageElement {
+  // True on the element itself AND on anything inside an editing host, which
+  // is exactly the question "can a keystroke put text here" wants answered.
+  isContentEditable?: boolean;
+  children?: ArrayLike<TreeWalkElement>;
+  parentElement?: TreeWalkElement | null;
+  // The whole-subtree marker search runs through the native querySelector
+  // rather than a hand-rolled walk: it is one call into the engine instead of
+  // thousands of round trips through this interface, and it cannot miss a
+  // level the way a budgeted walk can.
+  querySelector?(selectors: string): TreeWalkElement | null;
+  // Present on a form control. A readonly or disabled one accepts no write at
+  // all, and Playwright waits for it to become editable rather than saying so.
+  readOnly?: boolean;
+  disabled?: boolean;
+  // Present on a text-holding input or textarea: how a selection is scoped to
+  // that control's own value, which is the form-control half of what a Range
+  // does for a contenteditable.
+  setSelectionRange?(start: number, end: number): void;
+  // Present (possibly null, for a closed root) only on a shadow host.
+  // activeElement is the half that matters most here: document.activeElement
+  // retargets to the host, so the element that really holds the caret inside
+  // an open shadow root is only reachable by descending this.
+  shadowRoot?: {
+    activeElement?: TreeWalkElement | null;
+    children?: ArrayLike<TreeWalkElement>;
+    querySelector?(selectors: string): TreeWalkElement | null;
+  } | null;
+  // Real signature returns Node; callers here only ever read .host off it,
+  // and both a Document and a ShadowRoot satisfy "optionally has a host".
+  getRootNode(): { host?: TreeWalkElement };
+}
+/**
+ * Only the two members the settle snapshot reads. timeOrigin identifies a
+ * document (two documents loaded microseconds apart still differ), and the
+ * navigation entry is the document's OWN record of the request that produced
+ * it, which is the only place a status can be read from the document rather
+ * than inferred about it.
+ */
+declare const performance: {
+  timeOrigin: number;
+  getEntriesByType(type: string): { name?: string; responseStatus?: number }[];
+};
+
 declare const document: {
   activeElement: PageElement | null;
+  /** Read by navigate's and reload's settle snapshot, together with performance.timeOrigin, in one crossing. */
+  title: string;
+  /** Read by the same snapshot, to spot a <meta http-equiv="refresh"> that will move the tab after the call returns. */
+  querySelector(selector: string): PageElement | null;
   addEventListener(type: string, handler: () => void, options?: unknown): void;
   removeEventListener(type: string, handler: () => void, options?: unknown): void;
   elementFromPoint(x: number, y: number): PageElement | null;
   scrollingElement: PageElement | null;
+  // Used to scope a deletion to one element's own contents instead of
+  // pressing the browser's select-all, which the browser scopes for you.
+  createRange(): PageRange;
 };
+/** The handful of Range members selectElementContents touches. */
+interface PageRange {
+  startContainer: unknown;
+  endContainer: unknown;
+  selectNodeContents(node: unknown): void;
+}
 declare const window: {
   innerWidth: number;
   innerHeight: number;
   devicePixelRatio: number;
-  getSelection(): { removeAllRanges(): void } | null;
-  getComputedStyle(element: PageElement): { overflowX: string; overflowY: string };
+  getSelection(): {
+    removeAllRanges(): void;
+    addRange(range: PageRange): void;
+    rangeCount: number;
+    getRangeAt(index: number): PageRange;
+  } | null;
+  getComputedStyle(element: PageElement): {
+    overflowX: string;
+    overflowY: string;
+    borderLeftWidth: string;
+    borderTopWidth: string;
+    paddingLeft: string;
+    paddingTop: string;
+  };
+  // Used to wait out one renderer frame after dispatching an input event, so a
+  // readback cannot run before the page's own listeners have. See wheel.
+  requestAnimationFrame(callback: () => void): number;
   __harborageDragProbed?: boolean;
   __harborageDragStarts?: number;
 };
+
+/**
+ * An <iframe> element, as seen from its PARENT document.
+ *
+ * Reached only through a cast inside a callback, never as a callback's own
+ * `el` parameter, for the reason ShadowDrillElement's comment gives at
+ * length. Playwright types frameElement() as ElementHandle<SVGElement |
+ * HTMLElement>, and under the test tsconfig (which does pull in lib.dom) a
+ * narrower declared parameter stops the callback type-checking.
+ *
+ * offsetWidth and offsetHeight are the LAYOUT border box, in CSS pixels
+ * before any transform; getBoundingClientRect is the same box after every
+ * ancestor transform has been applied. The ratio between them is the scale
+ * factor the point has to be divided by on the way in, which is what makes a
+ * transformed iframe map correctly rather than silently by a translation.
+ */
+interface FrameHostElement extends PageElement {
+  offsetWidth?: number;
+  offsetHeight?: number;
+  getBoundingClientRect(): { left: number; top: number; width: number; height: number };
+}
 
 /** The tags whose contents live in `.value` rather than in their child nodes. */
 const formControlTags = ['INPUT', 'TEXTAREA', 'SELECT'];
 
 /**
- * The modifier this machine's own browser binds its editing accelerators to:
- * Meta on macOS, Control everywhere else. Pressing the other one does not
- * throw, it just presses a chord the browser has no accelerator bound to, and
- * that is a trap `press_key` shares with the select-all logic below: a chord
- * built on the wrong platform's modifier reports an ordinary success and
- * silently does nothing.
+ * The modifier this machine's own browser binds its CLIPBOARD and select-all
+ * accelerators to: Meta on macOS, Control everywhere else. Pressing the other
+ * one does not throw, and a chord built for select-all on the wrong modifier
+ * reaches no such accelerator, which is the trap `press_key` shares with the
+ * select-all logic below.
+ *
+ * What must NOT be read into that: "the other modifier does nothing". On
+ * macOS it does plenty. Blink honours the emacs editing bindings there, so
+ * inside a text field Control+a moves the caret to the start of the line,
+ * Control+e to the end, and Control+k deletes from the caret to the end of the
+ * line. All three measured directly in a real input, not inferred.
  */
 const platformAcceleratorModifier = process.platform === 'darwin' ? 'Meta' : 'Control';
 
@@ -136,11 +285,21 @@ const selectAllChord = `${platformAcceleratorModifier}+a`;
  * ctrl+A on its own regardless of what the OS binds, and silently swapping
  * the modifier would be its own false pass, reporting success for a chord
  * that was never actually pressed. What this catches instead is the trap a
- * page cannot save the caller from: Control+a on macOS presses cleanly and
- * selects nothing, because the browser has no built-in accelerator on that
- * chord at all, so the call reports an ordinary success while nothing
- * happened. ControlOrMeta is exempt: Playwright itself resolves it to
- * whichever modifier is this platform's own, so it is never the wrong one.
+ * page cannot save the caller from: on macOS the browser has no select-all
+ * accelerator bound to Control at all, so a chord written for one arrives
+ * somewhere the caller did not intend.
+ *
+ * The note says that WITHOUT asserting what the press did or did not do,
+ * which is the correction this text needed. It used to state that the press
+ * "did not trigger a browser built-in editing accelerator", and that claim is
+ * measurably false: in a real macOS input Control+a moved the caret from 5 to
+ * 0, Control+e from 5 to 11, and Control+k deleted half the field. A caller
+ * told "this did nothing" after Control+k presses again and destroys more
+ * text, which is the opposite of what a warning is for. The firing logic
+ * itself was never wrong and is unchanged.
+ *
+ * ControlOrMeta is exempt: Playwright itself resolves it to whichever
+ * modifier is this platform's own, so it is never the wrong one.
  */
 function nonAcceleratorChordNote(key: string): string | null {
   const modifiers = key.split('+').slice(0, -1);
@@ -149,9 +308,15 @@ function nonAcceleratorChordNote(key: string): string | null {
   if (!modifiers.includes(nonAcceleratorModifier)) return null;
   return (
     `This chord's modifier is "${nonAcceleratorModifier}", but ${process.platform}'s own accelerator modifier is ` +
-    `"${platformAcceleratorModifier}". The press above did not throw, and it also did not trigger a browser ` +
-    `built-in editing accelerator (select-all and the rest all bind to ${platformAcceleratorModifier} here), so a ` +
-    'chord built for one of those can succeed and do nothing at all. Use ' +
+    `"${platformAcceleratorModifier}". The press did not throw, and that is the only thing this result establishes: ` +
+    'what the chord actually did is the browser\'s and the page\'s call, not this tool\'s, and it is not read back ' +
+    'here. Two different things can go wrong behind that, in opposite directions. Select-all and the other editing ' +
+    `accelerators are bound to "${platformAcceleratorModifier}" on this platform, so a chord written for one of them ` +
+    'reaches no accelerator and can report an ordinary success having selected nothing. And "Control" is not inert ' +
+    'on macOS: Chromium honours the emacs editing bindings, so in a text field Control+a moves the caret to the ' +
+    'start of the line, Control+e to the end, and Control+k DELETES from the caret to the end of the line. All three ' +
+    'measured directly. So do not read this note as "nothing happened", and do not press again on that assumption: ' +
+    'read the field back with fill, type or evaluate before concluding anything. Use ' +
     `"${platformAcceleratorModifier}+..." for this platform specifically, or "ControlOrMeta+..." for the portable ` +
     'form that resolves to the right modifier on every platform.'
   );
@@ -186,6 +351,16 @@ function tagNameOf(locator: Locator): Promise<string> {
  * Playwright selector is not always a CSS selector, so the selector case has
  * to go through a Locator, while the focused case has nothing to build one
  * from.
+ *
+ * The focused branch descends into open shadow roots rather than trusting
+ * `document.activeElement` on its own. That property RETARGETS: on a page
+ * whose editor lives in an open shadow root it names the shadow HOST, and a
+ * host's textContent does not include its shadow tree at all. Measured
+ * directly: a no-selector `type` into a shadow-DOM CodeMirror landed the text
+ * and this readback came back as the empty string, which `writeResult` then
+ * reported as a failed write with a reliable readback. The host is simply the
+ * wrong element to read, so the walk keeps descending until it reaches the one
+ * that really has the caret.
  */
 function readFieldValue(page: Page, locator: Locator | null): Promise<string> {
   if (locator) {
@@ -195,40 +370,99 @@ function readFieldValue(page: Page, locator: Locator | null): Promise<string> {
     );
   }
   return page.evaluate((tags: string[]) => {
-    const el = document.activeElement;
+    let el = document.activeElement as TreeWalkElement | null;
+    // Bounded rather than a bare while: a shadow tree that somehow hosts
+    // itself must not turn a readback into a hang.
+    for (let hops = 0; hops < 32; hops += 1) {
+      const inner = el?.shadowRoot?.activeElement;
+      if (!inner) break;
+      el = inner;
+    }
     if (!el) return '';
     return tags.includes(el.tagName) ? el.value ?? '' : el.textContent ?? '';
   }, formControlTags);
 }
 
 /**
- * Class and attribute markers a real Monaco 0.45.0 and CodeMirror 6.0.1
- * instance were both found to carry, probed directly rather than guessed at:
- * `.monaco-editor` wraps the whole widget and `[data-mode-id]` is Monaco's
- * own language marker, while CodeMirror carries both `.cm-editor` (the outer
- * view) and `.cm-content` (the actual editable node, which is what a
- * selector usually targets). Kept to markers that were actually verified so
- * an ordinary contenteditable that merely LOOKS rich, a role="textbox" widget
- * with no virtualization behind it, does not get flagged for a problem it
- * does not have.
+ * Markers for editors that VIRTUALIZE: only the lines currently on screen
+ * exist in the DOM at all, so textContent reads back truncated.
+ *
+ * Every one of these was measured against a real instance holding a 400-line,
+ * 19889-character document, not taken from memory:
+ *
+ *   Monaco 0.45.0     `.monaco-editor`, ~600 characters rendered
+ *   CodeMirror 6.0.1  `.cm-editor` (the view) and `.cm-content` (the editable
+ *                     node a selector usually names), ~3200 rendered
+ *   CodeMirror 5      `.CodeMirror`, 1191 rendered, with the gutter's line
+ *                     NUMBERS interleaved into the text
+ *   Ace               `.ace_editor`, 1707 rendered, including glyphs from its
+ *                     hidden character-measurement layer
+ *
+ * `[data-mode-id]` is Monaco's own language marker and used to be listed bare.
+ * It is not distinctive enough for that: it is a generic attribute name, and
+ * an ordinary page wrapping its app in `<div data-mode-id="dark">` had every
+ * write under it, plain inputs and textareas included, reported as an
+ * untrustworthy readback advising monaco.editor.getModels(). It is qualified
+ * to a descendant of `.monaco-editor` now, which is the only place it means
+ * Monaco.
  */
-const richEditorMarkers = '.monaco-editor, [data-mode-id], .cm-editor, .cm-content';
+const virtualizedEditorMarkers = '.monaco-editor, .monaco-editor [data-mode-id], .cm-editor, .cm-content, .CodeMirror, .ace_editor';
 
 /**
- * Why textContent cannot be trusted for a Monaco or CodeMirror instance.
- * Both were probed with a 500-line, ~25000 character document: Monaco's
- * textContent came back around 600 characters, CodeMirror's around 3200,
- * both truncated and with no newline between lines, because the rendered
- * view is a flat run of positioned line elements, not a document tree, and
- * only the lines currently on screen exist in the DOM at all.
+ * Markers for rich-TEXT editors, which keep a document model that the DOM only
+ * renders. They do not virtualize, and they defeat a textContent readback a
+ * different way, so they get their own message rather than being folded in
+ * above and described inaccurately.
+ *
+ * Measured the same way, same document:
+ *
+ *   Quill 2.0.2   `.ql-editor` inside `.ql-container`
+ *   ProseMirror   `.ProseMirror` (which is also what TipTap renders, confirmed
+ *                 in @tiptap/core's own bundle)
+ *   Lexical       `[data-lexical-editor]`
+ *   Slate         `[data-slate-editor]`, confirmed in slate-react's source
+ *
+ * All three that were instantiated rendered the whole 19889 characters, and
+ * all three returned them with every line break gone: textContent runs the
+ * blocks together, so a document that reads back "correct" by length is
+ * already wrong by structure.
+ */
+const richTextEditorMarkers = '.ql-editor, .ProseMirror, [data-slate-editor], [data-lexical-editor]';
+
+/**
+ * Why textContent cannot be trusted for a virtualizing editor. Both numbers
+ * below are measured: Monaco's textContent came back around 600 characters
+ * and CodeMirror 6's around 3200, out of 25000, both truncated and with no
+ * newline between lines, because the rendered view is a flat run of positioned
+ * line elements rather than a document tree and only the lines currently on
+ * screen exist in the DOM. CodeMirror 5 and Ace add their own noise on top:
+ * gutter line numbers and a hidden measurement layer respectively, both of
+ * which land in textContent as though they were the document's own text.
  */
 const virtualizedEditorWarning =
-  'This looks like a Monaco or CodeMirror instance. Both virtualize their lines, so textContent only covers ' +
-  'what is currently rendered on screen: a long document reads back truncated, and with no newline between ' +
-  'lines, since the rendered view is a flat run of positioned line elements rather than a document tree. ' +
+  'This looks like a virtualizing code editor (Monaco, CodeMirror 5 or 6, or Ace). They keep only the lines ' +
+  'currently on screen in the DOM, so textContent reads back truncated for a long document, with no newline ' +
+  'between lines, and can carry the gutter\'s line numbers or a hidden measurement layer along with the text. ' +
   '"value" below is what the DOM happens to show, not what the editor actually holds. Read the real content ' +
-  'through the editor\'s own API instead, with evaluate: monaco.editor.getModels()[0].getValue() for Monaco, or ' +
-  'a CodeMirror view\'s state.doc.toString().';
+  'through the editor\'s own API instead, with evaluate: monaco.editor.getModels()[0].getValue() for Monaco, a ' +
+  'CodeMirror 6 view\'s state.doc.toString(), cm.getValue() for CodeMirror 5, or ace.edit(el).getValue() for Ace.';
+
+/**
+ * Why textContent cannot be trusted for a rich-text editor. Different failure,
+ * so a different message: the text is all there, and every line break is not.
+ * Measured on Quill, ProseMirror and Lexical holding a 400-line document, all
+ * of which returned the full 19489 characters as one unbroken run. Anything
+ * that is not text, an image, an embed, a mention chip, has no textContent at
+ * all, so a document can read back "as requested" while differing from it in
+ * every way that matters.
+ */
+const richTextEditorWarning =
+  'This looks like a rich-text editor (Quill, ProseMirror, TipTap, Slate or Lexical). Its document model is not ' +
+  'the DOM: textContent runs the blocks together with every line break gone, and anything that is not text, an ' +
+  'image, an embed, a mention, contributes nothing to it at all. A single-line value can read back looking exactly ' +
+  'right while a structured document is silently wrong, so "matched" is not claimed either way here. Read the real ' +
+  'content through the editor\'s own API instead, with evaluate: quill.getText() or quill.getContents() for Quill, ' +
+  'a ProseMirror or TipTap view\'s state.doc.toJSON(), or editor.getEditorState().toJSON() for Lexical.';
 
 /**
  * Why textContent cannot be trusted for an element with an attached
@@ -244,97 +478,801 @@ const editContextWarning =
   'instead, with evaluate.';
 
 /**
- * Whether `el`'s textContent can be trusted as a readback, and why not when
- * it cannot. Self-contained on purpose: it runs inside the page through
- * `locator.evaluate`, which serializes only this function's own source, so it
- * takes every message it might return as an argument rather than closing
- * over the module-level constants above.
+ * `<input>` types that are form controls but hold no typed text at all.
+ *
+ * A deny-list rather than an allow-list on purpose: `input.type` is read as
+ * the IDL property, and the browser normalizes any value it does not
+ * recognise to "text", so an input type this list does not name is one that
+ * really does take typed text, including ones invented after this was written.
  */
-function richEditorWarning(
-  el: PageElement,
-  messages: { markers: string; virtualized: string; editContext: string }
-): string | null {
-  let node: PageElement | null = el;
-  for (let hops = 0; node && hops < 8; hops += 1) {
-    if (node.matches(messages.markers)) return messages.virtualized;
-    node = node.parentElement ?? null;
-  }
-  return el.editContext ? messages.editContext : null;
+const nonTextInputTypes = [
+  'checkbox',
+  'radio',
+  'button',
+  'submit',
+  'reset',
+  'image',
+  'file',
+  'color',
+  'range',
+  'hidden'
+];
+
+/** The two marker sets, bundled for the single argument the in-page pass takes. */
+const editorMarkers = { virtualized: virtualizedEditorMarkers, richText: richTextEditorMarkers };
+
+/** Which family of editor a target belongs to, or null for an ordinary element. */
+type EditorKind = 'virtualized' | 'richText' | null;
+
+/**
+ * One element, described in the only terms the write tools actually need:
+ * what it is, whether text can go into it, WHAT A DELETION AIMED AT IT WOULD
+ * DESTROY, and whether reading it back afterwards means anything.
+ *
+ * Facts only, no wording. Every message these drive is built in Node below,
+ * so the in-page half stays small and there is exactly one place to change
+ * what a refusal says.
+ */
+interface TextTargetReport {
+  /** Uppercase tag name, as the DOM reports it. */
+  tag: string;
+  id: string;
+  /** The first couple of class names, the only handle a refusal has when there is no id. */
+  classes: string;
+  /** The normalized `type` of an INPUT, null for every other tag. */
+  inputType: string | null;
+  /** A form control that will not accept a write however it is aimed. */
+  readOnly: boolean;
+  disabled: boolean;
+  /**
+   * The element is itself an editing host: a `contenteditable` root, not
+   * merely something sitting inside one.
+   *
+   * This is the distinction the previous guard did not make, and it is the
+   * whole defect. `isContentEditable` is INHERITED, true on every descendant
+   * of an editing host, and a select-all is scoped to the HOST, not to the
+   * element it was aimed at. So a guard that accepted anything with
+   * isContentEditable let a clear aimed at a widget inside a WYSIWYG region
+   * delete the entire region. Measured: a page went from three canvas nodes
+   * and 91 characters to one node and 14, reported as matched: true with no
+   * note at all.
+   */
+  isEditingHost: boolean;
+  /** The editing host that owns this element, described enough to name it in a refusal. Null when there is none. */
+  editingHost: { tag: string; id: string; classes: string } | null;
+  /** Which family of editor's readback this element's textContent cannot answer for. */
+  editorKind: EditorKind;
+  /** An EditContext is attached, so the DOM is not this element's text store at all. */
+  editContext: boolean;
+}
+
+/** A target's description plus where the caret really sits relative to it. */
+interface TextTargetInspection {
+  /** The element the caller named, or the caret holder when there was no selector. Null when neither exists. */
+  target: TextTargetReport | null;
+  /** The element that really has the caret, shadow boundaries crossed. Null when nothing has focus. */
+  caret: TextTargetReport | null;
+  /** The caret holder IS the target. */
+  caretIsTarget: boolean;
+  /** The caret holder sits INSIDE the target, shadow boundaries crossed. */
+  caretInsideTarget: boolean;
+  /**
+   * Whether the caret holder's text would actually appear in the target's own
+   * textContent readback.
+   *
+   * Not the same question as caretInsideTarget, which is what this used to be
+   * set from, and the difference is three ordinary configurations that were
+   * being described with a sentence that was simply false. A form control's
+   * `value` is never part of an ancestor's textContent. A shadow tree's text
+   * is never part of its host's. Both are "inside" and neither is covered.
+   */
+  caretTextInTargetReadback: boolean;
 }
 
 /**
- * The same check as `richEditorWarning`, for the no-selector case: there is
- * no locator to evaluate against, only whatever currently has focus, so this
- * reads `document.activeElement` itself before walking up from it. Kept as
- * its own top-level function rather than sharing a call to
- * `richEditorWarning` for the same serialization reason: `page.evaluate` only
- * sends the one function it is given, not whatever it happens to call.
+ * Everything the write tools need to know about an element before they type
+ * into it, gathered in one pass inside the page.
+ *
+ * It is deliberately called two different ways, and tells them apart by the
+ * shape of its first argument: `locator.evaluate(fn, arg)` invokes
+ * `fn(element, arg)`, while `page.evaluate(fn, arg)` invokes `fn(arg)`. That
+ * small trick buys something worth having. This logic decides whether a write
+ * happens at all and whether its readback may be believed, and earlier rounds
+ * of work on this file each fixed one of a pair of near-identical copies of it
+ * and left the other one wrong. There is one copy now, so a fix cannot reach
+ * the selector case and miss the focused case. An adversarial pass looking
+ * specifically for a disagreement between the two shapes, shadow cases
+ * included, found none.
+ *
+ * Written as flat loops with no inner functions, which is not a style choice:
+ * the test runner transpiles through esbuild with keepNames on, and esbuild
+ * rewrites a nested function declaration into a `__name(...)` call against a
+ * helper that exists in the bundle and not in the page. Playwright serializes
+ * only this function's own source, so that helper arrives undefined and every
+ * call throws "__name is not defined" inside the browser.
  */
-function richEditorWarningForFocused(messages: {
-  markers: string;
-  virtualized: string;
-  editContext: string;
-}): string | null {
-  const el = document.activeElement;
-  if (!el) return null;
-  let node: PageElement | null = el;
-  for (let hops = 0; node && hops < 8; hops += 1) {
-    if (node.matches(messages.markers)) return messages.virtualized;
-    node = node.parentElement ?? null;
+function inspectTextTarget(
+  elOrMarkers: PageElement | { virtualized: string; richText: string },
+  maybeMarkers?: { virtualized: string; richText: string }
+): TextTargetInspection {
+  const isMarkerArg =
+    elOrMarkers !== null &&
+    typeof elOrMarkers === 'object' &&
+    typeof (elOrMarkers as { virtualized?: unknown }).virtualized === 'string';
+  const markers = (isMarkerArg ? elOrMarkers : maybeMarkers) as { virtualized: string; richText: string };
+  const named = isMarkerArg ? null : (elOrMarkers as unknown as TreeWalkElement);
+
+  // The element that really has the caret. document.activeElement RETARGETS
+  // to the shadow host, so on a page whose editor lives in an open shadow
+  // root it names a plain <div> that can hold no text and whose textContent
+  // does not include the editor's. Bounded rather than a bare while: a
+  // malformed shadow tree must not turn a readback into a hang.
+  let caretNode = document.activeElement as TreeWalkElement | null;
+  for (let hops = 0; hops < 32; hops += 1) {
+    const inner = caretNode?.shadowRoot?.activeElement;
+    if (!inner) break;
+    caretNode = inner;
   }
-  return el.editContext ? messages.editContext : null;
+
+  const targetNode = named ?? caretNode;
+  const nodes: (TreeWalkElement | null)[] = [targetNode, caretNode];
+  const reports: (TextTargetReport | null)[] = [null, null];
+
+  for (let which = 0; which < 2; which += 1) {
+    const node = nodes[which];
+    if (!node) continue;
+    if (which === 1 && node === nodes[0]) {
+      reports[1] = reports[0];
+      continue;
+    }
+
+    // Which editor family's readback this element's textContent cannot answer
+    // for. Looked for AT the element, ABOVE it (stepping out of a shadow tree
+    // through its host wherever the parent chain runs out), and ANYWHERE
+    // BELOW it.
+    //
+    // Below is a full subtree search, not a fixed number of levels. A level
+    // budget was tried and was the wrong shape: two levels was fitted to
+    // Acres's `[data-testid="expression-editor-input"]` wrapper and landed one
+    // level short of Acres's OWN outer test ids, `param-source` and
+    // `field-source`, which are the stable ids a QA agent actually aims at. A
+    // 14589-character write through one of those reported matched: true with a
+    // readback that began with CodeMirror's aria-live announcer. The question
+    // is not how close the editor is; it is whether the text about to be read
+    // back contains an editor's render. Flagging a panel that genuinely
+    // contains one is the honest answer, because its textContent really does
+    // include that truncated render.
+    let editorKind: EditorKind = null;
+    let step: TreeWalkElement | null = node;
+    for (let hops = 0; step && hops < 8 && editorKind === null; hops += 1) {
+      if (step.matches(markers.virtualized)) editorKind = 'virtualized';
+      else if (step.matches(markers.richText)) editorKind = 'richText';
+      else step = step.parentElement ?? step.getRootNode().host ?? null;
+    }
+    if (editorKind === null && node.querySelector) {
+      if (node.querySelector(markers.virtualized)) editorKind = 'virtualized';
+      else if (node.querySelector(markers.richText)) editorKind = 'richText';
+    }
+    // querySelector does not cross a shadow boundary, so open roots in the
+    // subtree are walked separately, under a node budget so a huge page
+    // cannot turn one readback into a long pause.
+    if (editorKind === null) {
+      let frontier: TreeWalkElement[] = [node];
+      let budget = 400;
+      while (frontier.length > 0 && budget > 0 && editorKind === null) {
+        const next: TreeWalkElement[] = [];
+        for (const parent of frontier) {
+          const root = parent.shadowRoot;
+          if (root?.querySelector) {
+            if (root.querySelector(markers.virtualized)) editorKind = 'virtualized';
+            else if (root.querySelector(markers.richText)) editorKind = 'richText';
+            if (editorKind !== null) break;
+          }
+          const kids = parent.children;
+          for (let i = 0; kids && i < kids.length && budget > 0; i += 1) {
+            next.push(kids[i]);
+            budget -= 1;
+          }
+        }
+        frontier = next;
+      }
+    }
+
+    // The editing host that owns this element, and whether the element IS it.
+    // An editing host is an element carrying the contenteditable attribute
+    // itself (or the body once designMode is on); a descendant merely
+    // INHERITS isContentEditable and is not a host. That distinction is what
+    // decides how much a deletion aimed here would destroy.
+    let isEditingHost = false;
+    let editingHost: { tag: string; id: string; classes: string } | null = null;
+    if (node.isContentEditable === true) {
+      let host: TreeWalkElement | null = node;
+      for (let hops = 0; host && hops < 64; hops += 1) {
+        const attr = host.getAttribute('contenteditable');
+        const declares = attr === '' || attr === 'true' || attr === 'plaintext-only';
+        const parent: TreeWalkElement | null = host.parentElement ?? host.getRootNode().host ?? null;
+        if (declares || parent === null || parent.isContentEditable !== true) break;
+        host = parent;
+      }
+      if (host) {
+        isEditingHost = host === node;
+        editingHost = {
+          tag: host.tagName,
+          id: host.id,
+          classes: (host.getAttribute('class') ?? '').split(/\s+/).filter(Boolean).slice(0, 2).join(' ')
+        };
+      }
+    }
+
+    reports[which] = {
+      tag: node.tagName,
+      id: node.id,
+      // Two names at most: enough to identify a widget, short enough that a
+      // utility-class-heavy element does not bury the rest of the message.
+      classes: (node.getAttribute('class') ?? '').split(/\s+/).filter(Boolean).slice(0, 2).join(' '),
+      // `.type` on an INPUT is the normalized IDL property, not the raw
+      // attribute, so an omitted or unrecognised type reads back as "text".
+      inputType: node.tagName === 'INPUT' ? node.type ?? 'text' : null,
+      readOnly: node.readOnly === true,
+      disabled: node.disabled === true,
+      isEditingHost,
+      editingHost,
+      editorKind,
+      editContext: Boolean(node.editContext)
+    };
+  }
+
+  // Whether the caret sits inside the target, and whether its text would
+  // actually turn up in the target's own textContent readback. Node.contains
+  // does not cross a shadow boundary, so the walk steps out through each host
+  // instead, and remembers whether it had to.
+  let caretInsideTarget = false;
+  let crossedShadow = false;
+  if (caretNode && targetNode && caretNode !== targetNode) {
+    let up: TreeWalkElement | null = caretNode;
+    for (let hops = 0; up && hops < 64; hops += 1) {
+      if (up === targetNode) {
+        caretInsideTarget = true;
+        break;
+      }
+      const parent: TreeWalkElement | null = up.parentElement ?? null;
+      if (parent) {
+        up = parent;
+      } else {
+        up = up.getRootNode().host ?? null;
+        crossedShadow = true;
+      }
+    }
+  }
+  const caretTag = caretNode ? caretNode.tagName : '';
+  const caretIsFormControl = caretTag === 'INPUT' || caretTag === 'TEXTAREA' || caretTag === 'SELECT';
+
+  return {
+    target: reports[0],
+    caret: reports[1],
+    caretIsTarget: caretNode !== null && caretNode === targetNode,
+    caretInsideTarget,
+    // A form control's value lives in `.value`, never in an ancestor's
+    // textContent, and a shadow tree's text never reaches its host's. Both
+    // are "inside" and neither is covered.
+    caretTextInTargetReadback: caretInsideTarget && !crossedShadow && !caretIsFormControl
+  };
 }
 
-/** Arguments `richEditorWarning`/`richEditorWarningForFocused` are called with, bundled once. */
-const richEditorWarningMessages = { markers: richEditorMarkers, virtualized: virtualizedEditorWarning, editContext: editContextWarning };
-
-/** What the field really holds, plus whether that readback is one a rich editor can defeat. */
-function readReadbackReliability(page: Page, locator: Locator | null): Promise<string | null> {
+/**
+ * Runs `inspectTextTarget` against the named element, or against whatever
+ * holds the caret when there is no selector to name one.
+ *
+ * The cast is the Node-side half of the two-call-shapes trick documented on
+ * `inspectTextTarget`: page.evaluate passes its argument as the FIRST
+ * parameter, which is exactly what that function is written to expect.
+ */
+function inspectTarget(page: Page, locator: Locator | null): Promise<TextTargetInspection> {
   return locator
-    ? locator.evaluate(richEditorWarning, richEditorWarningMessages)
-    : page.evaluate(richEditorWarningForFocused, richEditorWarningMessages);
+    ? locator.evaluate(inspectTextTarget, editorMarkers)
+    : page.evaluate(
+        inspectTextTarget as (markers: { virtualized: string; richText: string }) => TextTargetInspection,
+        editorMarkers
+      );
+}
+
+/**
+ * Whether an element can actually hold typed text AND own the deletion that
+ * replacing its contents would perform.
+ *
+ * The question this asks has been wrong twice. First it asked what the tag
+ * was, which let a React Flow canvas node through because a plain <div> with
+ * a tabindex is not BODY. Then it asked whether `isContentEditable` was true,
+ * which is worse, because that property is INHERITED: every descendant of an
+ * editing host reports true, and a select-all is scoped to the HOST. A widget
+ * inside a WYSIWYG region passed, and clearing it deleted the whole region.
+ *
+ * The question that actually matters is what a deletion aimed here would
+ * destroy. A form control scopes it to its own value, which is safe. An
+ * editing host scopes it to itself, which is safe and is exactly what the
+ * caller named. Anything else scopes it to something larger than the caller
+ * named, or to the document, and must be refused.
+ */
+function canReceiveText(report: TextTargetReport): boolean {
+  if (report.tag === 'TEXTAREA') return true;
+  // A SELECT is a form control that holds no typed text either. It gets its
+  // own message rather than the generic one, so it is not answered here.
+  if (report.tag === 'INPUT') return !nonTextInputTypes.includes(report.inputType ?? 'text');
+  return report.isEditingHost;
+}
+
+/** How an element is named in a refusal: `<div id="wrap">`, `<input type="checkbox">`, `<div class="cm-content">`. */
+function describeTextTarget(report: { tag: string; id: string; classes: string; inputType?: string | null }): string {
+  const type = report.tag === 'INPUT' && report.inputType ? ` type="${report.inputType}"` : '';
+  const id = report.id ? ` id="${report.id}"` : '';
+  // The class only earns its place when there is no id to name the element by.
+  const classes = !report.id && report.classes ? ` class="${report.classes}"` : '';
+  return `<${report.tag.toLowerCase()}${type}${id}${classes}>`;
+}
+
+/**
+ * The selector a caller would most plausibly retry with, built from what the
+ * element actually carries: its id when it has one, otherwise its first class.
+ * Deliberately a hint rather than a guarantee, because an element with neither
+ * cannot be named from its own attributes at all.
+ */
+function cssPathHint(report: { tag: string; id: string; classes: string }): string {
+  if (report.id) return `#${report.id}`;
+  const first = report.classes.split(' ').filter(Boolean)[0];
+  return first ? `.${first}` : report.tag.toLowerCase();
+}
+
+/** The tool that can act on a form control which takes no typed text, when there is one. */
+function toolForNonTextControl(report: TextTargetReport): string {
+  if (report.tag !== 'INPUT') return '';
+  const type = report.inputType ?? 'text';
+  if (type === 'file') return 'Use file_upload to give a file input a file. ';
+  if (type === 'checkbox' || type === 'radio') return 'Use click to toggle it. ';
+  if (type === 'button' || type === 'submit' || type === 'reset' || type === 'image') return 'Use click to press it. ';
+  if (type === 'range' || type === 'color') {
+    return 'A range or colour input is driven by the pointer, not the keyboard: use drag, or set it through evaluate and dispatch the input event the page listens for. ';
+  }
+  return '';
+}
+
+/**
+ * Why a write was refused, in one message, shared by `fill` and by `type`'s
+ * no-selector guard because the mistake is the same one approached from two
+ * directions: an element that can take focus is not an element that can take
+ * text, and an element that merely SITS INSIDE an editable region does not own
+ * that region.
+ *
+ * The harm this exists to stop was measured, not reasoned about. On the real
+ * Acres canvas, an ordinary click on a node followed by `type` with
+ * `clear: true` pressed select-all and Delete at document level, React Flow
+ * handled the Delete as "remove the selected node", and the flow went from
+ * three nodes to two while the result said `matched: false`. On a page whose
+ * canvas sat inside a `contenteditable` region the same call destroyed the
+ * whole region, three nodes and 91 characters down to one node and 14, and
+ * reported `matched: true` with no note at all. And `fill` aimed at a plain
+ * `<div>` wrapper whose focused child was a contenteditable wrote into the
+ * CHILD and reported `matched: true` against the wrapper's textContent.
+ */
+function refusalForUnwritableTarget(lead: string, target: TextTargetReport, inspection: TextTargetInspection): string {
+  const named = describeTextTarget(target);
+  let reason: string;
+  if (target.tag === 'INPUT') {
+    reason = `${named} is a form control, but not one that holds typed text`;
+  } else if (target.editingHost && !target.isEditingHost) {
+    // The dangerous case, and the one worth spelling out: this element looks
+    // editable because isContentEditable is inherited, but the editing region
+    // it belongs to is larger than it.
+    reason =
+      `${named} sits inside a contenteditable region but is not the editable element itself. Replacing its ` +
+      `contents means selecting and deleting, and a selection there is scoped to the editing host, ` +
+      `${describeTextTarget(target.editingHost)}, not to this element: it would destroy that whole region, ` +
+      'not the part that was named';
+  } else {
+    reason = `${named} is not an input, a textarea, or a contenteditable, so a keystroke has nowhere to land in it`;
+  }
+
+  const instead =
+    target.editingHost && !target.isEditingHost
+      ? `Name ${describeTextTarget(target.editingHost)} if replacing the whole region is what you meant, or write into ` +
+        'this element through evaluate if it is not. '
+      : '';
+
+  const caret = inspection.caret;
+  const caretNote =
+    caret && inspection.caretInsideTarget && canReceiveText(caret)
+      ? `The caret is on ${describeTextTarget(caret)} INSIDE it, so a write here would have gone to THAT element: ` +
+        'somewhere the selector never named, with the readback taken from the named element instead. Point the ' +
+        'selector at it. '
+      : caret && !inspection.caretIsTarget && canReceiveText(caret)
+        ? `The caret is on ${describeTextTarget(caret)}, somewhere else on the page entirely. `
+        : '';
+
+  // Worth saying even when nothing is focused yet, which is the ordinary way
+  // this refusal is met: a QA agent aims at a test id and has clicked nothing.
+  const editorNote =
+    caret?.editorKind || target.editorKind
+      ? 'There is a verified editor marker at or below this element, so it is a wrapper around an editor rather ' +
+        'than the editor itself. Point the selector at the editable node inside it (".cm-content" for CodeMirror ' +
+        '6, ".ql-editor" for Quill, ".ProseMirror" for ProseMirror or TipTap), and read its value back through the ' +
+        'editor\'s own API rather than the DOM. '
+      : '';
+
+  return `${lead}: ${reason}. ` + caretNote + editorNote + instead + toolForNonTextControl(target);
+}
+
+/** Why this element's textContent readback cannot be believed, or null when it can. */
+function readbackWarningFor(target: TextTargetReport | null): string | null {
+  if (!target) return null;
+  if (target.editorKind === 'virtualized') return virtualizedEditorWarning;
+  if (target.editorKind === 'richText') return richTextEditorWarning;
+  return target.editContext ? editContextWarning : null;
+}
+
+/** What the field really holds, plus whether that readback is one an editor can defeat. */
+async function readReadbackReliability(page: Page, locator: Locator | null): Promise<string | null> {
+  const { target } = await inspectTarget(page, locator);
+  return readbackWarningFor(target);
+}
+
+/**
+ * Refuses a WRITE whose selector matches more than one element, in this file's
+ * own voice rather than Playwright's, and hands back the count it measured so
+ * a later failure can say what it actually saw rather than guessing.
+ *
+ * click and hover act on the first match and say so in a note, because looking
+ * at the wrong element is recoverable. A write is not: fill and type change
+ * the page, and Playwright's strict mode is exactly what stops them writing
+ * into an arbitrary one of several matches. The strictness is right. What was
+ * wrong is that it surfaced as a raw "strict mode violation" thrown from deep
+ * inside a readback, naming neither the tool that refused nor the way out.
+ */
+async function assertSingleWriteTarget(tool: string, locator: Locator, selector: string): Promise<number | undefined> {
+  const matched = await locator.count().catch(() => undefined);
+  if (matched === undefined || matched <= 1) return matched;
+  throw new Error(
+    `${tool} will not write into ${JSON.stringify(selector)}: it matches ${matched} elements, and picking one of them ` +
+      'would change the page rather than merely look at the wrong thing. Playwright selectors also pierce open shadow ' +
+      'roots, so a positional path can match more of the page than it looks like it does. Narrow the selector, append ' +
+      '" >> nth=0" to name one match explicitly, or use find to confirm which element you meant. Nothing was written.'
+  );
+}
+
+/**
+ * Where a typed character actually went, when that is not simply the element
+ * the caller named.
+ *
+ * `type` with a selector does NOT refuse a target that cannot hold text, and
+ * that stays deliberate: routing real keystrokes at a focused widget is a
+ * legitimate thing to want, and press_key alone does not cover it. But
+ * `pressSequentially` focuses the locator and then types at whatever holds the
+ * caret, so when the focus attempt does not land, the characters go somewhere
+ * else entirely and the result still names the caller's selector. Reproduced:
+ * `type` aimed at a plain <div> while an input was focused put the text in the
+ * INPUT, and reported the div's unchanged textContent with a note saying the
+ * write "may have landed somewhere other than the intended element". It knew.
+ * It just did not say where. Refusing is the wrong fix; saying so is.
+ */
+interface WriteDestination {
+  /** Where the characters really went, named the way a refusal names an element. */
+  note: string;
+  /**
+   * Whether reading the NAMED element back still says anything about the
+   * typing. Only true when the caret holder's text genuinely appears in the
+   * named element's own textContent, which rules out a focused form control
+   * and anything behind a shadow boundary.
+   */
+  readbackStillCovers: boolean;
+}
+
+/**
+ * Compares where the caret really ended up against the element the caller
+ * named, after the focus attempt and before a single character is sent, and
+ * again after the last one.
+ *
+ * Null when the two agree throughout, which is the ordinary case and adds
+ * nothing to the result. The caret holder comes from the same shadow-piercing
+ * descent readFieldValue uses, so an editor inside an open shadow root is
+ * named as itself rather than as the host document.activeElement retargets to.
+ */
+function typingDestination(before: TextTargetInspection, after: TextTargetInspection): WriteDestination | null {
+  // Focus moved DURING the typing, which the before-check alone cannot see.
+  // Measured with a page that moves focus after the third keystroke: "ab"
+  // landed in the named field and "cdef" in another one, and the result said
+  // matched: false and blamed the page for rewriting the input.
+  if (before.caretIsTarget && !after.caretIsTarget) {
+    return {
+      note:
+        'Focus moved away from the element this selector names WHILE the characters were being typed: it held the ' +
+        `caret when typing started and ${after.caret ? describeTextTarget(after.caret) : 'nothing at all'} held it ` +
+        'when typing finished. Some of the characters went to one and the rest to the other, and which is which is ' +
+        'not something this tool can tell you, so "matched" is not claimed. Read both elements back before drawing ' +
+        'any conclusion.',
+      readbackStillCovers: false
+    };
+  }
+  if (before.caretIsTarget) return null;
+  if (before.caret === null) {
+    return {
+      note:
+        'Nothing had focus when the characters were sent, so they went to the document rather than into the element ' +
+        'this selector names: focusing it did not move the caret there. "value" below is that element read back, ' +
+        'which nothing was typed into, so "matched" is not claimed either way. Name a field, or click into one first.',
+      readbackStillCovers: false
+    };
+  }
+  if (before.caretInsideTarget) {
+    return {
+      note:
+        `The caret sat on ${describeTextTarget(before.caret)} INSIDE the element this selector names, so that is ` +
+        'the element the characters actually went into. ' +
+        (before.caretTextInTargetReadback
+          ? '"value" below is the named element read back, and its textContent does cover that child, so the ' +
+            'comparison still means something. Name the inner element directly if you want a readback of just it.'
+          : 'The named element\'s readback does NOT cover it: a form control keeps its text in .value rather than in ' +
+            'any ancestor\'s textContent, and a shadow tree\'s text never reaches its host\'s, so "value" below is ' +
+            'blind to the write and "matched" is not claimed. Name the inner element to read it back.'),
+      readbackStillCovers: before.caretTextInTargetReadback
+    };
+  }
+  return {
+    note:
+      'The characters did not go into the element this selector names. Focusing it did not move the caret there, so ' +
+      `they went to ${describeTextTarget(before.caret)}, which is neither that element nor anything inside it. ` +
+      '"value" below is the named element read back, which nothing was typed into, so "matched" is not claimed ' +
+      'either way. That is a real result if you meant to drive a widget that keeps focus elsewhere; if you meant to ' +
+      'fill a field, name the field.',
+    readbackStillCovers: false
+  };
+}
+
+/**
+ * Turns Playwright's bare TimeoutError into the guidance the rest of this file
+ * gives, or hands back whatever else was thrown, untouched.
+ *
+ * Playwright WAITS for a selector rather than failing straight away, which is
+ * the right behaviour (an element that appears a moment later is still one to
+ * act on) and the reason a selector matching nothing costs the whole timeout.
+ * What was wrong is what the caller got for that wait: a raw TimeoutError,
+ * naming neither the tool nor the way out.
+ *
+ * Two things this must not do, both of which it did. It must not assert a
+ * measurement it never took: it used to say the selector "matched no elements
+ * when the call started" on the strength of a count taken only AFTER the
+ * failure, which was flatly false in a case where the call had counted one
+ * match at the start and then destroyed it. And it must not say "Nothing was
+ * written" once a write has been attempted, for the same reason. Both facts
+ * are now passed in by the caller, which is the only place that knows them.
+ */
+async function selectorActionFailure(
+  tool: string,
+  page: Page,
+  selector: string,
+  err: unknown,
+  waitedMs: number,
+  nothingHappened: string,
+  matchedAtStart: number | undefined,
+  alreadyActed: boolean
+): Promise<unknown> {
+  if (!(err instanceof Error) || err.name !== 'TimeoutError') return err;
+  const stillMatching = await page.locator(selector).count().catch(() => undefined);
+  const atStart =
+    matchedAtStart === undefined
+      ? 'How many elements it matched when the call started was not measured'
+      : `It matched ${matchedAtStart} element(s) when the call started`;
+  const tail = alreadyActed
+    ? 'This failure came AFTER the write was attempted, so the page may already have changed: read it back before ' +
+      'assuming otherwise.'
+    : nothingHappened;
+
+  if (stillMatching === 0) {
+    return new Error(
+      `${tool} could not finish on ${JSON.stringify(selector)}: it matches no elements now, ${waitedMs}ms in, which ` +
+        `is why this took as long as it did. ${atStart}. Playwright waits for a selector to appear rather than ` +
+        'failing immediately, so a selector that never matches spends the whole timeout. Check the selector with ' +
+        'find, or wait for the element with wait_for first when it is meant to appear in response to something ' +
+        `else. ${tail}`
+    );
+  }
+  return new Error(
+    `${tool} could not act on ${JSON.stringify(selector)} within ${waitedMs}ms, even though it matches ` +
+      `${stillMatching ?? 'some'} element(s) now. ${atStart}. Playwright acts only on an element that is visible, ` +
+      'stable, enabled and actually writable, so this is a real finding about the page rather than a selector typo: ' +
+      'the element is hidden, still animating, zero-sized, disabled, readonly, or covered by something else. ' +
+      `element_box reports its geometry and whether anything is on top of it, and computed_style the visibility. ${tail}`
+  );
+}
+
+/**
+ * Selects exactly the contents of one element and nothing else, then reports
+ * whether that actually took.
+ *
+ * This replaces pressing the platform select-all chord, and the replacement is
+ * the point rather than an optimisation. Select-all is scoped by the BROWSER,
+ * to the focused form control or to the editing host or to the document, and
+ * none of those is necessarily the element the caller named. Worse, it is a
+ * separate round trip from the guard that checked what was focused, so a page
+ * with an ordinary global shortcut handler could move focus on the chord
+ * itself and redirect the Delete that followed. Measured: focus sat on a plain
+ * <input> when the guard ran, the chord moved it to a canvas node, and the
+ * Delete removed that node while the input was untouched and the result blamed
+ * the page for rewriting the input.
+ *
+ * A Range placed over the element's own contents cannot do either. It is
+ * scoped structurally rather than by whatever happens to be focused, and it is
+ * set in the same round trip that verifies it, so there is no window between
+ * deciding and acting. The Delete after it is still a real key press, because
+ * an editor with its own document model has to see a real one: CodeMirror 6 on
+ * the live Acres app was checked directly through the editor's own
+ * state.doc.toString() to confirm the deletion reaches the model, not just the
+ * DOM.
+ */
+async function selectElementContents(locator: Locator): Promise<boolean> {
+  return locator.evaluate((el: PageElement) => {
+    const selection = window.getSelection();
+    if (!selection) return false;
+    const range = document.createRange();
+    range.selectNodeContents(el as unknown as never);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    // Verified rather than assumed: an editor can normalize or reject a
+    // selection it does not like, and a deletion aimed at a selection that
+    // never took would fall through to whatever was selected before.
+    const now = selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
+    return now !== null && el.contains(now.startContainer) && el.contains(now.endContainer);
+  });
+}
+
+/**
+ * Selects the contents of whatever currently holds the caret, and re-checks in
+ * the SAME page round trip that the caret is still where the guard found it.
+ *
+ * The no-selector clear path used to press the platform select-all chord, and
+ * that is a time-of-check-to-time-of-use bug as well as a scoping one. The
+ * guard ran, two round trips passed, and only then did the chord go out, so an
+ * ordinary global keyboard-shortcut handler that moves focus on the
+ * accelerator could redirect the Delete that followed. Measured: focus was on
+ * a plain <input> when the guard ran, the chord moved it to a canvas node, and
+ * the Delete deleted that node while the input was untouched and the result
+ * blamed the page for rewriting the input.
+ *
+ * Checking and selecting in one evaluate leaves no window between the two, and
+ * a Range over the caret holder's own contents is scoped to that element
+ * rather than to whatever the browser decides select-all means. Returns the
+ * tag it acted on, or null when the caret is no longer on an element that owns
+ * a scoped selection.
+ */
+function selectFocusedContents(page: Page): Promise<string | null> {
+  return page.evaluate(() => {
+    let el = document.activeElement as TreeWalkElement | null;
+    for (let hops = 0; hops < 32; hops += 1) {
+      const inner = el?.shadowRoot?.activeElement;
+      if (!inner) break;
+      el = inner;
+    }
+    if (!el) return null;
+    // BODY and HTML are never a scoped target: the region would be the page.
+    if (el.tagName === 'BODY' || el.tagName === 'HTML') return null;
+    if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+      if (el.readOnly === true || el.disabled === true) return null;
+      if (typeof el.setSelectionRange !== 'function') return null;
+      el.setSelectionRange(0, (el.value ?? '').length);
+      return el.tagName;
+    }
+    // Only an editing host owns its own region; a descendant of one does not,
+    // and deleting through it would take the whole host with it.
+    const attr = el.getAttribute('contenteditable');
+    const isHost = el.isContentEditable === true && (attr === '' || attr === 'true' || attr === 'plaintext-only');
+    if (!isHost) return null;
+    const selection = window.getSelection();
+    if (!selection) return null;
+    const range = document.createRange();
+    range.selectNodeContents(el as unknown as never);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    const now = selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
+    if (now === null || !el.contains(now.startContainer) || !el.contains(now.endContainer)) return null;
+    return el.tagName;
+  });
 }
 
 /**
  * Replaces a field's contents for real.
  *
- * A contenteditable goes through actual keyboard events (focus, select-all,
- * delete, insert) rather than a plain insertion, because CodeMirror and
- * Monaco keep their own document model and treat an insertion as an insert at
- * their own cursor. That is how filling `{{ $json.mode }}` over `result`
- * produced `{{ $json.mode }}result`: the editor never saw the old text go
- * away. Deleting with a key press is what a human does, so the editor handles
- * it the way it handles a human.
+ * A contenteditable goes through real keyboard events rather than a plain
+ * insertion, because CodeMirror and Monaco keep their own document model and
+ * treat an insertion as an insert at their own cursor. That is how filling
+ * `{{ $json.mode }}` over `result` produced `{{ $json.mode }}result`: the
+ * editor never saw the old text go away. Deleting with a key press is what a
+ * human does, so the editor handles it the way it handles a human. What is NOT
+ * done the way a human does it is the selecting: see selectElementContents.
+ *
+ * Before any of that it asks whether the named element can hold typed text and
+ * owns the region a deletion would clear, which is a different question from
+ * what its tag is, from where focus happens to be, and from whether
+ * isContentEditable is true on it.
  */
 async function setFieldValue(page: Page, locator: Locator, value: string): Promise<void> {
-  const tagName = await tagNameOf(locator);
+  const inspection = await inspectTarget(page, locator);
+  const target = inspection.target;
+  if (target === null) {
+    throw new Error(
+      'fill could not read the element the selector resolved to, so it wrote nothing rather than typing into something it could not identify.'
+    );
+  }
+
   // Playwright's fill has never accepted a <select>, and the error it throws
   // describes the element rather than the way out, so say the way out here.
-  if (tagName === 'SELECT') {
+  if (target.tag === 'SELECT') {
     throw new Error(
       'fill cannot set a <select>: it only works on an input, a textarea or a contenteditable. Use select_option instead, which picks by value, by label or by index and reads the resulting selection back.'
     );
   }
-  if (formControlTags.includes(tagName)) {
-    await locator.fill(value);
-    return;
-  }
-  await locator.focus();
 
-  // Select-all is scoped to whatever holds the caret, so pressing it while
-  // focus never landed on the target would select the whole document and the
-  // delete below would empty the page. Refuse loudly instead.
-  const focused = await locator.evaluate((el: PageElement) => {
-    const active = document.activeElement;
-    return active !== null && (active === el || el.contains(active));
-  });
-  if (!focused) {
+  // Caught here rather than left to Playwright, which waits for the element to
+  // become editable and then times out: a readonly input cost the full 30
+  // seconds and was then explained as "hidden, still animating, zero-sized or
+  // covered", none of which was true.
+  if (target.readOnly || target.disabled) {
     throw new Error(
-      'fill could not put focus inside the target element, so it stopped rather than pressing select-all against the whole document. Is the selector pointing at an input, a textarea, or a contenteditable?'
+      `fill cannot write into ${describeTextTarget(target)}: it is ${target.disabled ? 'disabled' : 'readonly'}, so ` +
+        'no amount of waiting will make it accept text. That is a finding about the page, not about the selector: ' +
+        'whatever is meant to enable it has not happened yet. Nothing was written.'
     );
   }
 
-  await page.keyboard.press(selectAllChord);
+  // BODY and HTML are refused even when the page has genuinely made them
+  // editable, by a contenteditable attribute or by designMode. "Can it receive
+  // text" is then honestly yes, and it is still the wrong thing to write into:
+  // the region is the whole document, so replacing its contents deletes the
+  // page. Measured on a contenteditable body: fill reduced the page to the one
+  // word it was given.
+  if (target.tag === 'BODY' || target.tag === 'HTML') {
+    throw new Error(
+      `fill will not replace the contents of <${target.tag.toLowerCase()}>: the page has made the document itself ` +
+        'editable, so the editing region is the entire page and replacing it would delete everything on it. Name ' +
+        'the specific element you meant. Nothing was written.'
+    );
+  }
+
+  if (!canReceiveText(target)) {
+    throw new Error(
+      refusalForUnwritableTarget('fill was pointed at an element that cannot receive text', target, inspection) +
+        'Nothing was written.'
+    );
+  }
+
+  if (formControlTags.includes(target.tag)) {
+    await locator.fill(value);
+    return;
+  }
+
+  await locator.focus();
+
+  // Focus still has to have landed, because the Delete and the insert that
+  // follow go to whatever holds the caret. Read through inspectTextTarget's
+  // shadow-piercing walk: document.activeElement retargets to the shadow host,
+  // so the identity test this replaces could not see focus that had genuinely
+  // landed inside an open shadow root, and fill on a shadow-DOM contenteditable
+  // threw this error every single time while the element was, in fact, focused.
+  const afterFocus = await inspectTarget(page, locator);
+  if (!afterFocus.caretIsTarget && !afterFocus.caretInsideTarget) {
+    throw new Error(
+      'fill could not put focus inside the target element, so it stopped rather than deleting anything. ' +
+        (afterFocus.caret
+          ? `The caret is on ${describeTextTarget(afterFocus.caret)}, which is outside the element named. `
+          : 'Nothing has focus at all. ') +
+        'Is the selector pointing at an input, a textarea, or a contenteditable? Nothing was written.'
+    );
+  }
+
+  const selected = await selectElementContents(locator);
+  if (!selected) {
+    throw new Error(
+      'fill could not place a selection over the target element\'s own contents, so it stopped rather than pressing ' +
+        'Delete against whatever else happened to be selected. The element may be inside a widget that manages its ' +
+        'own selection. Nothing was written.'
+    );
+  }
   await page.keyboard.press('Delete');
   if (value.length > 0) {
     await page.keyboard.insertText(value);
@@ -353,27 +1291,46 @@ function writeResult(
   actual: string,
   matched: boolean,
   expectation: string,
-  readbackWarning?: string | null
+  readbackWarning?: string | null,
+  destination?: WriteDestination | null
 ): ToolResult {
+  const destinationNote = destination?.note;
+  const withDestination = (rest: string): string => (destinationNote ? `${destinationNote} ${rest}` : rest);
+
   // A rich editor's own textContent readback cannot be trusted, so "matched"
   // is not computed at all here: reporting true would be the false pass this
   // whole file exists to avoid, and reporting false would look like a real
   // write failure when the write may well have landed exactly as asked.
   // Neither claim is honest, so neither is made.
   if (readbackWarning) {
-    return text({ ...base, value: actual, readbackReliable: false, note: readbackWarning });
+    return text({ ...base, value: actual, readbackReliable: false, note: withDestination(readbackWarning) });
+  }
+  // The same refusal to claim, for the other reason a readback can fail to
+  // answer the question: the characters went somewhere the named element does
+  // not cover, so comparing that element against the request says nothing
+  // about whether the typing worked. The readback itself is still honest, so
+  // readbackReliable stays true; it is "matched" that has no answer.
+  if (destination && !destination.readbackStillCovers) {
+    return text({ ...base, value: actual, readbackReliable: true, note: destination.note });
   }
   if (matched) {
-    return text({ ...base, value: actual, matched: true, readbackReliable: true });
+    return text({
+      ...base,
+      value: actual,
+      matched: true,
+      readbackReliable: true,
+      ...(destinationNote ? { note: destinationNote } : {})
+    });
   }
   return text({
     ...base,
     value: actual,
     matched: false,
     readbackReliable: true,
-    note:
+    note: withDestination(
       `The field does not contain what was expected. ${expectation} It now contains ${JSON.stringify(actual)}. ` +
-      'The page may have rewritten, truncated or reformatted the input, or the write may have landed somewhere other than the intended element. Trust "value", not the request.'
+        'The page may have rewritten, truncated or reformatted the input, or the write may have landed somewhere other than the intended element. Trust "value", not the request.'
+    )
   });
 }
 
@@ -424,6 +1381,14 @@ interface PointerPoint {
   selector?: string;
   x: number;
   y: number;
+  /**
+   * How many elements the selector really matched, absent for a raw x/y
+   * endpoint. Reported for the same reason click and hover report it: a
+   * selector that matches eleven nodes still resolves, the FIRST one is what
+   * gets pressed, and a caller who does not know that reads a perfectly
+   * ordinary result as proof the node they meant was the one dragged.
+   */
+  matchedElements?: number;
 }
 
 /**
@@ -496,22 +1461,47 @@ async function readDragProbe(page: Page, armedOn: number): Promise<boolean | nul
 }
 
 /**
- * Turns one pointer endpoint into the viewport point the mouse will visit.
+ * An endpoint whose selector has been waited for and scrolled into view, but NOT yet measured.
  *
- * Three shapes, because a canvas app needs all three: a selector alone means
- * the element's centre, a selector with an offset means a spot inside it (the
- * drag handle in a node's header, not its middle), and a bare x/y means a
- * region of a canvas that is not a DOM element at all and has no selector to
- * name it. Shared by drag and wheel: a wheel has to land on a point too,
+ * The split between preparing and measuring exists because of a bug drag had all to itself.
+ * drag resolved its source completely, then resolved its target, and resolving the target calls
+ * scrollIntoViewIfNeeded, which scrolls the page out from under the source point that was
+ * already measured. The gesture then pressed at coordinates that could be thousands of pixels
+ * stale. The hit test did catch it, so it was never a false pass, but it reported <html> with
+ * containsTarget true and sent the caller hunting for a scrim, never mentioning that the tool's
+ * own second endpoint had moved the first.
+ *
+ * Preparing both endpoints before measuring either one fixes it exactly: every scroll this call
+ * is going to perform has already happened by the time any box is read. It cannot be fixed by
+ * re-resolving the source afterwards, because that would scroll again and invalidate the target
+ * in turn, and two elements far enough apart genuinely cannot both be on screen at once. That
+ * case is now reported rather than papered over: see drag's off-screen note.
+ */
+interface PreparedEndpoint {
+  selector?: string;
+  offsetX?: number;
+  offsetY?: number;
+  locator?: Locator;
+  matchedElements?: number;
+  raw?: { x: number; y: number };
+}
+
+/**
+ * Waits for one pointer endpoint's selector and scrolls it into view, without measuring it.
+ *
+ * Three shapes, because a canvas app needs all three: a selector alone means the element's
+ * centre, a selector with an offset means a spot inside it (the drag handle in a node's header,
+ * not its middle), and a bare x/y means a region of a canvas that is not a DOM element at all
+ * and has no selector to name it. Shared by drag and wheel: a wheel has to land on a point too,
  * because a canvas zooms toward the pointer.
  */
-async function resolvePointerPoint(
+async function preparePointerEndpoint(
   page: Page,
   spec: PointerEndpoint,
   tool: string,
   which: string,
   timeout: number
-): Promise<PointerPoint> {
+): Promise<PreparedEndpoint> {
   const hasSelector = spec.selector !== undefined;
   const hasX = spec.x !== undefined;
   const hasY = spec.y !== undefined;
@@ -525,11 +1515,22 @@ async function resolvePointerPoint(
     );
   }
   if (!hasSelector) {
-    return { x: spec.x as number, y: spec.y as number };
+    return { raw: { x: spec.x as number, y: spec.y as number } };
   }
 
   const selector = spec.selector as string;
-  const locator = page.locator(selector);
+  const all = page.locator(selector);
+  // .first(), and not the bare locator, because waitFor, scrollIntoViewIfNeeded and boundingBox
+  // are all STRICT MODE: on a selector matching several elements they throw rather than pick
+  // one. That throw used to land in the catch below and be rewritten as a timeout, so an
+  // ambiguous selector burned the whole endpoint timeout and then handed the caller advice
+  // about an element appearing late, which can never help when the element is already there
+  // eleven times over. ".react-flow__node" on a canvas with eleven nodes is exactly that shape.
+  // Taking the first match is what click and hover already do, so drag and wheel now mean the
+  // same thing by the same selector as the rest of this file; the count comes back on the
+  // resolved point, and both tools attach a note, so the ambiguity is reported rather than
+  // silently resolved.
+  const locator = all.first();
   try {
     await locator.waitFor({ state: 'attached', timeout });
     await locator.scrollIntoViewIfNeeded({ timeout });
@@ -539,59 +1540,246 @@ async function resolvePointerPoint(
     );
   }
 
-  const box = await locator.boundingBox({ timeout }).catch(() => null);
+  // Counted after the wait, never before: an element that has not attached yet counts zero, and
+  // a count taken then would report an ambiguity that does not exist or miss one that does.
+  const matchedElements = await all.count().catch(() => undefined);
+  return {
+    selector,
+    locator,
+    ...(hasX ? { offsetX: spec.x as number, offsetY: spec.y as number } : {}),
+    ...(matchedElements === undefined ? {} : { matchedElements })
+  };
+}
+
+/**
+ * Reads a prepared endpoint's box and turns it into the viewport point the mouse will visit.
+ *
+ * Deliberately performs no scrolling of its own. Every scroll a call is going to do has
+ * happened by the time this runs, so a point measured here is still valid when the mouse
+ * reaches it.
+ */
+async function measurePointerEndpoint(
+  prepared: PreparedEndpoint,
+  tool: string,
+  which: string,
+  timeout: number
+): Promise<PointerPoint> {
+  if (prepared.raw) return { x: prepared.raw.x, y: prepared.raw.y };
+
+  const selector = prepared.selector as string;
+  const box = await (prepared.locator as Locator).boundingBox({ timeout }).catch(() => null);
   if (!box) {
     throw new Error(
       `${tool} found the ${which} selector ${JSON.stringify(selector)} but it has no layout box, so there is no point to aim at. It is probably display:none or zero-sized.`
     );
   }
 
-  return hasX
-    ? { selector, x: box.x + (spec.x as number), y: box.y + (spec.y as number) }
-    : { selector, x: box.x + box.width / 2, y: box.y + box.height / 2 };
+  const point =
+    prepared.offsetX === undefined
+      ? { selector, x: box.x + box.width / 2, y: box.y + box.height / 2 }
+      : { selector, x: box.x + prepared.offsetX, y: box.y + (prepared.offsetY as number) };
+  return prepared.matchedElements === undefined ? point : { ...point, matchedElements: prepared.matchedElements };
 }
+
+/** Prepare and measure in one step, for a tool with only one endpoint and so nothing to invalidate. */
+async function resolvePointerPoint(
+  page: Page,
+  spec: PointerEndpoint,
+  tool: string,
+  which: string,
+  timeout: number
+): Promise<PointerPoint> {
+  return measurePointerEndpoint(await preparePointerEndpoint(page, spec, tool, which, timeout), tool, which, timeout);
+}
+
+/**
+ * How far the flattened-tree walk and the shadow drill are allowed to run.
+ *
+ * Both are guards against a malformed or hostile tree, NOT expected limits,
+ * and both are now high enough that no real document reaches them: the
+ * previous walk cap of 200 was reachable (measured: 199 intervening levels
+ * passed, 200 failed) by recursive tree UIs and deeply nested rich text, and
+ * hitting it produced a confident MISS naming the leaf, with the "an ancestor
+ * is on top" remedy that could not possibly apply. A cap that is hit is now
+ * reported as an UNKNOWN answer rather than a wrong one, so raising the
+ * numbers is a second line of defence rather than the fix.
+ */
+const HIT_TEST_WALK_CAP = 10000;
+const HIT_TEST_DRILL_CAP = 100;
 
 /** How a covering element is named, the same shape element_box's occludedBy uses. */
 interface TopmostElement {
   tagName: string;
   id: string;
   classes: string | null;
+  /**
+   * Whether this element is an ANCESTOR of the one the caller named, in the
+   * flattened tree, null when there was nothing named to be an ancestor of.
+   *
+   * Worth a field of its own because the two shapes need opposite remedies. An
+   * unrelated element on top is an overlay: move it, or aim at it instead. An
+   * ANCESTOR on top means the point is inside the caller's element's box but
+   * outside anything that element actually hit-tests, so the event reaches the
+   * ancestor and the element's own listeners never run at all. That is what
+   * pointer-events: none, visibility: hidden, a ::before or ::after scrim
+   * painted by the ancestor, a clip-path cut-out, and a wrapped inline whose
+   * box centre falls between its line boxes all look like from here, and none
+   * of them are fixed by changing a z-index.
+   *
+   * Computed by walking UP the flattened tree from the named element, the exact
+   * mirror of the walk that decides matchesTarget, and NOT by Node.contains().
+   * contains() does not cross a shadow boundary, so a button inside an open
+   * shadow root under its light-DOM wrapper's ::after scrim used to report
+   * false here and get the overlay remedy, while the byte-identical light-DOM
+   * shape on the same page reported true and got the right one. The verdict was
+   * correct in both; only the diagnosis flipped, and only because a shadow root
+   * happened to be in the way.
+   */
+  containsTarget: boolean | null;
+  /**
+   * Set when the thing that took the event is not in the same document as the
+   * element named, because an ancestor FRAME was covered. The remedy is
+   * different again: nothing inside the frame can fix it.
+   */
+  inAncestorFrame?: boolean;
+}
+
+/** What a hit test concluded, including the case where it honestly could not conclude. */
+interface PointerHit {
+  matchesTarget: boolean | null;
+  elementAtPoint: TopmostElement | null;
+  /**
+   * Present only when matchesTarget is null DESPITE a selector having been
+   * given, which means a cap was hit and the answer is unknown rather than
+   * negative. Kept distinct from the ordinary matchesTarget null (a raw x/y
+   * endpoint, which named nothing to check) by that field's presence.
+   */
+  unknownReason?: string;
 }
 
 /**
- * Whether a resolved pointer point really belongs to the element a caller named, and what
- * is there if it does not.
+ * The chain of <iframe> elements from the main frame down to the frame the
+ * locator's element actually lives in, outermost first. Empty for the main
+ * frame, which is the overwhelmingly common case.
+ *
+ * This exists because of a coordinate-space bug that made drag and wheel lie
+ * in BOTH directions for any iframe not positioned at exactly (0, 0).
+ * resolvePointerPoint takes its point from Playwright's boundingBox, which is
+ * relative to the MAIN frame's viewport, and the mouse correctly goes to that
+ * pixel. The hit test then ran through locator.evaluate, which executes inside
+ * the FRAME's document, and handed that main-frame coordinate to the frame's
+ * own elementFromPoint. The two spaces differ by the iframe's offset, so an
+ * iframe at (0, 100) produced a confident false failure naming the frame's
+ * <html>, and an iframe at (60, 40) over a large target produced a false PASS,
+ * because the mis-mapped point landed on an uncovered part of the same element
+ * while the real press went to a cover the tool never saw. list_frames tells
+ * callers to prepend a frame prefix to any selector and drag and wheel accept
+ * one, so this was a reachable path rather than a corner.
+ *
+ * Walking the chain, rather than simply translating the point, also closes a
+ * hole that was there before: something in a PARENT document covering the
+ * iframe swallows the event before it ever reaches the frame, and a hit test
+ * that only ever looks inside the frame cannot see that at all.
+ *
+ * Costs two round trips on every hit test with a selector, one for the element
+ * handle and one for its owning frame, and that is deliberate rather than
+ * conditional. The alternative was sniffing the selector string for
+ * Playwright's internal enter-frame step, which is the only string form that
+ * can reach a subframe today, and making a correctness-critical answer depend
+ * on a substring of an internal selector-engine name is exactly the kind of
+ * shortcut this round exists to remove.
+ */
+async function pointerFrameChain(locator: Locator): Promise<ElementHandle[]> {
+  const handle = await locator.elementHandle().catch(() => null);
+  if (!handle) return [];
+  const chain: ElementHandle[] = [];
+  try {
+    let frame = await handle.ownerFrame();
+    while (frame && frame.parentFrame()) {
+      const frameElement = await frame.frameElement();
+      chain.unshift(frameElement);
+      frame = frame.parentFrame();
+    }
+  } catch {
+    // A frame detached mid-walk. Whatever is left is not a usable chain, and
+    // guessing from a partial one would be worse than saying nothing.
+    for (const entry of chain) await entry.dispose().catch(() => {});
+    return [];
+  } finally {
+    await handle.dispose().catch(() => {});
+  }
+  return chain;
+}
+
+/**
+ * Whether a real pointer event at a resolved point would reach the element a caller named, and
+ * what would receive it instead when it would not.
  *
  * resolvePointerPoint only ever measures a bounding box: it has no opinion on what is drawn
  * on top of that box, so a selector that used to be safe to press stays "resolved" correctly
  * even after a modal or a loading spinner covers it completely. The mouse still goes to the
  * right coordinates; the coordinates just no longer belong to the element the caller thinks
- * they do. element_box catches exactly this for a plain click target with elementFromPoint,
- * and this reuses the same test rather than inventing a second one.
+ * they do. element_box asks the identical question for a plain click target, and shares the
+ * identical in-page walk.
  *
- * The match is deliberately wider than element_box's topmostAtCentre, which only accepts the
- * element itself or a descendant of it. A descendant is still accepted here for the same
- * reason (a click aimed at a <button>'s centre is received by whatever inline element paints
- * there, and the button still opens). An ANCESTOR is accepted too, which topmostAtCentre is
- * not asked to do: a selector can legitimately name a node nested inside the thing that
- * really receives pointer events, such as a label inside a bigger draggable region, or a
- * canvas whose interactive overlay is the target's own parent. Rejecting that as an
- * "occlusion" would turn a normal, working drag into a false failure. Anything that is
- * neither the target, an ancestor, nor a descendant of it really is a different element
- * receiving the gesture, and that is what gets reported.
+ * The test is the browser's own answer, not an approximation of it. A pointerdown at (x, y)
+ * dispatches on the deepest node the hit test finds there and then propagates up the FLATTENED
+ * tree, so the elements whose listeners run are exactly the elements on that composed path.
+ * matchesTarget is therefore "the named element is on the composed path of the true topmost
+ * node at this point", built in two steps: drill document.elementFromPoint through open shadow
+ * roots to the real deepest node, then climb with assignedSlot first and parentNode second,
+ * stepping from a ShadowRoot (nodeType 11) to its host.
+ *
+ * That encodes an asymmetry which the predicate this replaced had exactly backwards. An
+ * ANCESTOR of the hit node is on the path, so a <button> whose centre is painted by its own
+ * inline label, or a parent that receives a press because its child is pointer-events: none,
+ * both match. A DESCENDANT of the hit node is NOT on the path, and the old code accepted one:
+ * it asked hit.contains(el) as well, which meant <body> and <html> matched every selector on
+ * the page, and any container an element sits inside counted as a hit on the element. On a
+ * React Flow canvas the pane is an ancestor of every node, so a drag endpoint that fell just
+ * outside a node landed on the pane and was reported as a clean hit on the node, while the
+ * node provably never moved and the pane panned instead.
+ *
+ * Walking the flattened tree rather than the DOM tree is also what fixes the shadow cases in
+ * both directions. Targeting a shadow HOST used to fail: the drill descends past the host into
+ * its own shadow content, which is neither the host nor reachable from it by contains(), so the
+ * tool named the target's own child as the coverer while the page's listener on the host fired.
+ * The host is on the composed path of its shadow content, so it now matches, and no "stop the
+ * drill at the target" special case is needed. Slotted content is the same bug from the other
+ * side: a shadow-tree wrapper painting around light-DOM children it slots in is on the composed
+ * path of a press on those children, but the slotted node's parentNode is the HOST, not the
+ * wrapper, so contains() cannot see the relationship in either direction. assignedSlot can.
+ *
+ * Note that <body> and <html> are on the composed path of every point, so a caller who really
+ * does name "body" matches everywhere. That is correct, not a loophole: a press anywhere on the
+ * page does run body's listeners. elementAtPoint is filled in whenever the topmost node is not
+ * the named element ITSELF, match or no match, so naming "body" with an offset still tells you
+ * what is really at that point rather than being strictly less informative than passing the
+ * same coordinates raw.
+ *
+ * A pointer event does not propagate across a frame boundary, so the composed path of an
+ * element inside an iframe is bounded by that frame's document. The frame chain above is walked
+ * first for exactly that reason: each ancestor frame has to actually receive the event at that
+ * point before the question of what happens inside it means anything.
  *
  * A raw x/y endpoint names no element, so there is nothing to compare against: matchesTarget
  * comes back null rather than false, which would read as a failure that was never checked.
  * elementAtPoint is still filled in when something is there, purely as a diagnostic: a canvas
  * drag that silently does nothing is much faster to debug once you know the point actually
  * landed on a debug banner rather than the canvas.
+ *
+ * The in-page snippet below is deliberately a second copy of element_box's, in inspect.ts,
+ * rather than a shared helper: both run under a tsconfig with no dom lib, each against its own
+ * minimal element shim, so sharing would cost more than it saves. What is shared is the exact
+ * algorithm: the shadow drill, the composed-path walk, the mirrored ancestor walk behind
+ * containsTarget, and both caps. What is NOT shared, and must not be assumed to be, is the
+ * frame handling: this tool aims a real mouse at a MAIN-frame coordinate and therefore has to
+ * verify every ancestor frame on the way down, while element_box measures and hit-tests
+ * entirely within one frame's own coordinate space. Each file says so at its own copy.
  */
-async function hitTestPointerPoint(
-  page: Page,
-  point: PointerPoint
-): Promise<{ matchesTarget: boolean | null; elementAtPoint: TopmostElement | null }> {
+async function hitTestPointerPoint(page: Page, point: PointerPoint): Promise<PointerHit> {
   if (point.selector === undefined) {
-    const elementAtPoint = await page.evaluate((arg: { x: number; y: number }) => {
+    const elementAtPoint = await page.evaluate((arg: { x: number; y: number; drillCap: number }) => {
       // Drilled the same way the selector branch below is, and for the same reason: without
       // it, a raw point sitting inside a shadow tree would always be reported as the shadow
       // host itself, which is a useless answer for a diagnostic field whose whole point is
@@ -600,61 +1788,178 @@ async function hitTestPointerPoint(
       // file keeps type-checking against a real HTMLElement.
       let hit = document.elementFromPoint(arg.x, arg.y) as ShadowDrillElement | null;
       let shadowDrillDepth = 0;
-      while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function' && shadowDrillDepth < 20) {
+      while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function') {
+        if (shadowDrillDepth >= arg.drillCap) break;
         const deeper = hit.shadowRoot.elementFromPoint(arg.x, arg.y);
         if (!deeper || deeper === hit) break;
         hit = deeper;
         shadowDrillDepth += 1;
       }
-      return hit ? { tagName: String(hit.tagName).toLowerCase(), id: hit.id || '', classes: hit.getAttribute('class') } : null;
-    }, point);
+      return hit
+        ? { tagName: String(hit.tagName).toLowerCase(), id: hit.id || '', classes: hit.getAttribute('class'), containsTarget: null }
+        : null;
+    }, { x: point.x, y: point.y, drillCap: HIT_TEST_DRILL_CAP });
     return { matchesTarget: null, elementAtPoint };
   }
 
-  // A fresh locator rather than the one resolvePointerPoint already built: this runs
-  // immediately afterwards against the same page, so it resolves to the same element, and
-  // reusing it here would mean threading a Locator through resolvePointerPoint's return
-  // value for every caller that never needs it.
-  const locator = page.locator(point.selector);
-  return locator.evaluate((el: PageElement, arg: { x: number; y: number }) => {
-    // document.elementFromPoint retargets into the shadow host for ANYTHING inside a shadow
-    // tree, open or closed, and Node.contains() does not cross that boundary the other way:
-    // confirmed directly against real Chromium, a shadow host does not contain() its own
-    // shadow content, because a node's parent inside a shadow tree is the shadow root, not the
-    // host. So without drilling, hit === el, el.contains(hit) and hit.contains(el) are ALL
-    // false for anything inside a shadow root, occluded or not: a real drag or wheel target
-    // with nothing whatsoever on top of it read as occluded by its own host, the drag/wheel
-    // version of the bug element_box's topmostAtCentre had before its own fix (see inspect.ts).
-    // Drilling through hit.shadowRoot.elementFromPoint recovers the real topmost node inside
-    // the shadow tree, so the three comparisons above work again exactly as they do in the
-    // light DOM: hit === el for a clean unoccluded target, and hit.contains(el) / el.contains(hit)
-    // for an ordinary ancestor/descendant nesting, now evaluated within the shadow root's own
-    // tree instead of against a host outside it. That is also what keeps a real overlay honest
-    // once the drill is added: an overlay sitting on top of the target INSIDE THAT SAME shadow
-    // root drills down to become `hit` itself, a SIBLING of `el`, not an ancestor, so it fails
-    // all three comparisons and is reported as the occluder, rather than being missed (as it
-    // was without the drill) or waved through as an ancestor it never structurally was.
-    // ShadowRoot.elementFromPoint, unlike Document's, does not retarget, so re-querying the
-    // same point against hit.shadowRoot is what makes this work, and repeating it handles
-    // shadow roots nested in shadow roots. Kept in step with element_box's identical drill in
-    // inspect.ts; if one changes, change the other.
-    let hit = document.elementFromPoint(arg.x, arg.y) as ShadowDrillElement | null;
-    let shadowDrillDepth = 0;
-    while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function' && shadowDrillDepth < 20) {
-      const deeper = hit.shadowRoot.elementFromPoint(arg.x, arg.y);
-      if (!deeper || deeper === hit) break;
-      hit = deeper;
-      shadowDrillDepth += 1;
+  // .first(), because locator.evaluate is strict mode and would throw outright on the same
+  // multi-match selector resolvePointerPoint just took the first match of. A fresh locator
+  // rather than the one resolvePointerPoint already built: this runs immediately afterwards
+  // against the same page, so it resolves to the same element, and reusing it would mean
+  // threading a Locator through resolvePointerPoint's return value for every caller that
+  // never needs one.
+  const locator = page.locator(point.selector).first();
+
+  // Descend the frame chain first, translating the point into each frame's own coordinate
+  // space and checking at every level that the event really reaches the next frame down.
+  const chain = await pointerFrameChain(locator);
+  let local = { x: point.x, y: point.y };
+  try {
+    for (const frameElement of chain) {
+      const step = await frameElement.evaluate(
+        (element: unknown, arg: { x: number; y: number; drillCap: number }) => {
+          const host = element as FrameHostElement;
+          let hit = document.elementFromPoint(arg.x, arg.y) as ShadowDrillElement | null;
+          let shadowDrillDepth = 0;
+          while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function') {
+            if (shadowDrillDepth >= arg.drillCap) break;
+            const deeper = hit.shadowRoot.elementFromPoint(arg.x, arg.y);
+            if (!deeper || deeper === hit) break;
+            hit = deeper;
+            shadowDrillDepth += 1;
+          }
+          // An <iframe> has no rendered light-DOM children of its own, so the only clean
+          // answer at this point is the iframe element itself. Anything else, including the
+          // frame's own ancestors when something with pointer-events: none is in the way, is
+          // the parent document swallowing the event before the frame ever sees it.
+          const reaches = (hit as unknown) === (host as unknown);
+          const rect = host.getBoundingClientRect();
+          const style = window.getComputedStyle(host);
+          const scaleX = host.offsetWidth ? rect.width / host.offsetWidth : 1;
+          const scaleY = host.offsetHeight ? rect.height / host.offsetHeight : 1;
+          // The child document is painted in the iframe's CONTENT box, so the origin is the
+          // border box plus border and padding, each scaled the same way the box was.
+          const originX = rect.left + ((parseFloat(style.borderLeftWidth) || 0) + (parseFloat(style.paddingLeft) || 0)) * scaleX;
+          const originY = rect.top + ((parseFloat(style.borderTopWidth) || 0) + (parseFloat(style.paddingTop) || 0)) * scaleY;
+          return {
+            reaches,
+            x: (arg.x - originX) / (scaleX || 1),
+            y: (arg.y - originY) / (scaleY || 1),
+            hit: hit
+              ? {
+                  tagName: String(hit.tagName).toLowerCase(),
+                  id: hit.id || '',
+                  classes: hit.getAttribute('class'),
+                  containsTarget: false,
+                  inAncestorFrame: true
+                }
+              : null
+          };
+        },
+        { x: local.x, y: local.y, drillCap: HIT_TEST_DRILL_CAP }
+      );
+      if (!step.reaches) return { matchesTarget: false, elementAtPoint: step.hit };
+      local = { x: step.x, y: step.y };
     }
-    if (!hit) return { matchesTarget: false, elementAtPoint: null };
-    const matchesTarget = hit === el || el.contains(hit) || hit.contains(el);
-    return {
-      matchesTarget,
-      elementAtPoint: matchesTarget
-        ? null
-        : { tagName: String(hit.tagName).toLowerCase(), id: hit.id || '', classes: hit.getAttribute('class') }
-    };
-  }, point);
+  } finally {
+    for (const frameElement of chain) await frameElement.dispose().catch(() => {});
+  }
+
+  return locator.evaluate(
+    (el: PageElement, arg: { x: number; y: number; walkCap: number; drillCap: number }) => {
+      // Step one: the true topmost node. document.elementFromPoint retargets to the shadow HOST
+      // for anything inside a shadow tree, open or closed, so on its own it never names what is
+      // really there. ShadowRoot.elementFromPoint does not retarget, so re-querying the same
+      // point against hit.shadowRoot recovers the real node, and repeating it handles shadow
+      // roots nested in shadow roots. A closed root reports shadowRoot null, so the drill stops
+      // at the host, which is the honest answer: nothing outside can see into a closed root.
+      let hit = document.elementFromPoint(arg.x, arg.y) as ShadowDrillElement | null;
+      let shadowDrillDepth = 0;
+      let truncated = false;
+      while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function') {
+        if (shadowDrillDepth >= arg.drillCap) {
+          truncated = true;
+          break;
+        }
+        const deeper = hit.shadowRoot.elementFromPoint(arg.x, arg.y);
+        if (!deeper || deeper === hit) break;
+        hit = deeper;
+        shadowDrillDepth += 1;
+      }
+      if (!hit) return { matchesTarget: false, elementAtPoint: null };
+
+      // Step two: climb the flattened tree from that node, which is the path a real pointerdown
+      // propagates along, and look for the element the caller named. assignedSlot is tried FIRST
+      // and that order matters: a slotted light-DOM node's flattened parent is the <slot> it was
+      // distributed into, inside the shadow tree, while its parentNode is the host outside it, so
+      // checking parentNode first skips every shadow-tree element that paints around it. The
+      // nodeType 11 step is the shadow root itself, which is not an element and has no parent of
+      // its own; hopping to its host is what carries the walk back out into the light DOM.
+      let matchesTarget = false;
+      let node: FlatNode | null = hit as FlatNode;
+      let steps = 0;
+      while (node) {
+        if ((node as unknown) === (el as unknown)) {
+          matchesTarget = true;
+          break;
+        }
+        if (steps >= arg.walkCap) {
+          truncated = true;
+          break;
+        }
+        node = node.assignedSlot ?? (node.nodeType === 11 ? (node.host ?? null) : (node.parentNode ?? null));
+        steps += 1;
+      }
+
+      // The mirror walk, UP from the named element, answering whether the thing that took the
+      // event is an ancestor of it. Node.contains() was used here and was wrong: it does not
+      // cross a shadow boundary, so the identical scrim-over-a-button shape reported one
+      // diagnosis in the light DOM and the opposite one inside a shadow root.
+      let containsTarget = false;
+      if (!matchesTarget) {
+        let up: FlatNode | null = el as unknown as FlatNode;
+        let upSteps = 0;
+        while (up) {
+          if ((up as unknown) === (hit as unknown)) {
+            containsTarget = true;
+            break;
+          }
+          if (upSteps >= arg.walkCap) {
+            truncated = true;
+            break;
+          }
+          up = up.assignedSlot ?? (up.nodeType === 11 ? (up.host ?? null) : (up.parentNode ?? null));
+          upSteps += 1;
+        }
+      }
+
+      const elementAtPoint =
+        (hit as unknown) === (el as unknown)
+          ? null
+          : {
+              tagName: String(hit.tagName).toLowerCase(),
+              id: hit.id || '',
+              classes: hit.getAttribute('class'),
+              containsTarget
+            };
+      // A cap that was actually reached means the walk gave up, not that the element is not
+      // there. Reporting that as a confident miss is what produced the "an ancestor is on top"
+      // remedy for a tree that simply happened to be deep, so it is reported as unknown.
+      if (truncated && !matchesTarget) {
+        return {
+          matchesTarget: null,
+          elementAtPoint,
+          unknownReason:
+            'The hit test gave up before it could answer: the DOM at this point is nested deeper than the ' +
+            'walk is allowed to run, so whether a press here reaches the named element is UNKNOWN rather ' +
+            'than known to be false. Nothing here is evidence of an overlay. Aim at a shallower element, ' +
+            'or check the page for a runaway nesting loop.'
+        };
+      }
+      return { matchesTarget, elementAtPoint };
+    },
+    { x: local.x, y: local.y, walkCap: HIT_TEST_WALK_CAP, drillCap: HIT_TEST_DRILL_CAP }
+  );
 }
 
 /** How `elementAtPoint` is named in a sentence, for the note a mismatched hit test writes. */
@@ -662,7 +1967,64 @@ function describeElement(el: TopmostElement | null): string {
   if (!el) return 'nothing that elementFromPoint could find';
   const id = el.id ? ` id=${JSON.stringify(el.id)}` : '';
   const classes = el.classes ? ` class=${JSON.stringify(el.classes)}` : '';
-  return `<${el.tagName}${id}${classes}>`;
+  const where = el.inAncestorFrame ? ', in an ancestor frame' : '';
+  return `<${el.tagName}${id}${classes}>${where}`;
+}
+
+/**
+ * The remedy sentence for a missed endpoint, which differs by how the element that took the
+ * press is related to the one that was named.
+ *
+ * An ancestor taking the press is the more confusing of the two, and the more common: the point
+ * really is inside the named element's box, so the coordinates look right, but it is outside
+ * anything that element hit-tests, so the element's own handlers never run. Telling that caller
+ * to change a z-index sends them after an overlay that does not exist.
+ */
+function missRemedy(el: TopmostElement | null): string {
+  if (el?.inAncestorFrame) {
+    return (
+      'That element is in an ANCESTOR FRAME, not in the same document as the selector: the point never ' +
+      'reaches the iframe at all, so nothing inside the frame receives the event and nothing inside the ' +
+      'frame can fix it. Something in the parent document is covering the iframe, or the iframe itself is ' +
+      'pointer-events: none. Deal with the parent document first.'
+    );
+  }
+  if (el?.containsTarget) {
+    return (
+      'That element is an ANCESTOR of the selector in the DOM, not an overlay: the point is inside the named element\'s ' +
+      'bounding box but outside anything it actually hit-tests, so the ancestor receives the event and the named ' +
+      'element\'s own handlers never run. The usual causes are pointer-events: none or visibility: hidden on the ' +
+      'element itself, a ::before or ::after painted by the ancestor over it, a clip-path or border-radius cut-out ' +
+      'whose box centre falls in the removed part, an inline that wraps so its box centre lands between its line ' +
+      'boxes, and an offset that simply falls off the element onto the container behind it. Aim at a point that is ' +
+      'really on the element, or name the ancestor if the ancestor is what you meant to press. Changing a z-index ' +
+      'will not help.'
+    );
+  }
+  return (
+    'Coordinates still went where the box math said, but something else was really on top of the point, which is ' +
+    'exactly how a modal, a loading overlay or a sibling drawn later swallows a gesture while the call still looks ' +
+    'clean. If that element is meant to be there (a transparent hit-testing overlay over a canvas, say) this is not ' +
+    'a failure; otherwise move it out of the way or point the selector at what is really on top.'
+  );
+}
+
+/**
+ * The note an ambiguous endpoint selector earns, empty when there is nothing ambiguous.
+ *
+ * Shared by drag and wheel so both say the same thing click and hover already say about the
+ * same situation, rather than each inventing its own wording for "the first one is what ran".
+ */
+function multiMatchNote(points: { which: string; point: PointerPoint }[]): string[] {
+  return points
+    .filter(entry => (entry.point.matchedElements ?? 1) > 1)
+    .map(
+      entry =>
+        `The ${entry.which} selector ${JSON.stringify(entry.point.selector)} matched ${entry.point.matchedElements} elements ` +
+        'and the FIRST one was used, the same way click and hover resolve an ambiguous selector. Playwright selectors ' +
+        'also pierce open shadow roots, so a positional path can match far more of the page than it looks like it ' +
+        'should. Narrow the selector, or add ">> nth=N", if the first match is not the one you meant.'
+    );
 }
 
 /** A pointer endpoint's schema, shared by drag's source and target and by wheel's point, so all three mean the same thing. */
@@ -730,7 +2092,7 @@ function readAttachedFiles(locator: Locator): Promise<{ name: string; size: numb
 async function readNavigationHistory(
   context: { newCDPSession(page: Page): Promise<{ send(method: any, params?: any): Promise<unknown>; detach(): Promise<void> }> },
   page: Page
-): Promise<{ index: number; length: number } | null> {
+): Promise<{ index: number; length: number; urls: string[] } | null> {
   let cdpSession: { send(method: any, params?: any): Promise<unknown>; detach(): Promise<void> } | undefined;
   try {
     cdpSession = await context.newCDPSession(page);
@@ -738,7 +2100,17 @@ async function readNavigationHistory(
       currentIndex: number;
       entries: unknown[];
     };
-    return { index: history.currentIndex, length: history.entries.length };
+    // The entry URLs were already in this payload and were being discarded.
+    // They are the only way to answer "did the step land on the entry it
+    // aimed at", which an index alone cannot: a guard calling
+    // location.replace swaps the entry's contents in place, so the index
+    // moves exactly one the right way while the tab ends up on a page the
+    // caller never asked for.
+    return {
+      index: history.currentIndex,
+      length: history.entries.length,
+      urls: history.entries.map(entry => String((entry as { url?: unknown }).url ?? ''))
+    };
   } catch {
     return null;
   } finally {
@@ -763,7 +2135,13 @@ async function readNavigationHistory(
  */
 async function historyStep(
   ctx: ToolContext,
-  args: { sessionId: string; pageId?: string; waitUntil?: 'load' | 'domcontentloaded' | 'networkidle' | 'commit' },
+  args: {
+    sessionId: string;
+    pageId?: string;
+    waitUntil?: 'load' | 'domcontentloaded' | 'networkidle' | 'commit';
+    settleMs?: number;
+    timeoutMs?: number;
+  },
   direction: 'back' | 'forward'
 ): Promise<ToolResult> {
   const target = ctx.sessions.resolve(args.sessionId, args.pageId);
@@ -791,44 +2169,118 @@ async function historyStep(
   }
 
   const before = await documentIdentity(target.page);
-  const options = args.waitUntil ? { waitUntil: args.waitUntil } : undefined;
-  const response = direction === 'back' ? await target.page.goBack(options) : await target.page.goForward(options);
-  const after = await documentIdentity(target.page);
-  const url = target.page.url();
+  // What this step is AIMING at, captured before it happens. The index alone
+  // is not enough: a guard that calls location.replace from its popstate
+  // handler swaps the entry's contents in place, so the index still moves
+  // exactly one the right way while the tab lands on a page the caller never
+  // asked for. Reproduced on a real SPA: index 16 to 15, "navigated": true,
+  // "sameDocument": true, and a note promising the JS context survived, while
+  // the tab was actually on a freshly loaded /login.
+  const expectedIndex = history === null ? null : direction === 'back' ? history.index - 1 : history.index + 1;
+  const expectedUrl = history === null || expectedIndex === null ? null : (history.urls[expectedIndex] ?? null);
 
-  // Re-read rather than doing arithmetic on the PRE-step `history` above.
-  // Probed against a back-trapping SPA (a popstate handler that re-pushes its
-  // own URL, exactly what a route guard or an unsaved-changes interceptor
-  // does): the trap does not merely leave the index where it was, it moves
-  // the browser back and then pushes a fresh entry forward again, so
-  // `history.index - 1` corroborated a step that never really landed the
-  // caller anywhere. Only a fresh read of Chromium's own history tells the
-  // truth about where the tab ended up.
+  const watch = watchNavigationActivity(target.page);
+  let response: Response | null = null;
+  let timedOut = false;
+  let settled: PageSnapshot;
+  let stillMoving: boolean;
+  const timeoutMs = args.timeoutMs ?? NAVIGATION_TIMEOUT_MS;
+  const settleMs = args.settleMs ?? NAVIGATION_SETTLE_MS;
+  try {
+    try {
+      const options = { timeout: timeoutMs, ...(args.waitUntil ? { waitUntil: args.waitUntil } : {}) };
+      response = direction === 'back' ? await target.page.goBack(options) : await target.page.goForward(options);
+    } catch (error) {
+      // A beforeunload handler makes the step hang until the timeout and then
+      // die on a raw Playwright error, which is a poor way to report the very
+      // thing this tool documents: a page refusing to let the step happen.
+      // Reported as the blocked step it is.
+      // A refused step reaches here two ways depending on how Chromium
+      // abandons it, a timeout or an outright abort, and both mean the same
+      // thing to a caller: the page would not let the step happen. Treated
+      // identically rather than one of them escaping as a raw error.
+      if (!isTimeoutError(error) && !isAbortedError(error)) throw error;
+      timedOut = true;
+    }
+    // THE SETTLE, which this call site never had. goBack resolves as soon as
+    // the traversal commits, and a guard's own navigation has not started
+    // yet at that moment, so reading url and identity here described a
+    // document that was about to be thrown away. This is the sibling call
+    // site navigate's fix did not reach.
+    ({ snapshot: settled, stillMoving } = await settleAfterNavigation(target.page, watch.activity, timedOut ? 0 : settleMs));
+  } finally {
+    watch.stop();
+  }
+
+  const url = settled.url;
   const afterHistory = await readNavigationHistory(target.session.context, target.page);
 
   // Same rule navigate uses, for the same reason: a null response alone is
   // ambiguous, so the document's own identity settles it, and an unreadable
-  // identity errs toward warning the caller.
-  const sameDocument = response === null && (before === null || after === null || before === after);
-  // `canStep` was dropped from this check. It only says a history entry
-  // EXISTS to step to, not that the step actually happened, and it used to
-  // sit first in this expression, short-circuiting the three terms that
-  // genuinely measure movement. Probed against a back-trapping SPA: canStep
-  // was true (there really was an entry to go back to), the trap re-pushed
-  // the same URL, and the result still came back "navigated": true, "url"
-  // unchanged from "previousUrl", a clean pass for a back button that did
-  // nothing. What is left below is evidence a step really happened: a real
-  // HTTP response came back, the URL is different, or the document's own
-  // identity changed.
-  const navigated = response !== null || url !== previousUrl || (before !== null && after !== null && before !== after);
+  // identity errs toward warning the caller. Read from the SETTLED document,
+  // so a guard that did a full page load can no longer be reported as a
+  // same-document step whose JS context survived.
+  const sameDocument =
+    response === null && (before === null || settled.identity === null || before === settled.identity) && !timedOut;
 
+  // Evidence the tab moved at all: a real HTTP response, a changed URL, or a
+  // changed document identity. `canStep` is deliberately not part of this: it
+  // only says an entry EXISTED to step to.
+  const moved = response !== null || url !== previousUrl || (before !== null && settled.identity !== null && before !== settled.identity);
+
+  // Three separate things have to hold for a step to count, and each of them
+  // was found in production by an adversary attacking the previous two:
+  // the tab moved, it ended on the index the step aimed at, and the entry it
+  // landed on is the one it aimed at.
+  const landedOnExpectedIndex = expectedIndex === null || afterHistory === null ? null : afterHistory.index === expectedIndex;
+  // A NEW document is what separates a guard hijacking the step from an app
+  // relabelling its own URL after arriving. location.replace and
+  // location.assign both load a whole new document, which is the attack this
+  // check exists for. history.replaceState does not, and an SPA tidying its
+  // URL on arrival is a healthy, extremely common thing that must not be
+  // reported as a blocked step: the round before this one turned a true
+  // "ok" into null by making exactly that mistake in navigate, and the same
+  // trap is here. So a URL that differs only without a document change
+  // counts as having landed, and is still disclosed through "url".
+  const loadedNewDocument =
+    response !== null || (before !== null && settled.identity !== null && before !== settled.identity);
+  const landedOnExpectedUrl = expectedUrl === null ? null : url === expectedUrl || !loadedNewDocument;
+  const navigated = moved && landedOnExpectedIndex !== false && landedOnExpectedUrl !== false && !timedOut;
+
+  const indexDelta = history === null || afterHistory === null ? null : afterHistory.index - history.index;
   const notes: string[] = [];
   if (navigated && sameDocument) {
     notes.push(
       'Same-document step: the URL changed but the document was NOT reloaded. The JS context, in-page state and the console buffer all survive, and the page saw a popstate event rather than a load. This is what a hash or pushState entry looks like going back.'
     );
   }
-  if (!navigated) {
+  if (timedOut) {
+    notes.push(
+      `Blocked: the ${direction} step did not finish within ${timeoutMs}ms and the tab is still on ${url}. A beforeunload handler is the usual cause, since it asks the browser to stay and this session dismisses that dialog rather than leaving. Treat this as a step the page refused, not as a tool failure. Raise "timeoutMs" if the page is merely slow.`
+    );
+  } else if (!navigated && moved) {
+    // It moved, but not to where the step pointed. Say which way it went and
+    // where it ended up, because "url" is the field a caller acts on.
+    const parts: string[] = [
+      `The tab moved, but this ${direction} step did not land where it aimed.`
+    ];
+    if (expectedUrl !== null && url !== expectedUrl) {
+      parts.push(`It aimed at ${expectedUrl} and ended on ${url}, having loaded a whole new document to get there.`);
+    }
+    if (indexDelta !== null) {
+      const magnitude = Math.abs(indexDelta);
+      parts.push(
+        indexDelta === 0
+          ? `Chromium's own history index is back where it started (${afterHistory?.index}).`
+          : `Chromium's own history index went from ${history?.index} to ${afterHistory?.index}, ${magnitude} entr${magnitude === 1 ? 'y' : 'ies'} ${indexDelta < 0 ? 'back' : 'forward'}, where a single ${direction} step moves one ${direction}.`
+      );
+    }
+    parts.push(
+      'That is a page intercepting the popstate this step fired and moving the tab itself, which is what a route guard, an unsaved-changes interceptor or a client-side auth bounce to a login page does. Treat this as a blocked step. ' +
+        '"url", "title" and "sameDocument" all describe where the tab REALLY ended up, read after the page finished moving, so act on them rather than assuming the tab stayed put.'
+    );
+    notes.push(parts.join(' '));
+  } else if (!navigated) {
     notes.push(
       `Nothing moved: the tab is still on ${previousUrl}, even though there was a ${direction} entry to step to. ` +
         'This is what a route guard or an unsaved-changes interceptor looks like from the outside: the page saw the ' +
@@ -836,15 +2288,31 @@ async function historyStep(
         'and the page genuinely stopped it. Treat this as a blocked step, not a no-op.'
     );
   }
+  const pending: PendingNavigation | undefined = stillMoving
+    ? {
+        reason: `the tab was still navigating when the ${settleMs}ms settle window closed, so this describes a document that may already have been replaced`,
+        afterMs: settleMs
+      }
+    : settled.pendingRefresh !== null
+      ? {
+          reason: `this document carries a meta refresh that fires in ${settled.pendingRefresh.seconds}s, so the tab will move on its own after this call returns`,
+          afterMs: Math.round(settled.pendingRefresh.seconds * 1000)
+        }
+      : undefined;
+  if (pending) notes.push(`This answer may already be out of date: ${pending.reason}.`);
 
   return text({
     pageId: target.pageId,
     navigated,
     url,
-    title: await target.page.title().catch(() => ''),
+    title: settled.title,
     sameDocument: navigated ? sameDocument : false,
     previousUrl,
+    ...(timedOut ? { timedOut: true } : {}),
+    ...(history ? { previousHistoryIndex: history.index } : {}),
+    ...(expectedUrl !== null ? { expectedUrl } : {}),
     ...(afterHistory ? { historyIndex: afterHistory.index, historyLength: afterHistory.length } : {}),
+    ...pendingNavigationPayload(pending),
     ...(notes.length ? { note: notes.join(' ') } : {})
   });
 }
@@ -950,36 +2418,59 @@ async function readSettledScrollState(page: Page, x: number, y: number): Promise
 /** Tools that drive a tab: moving it somewhere and acting on the page. */
 export const interactionTools = defineTools({
   navigate: defineTool({
+    // Serialized per session, the same way click is, and for the same reason
+    // the history steps are. Two navigations issued without awaiting each
+    // other tear each other's request down: probed directly, concurrent
+    // navigate calls rejected with "net::ERR_ABORTED" and concurrent reloads
+    // rejected with "net::ERR_ABORTED; maybe frame was detached?", both of
+    // them failures reported for work the browser had partly done. Queuing
+    // them makes the second act on the tab the first one left behind, which
+    // is what a caller issuing two in a row means, and it also keeps a click
+    // from landing in the middle of a navigation.
+    serializesInput: true,
     description:
       'Navigate a session\'s tab to a URL. A URL differing from the current one only in its hash is a SAME-DOCUMENT navigation: the browser changes the address but does not reload, so the JS context, in-page state (React state, timers, subscriptions) and the console buffer all survive. This tool does not quietly force a reload in that case, because navigating to a hash is a legitimate thing to test. It reports it instead: every result carries a "sameDocument" boolean, present in both the true and the false case, plus a note when it is true. Use reload when you need a real page load. ' +
-      'This is the most-called tool in the whole surface, and it reports the real HTTP outcome rather than treating a rendered page as success: every result carries "status" (the HTTP status code) and "ok" (whether it was in the 200 to 299 range), exactly as reload does, so navigating to a URL that answers 404 or 500 does not read as an ordinary success just because something rendered, which matters most for an SPA shell that paints its own error state under a failing response. "status" and "ok" are both null when there genuinely is no HTTP response to report a status FOR, which is not a failure: a same-document navigation, about:blank, or a non-HTTP scheme such as data: or javascript:. A note explains which of those it was, so a null status is never mistaken for a navigation that silently failed.',
+      'This is the most-called tool in the whole surface, and it reports the real HTTP outcome rather than treating a rendered page as success: every result carries "status" (the HTTP status code) and "ok" (whether it was in the 200 to 299 range), exactly as reload does, so navigating to a URL that answers 404 or 500 does not read as an ordinary success just because something rendered, which matters most for an SPA shell that paints its own error state under a failing response. "status" and "ok" are both null when there genuinely is no HTTP response to report a status FOR, which is not a failure: a same-document navigation, about:blank, or a non-HTTP scheme such as data: or javascript:. A note explains which of those it was, so a null status is never mistaken for a navigation that silently failed. ' +
+      'ONE PAYLOAD ALWAYS DESCRIBES ONE DOCUMENT. "status" and "ok" belong to the document "url" and "title" describe, not to whatever the first request happened to answer, and the call watches for a real, stated window ("settleMs", 500ms by default, watched in FULL rather than exited early) before reading any of them, so a client-side redirect fired inside that window is caught rather than missed. That matters because a client-side redirect is an ordinary shape: a 200 shell that runs location.replace on a failing route, a meta refresh chain, or a router bouncing an unauthenticated visitor to a login page. When one happens the result also carries "documentChanged", holding the response the navigation itself measured ("from"), the document finally described ("to"), and every main-frame document this call saw, in order, plus a note saying so. So ok: true beside a login page title, or beside a 500 error page, is a shape you will not see here. If the final document has no HTTP response of its own, because it ended on about:blank or a data: URL, "status" and "ok" are null rather than carrying the earlier document\'s status. A redirect fired LATER than the window is not caught, and rather than being silent about that the result says so: "pendingNavigation" appears whenever the tab was still moving when the window closed, or the document being described carries a meta refresh that has not fired yet, so a caller can raise settleMs or simply look again. Calls are serialized per session, so two navigations issued without awaiting each other queue instead of aborting each other. A page that never stops navigating, one that replaces itself with itself, does not hang the call and does not throw a raw timeout either: it comes back with "timedOut": true, a "pendingNavigation" naming the redirect loop, and a description of whatever the tab was showing when "timeoutMs" ran out.',
     inputSchema: z.object({
       sessionId,
       pageId,
       url: z.string().describe('URL to navigate the tab to.'),
-      waitUntil
+      waitUntil,
+      settleMs: z
+        .number()
+        .int()
+        .min(0)
+        .max(30_000)
+        .optional()
+        .describe(
+          'How long to keep watching for the page to move itself before measuring it, in milliseconds. Defaults to 500, and that window is real: it is watched in FULL rather than exited as soon as things look quiet, because there is no signal a page can give that it will NOT navigate again, so the only way to know is to watch. A client-side redirect fired inside the window is caught and reported; one fired after it is not. BEFORE YOU LOWER THIS TO SAVE LATENCY, know what you are buying and what you are giving up. Setting it to 0 makes the call as fast as it used to be and makes "status", "ok", "url" and "title" describe the document as of the moment the response arrived, which is the right answer for a static page and the WRONG one for any page that moves itself: a 200 shell that bounces to a login page then reports ok: true beside the shell it was about to discard. Lowering it rather than zeroing it does not remove that risk, it moves it: a redirect timed just past whatever window you choose produces no "pendingNavigation" either, because at the moment the window closes nothing has happened yet and there is nothing to warn about. Raise it instead for an app whose auth bounce waits on a token check or a first fetch, which is easily past 500ms.'
+        ),
+      timeoutMs: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe(
+          'How long the navigation itself may take before this call gives up on it, in milliseconds. Defaults to 30000. Giving up is REPORTED, not thrown: the result describes whatever the tab is showing, with "timedOut": true and a "pendingNavigation" saying the page was still moving, which is what a redirect loop looks like from the outside.'
+        )
     }),
     async handler(ctx, args) {
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
       const before = await documentIdentity(target.page);
-      const response = await target.page.goto(args.url, args.waitUntil ? { waitUntil: args.waitUntil } : undefined);
-      const after = await documentIdentity(target.page);
+      const outcome = await performNavigation(
+        target.page,
+        timeout => target.page.goto(args.url, { timeout, ...(args.waitUntil ? { waitUntil: args.waitUntil } : {}) }),
+        { settleMs: args.settleMs, timeoutMs: args.timeoutMs }
+      );
+      const { response, settled } = outcome;
 
       // A response means a document really was fetched and swapped in. A null
       // response is ambiguous on its own, so the identity check settles it.
       // When the identity is unreadable we say "same document", erring toward
       // warning the caller: a spurious warning costs one redundant reload, a
       // missed one costs a false pass.
-      const sameDocument = response === null && (before === null || after === null || before === after);
-
-      // navigate is the most-called tool here, and until now it discarded
-      // `response` the moment sameDocument was settled: a URL that answered
-      // 404 or 500 came back looking like an ordinary success, and for an SPA
-      // shell that renders its own error state under a failing response even
-      // "title" gave nothing away. Reported the same way reload already
-      // reports it, so the two tools agree on what a caller should read.
-      const status = response?.status() ?? null;
-      const ok = response?.ok() ?? null;
+      const sameDocument = response === null && (before === null || settled.identity === null || before === settled.identity);
 
       const notes: string[] = [];
       if (sameDocument) {
@@ -997,36 +2488,96 @@ export const interactionTools = defineTools({
           'This navigation produced no HTTP response, so "status" and "ok" are null: that is what about:blank and a non-HTTP scheme (for instance data: or javascript:) look like, not a failure. The document did change, a fresh one was created, just not through anything this tool can report an HTTP status for.'
         );
       }
+      if (outcome.documentChanged) notes.push(documentChangedNote(outcome, 'navigation'));
+      if (outcome.pending) notes.push(`This answer may already be out of date: ${outcome.pending.reason}. Read "pendingNavigation", and call navigate or reload again, or raise "settleMs", if you need the document it settles on.`);
 
       return text({
         pageId: target.pageId,
-        url: target.page.url(),
-        title: await target.page.title().catch(() => ''),
+        url: settled.url,
+        title: settled.title,
         sameDocument,
-        status,
-        ok,
+        status: outcome.status,
+        ok: outcome.ok,
+        ...(outcome.timedOut ? { timedOut: true } : {}),
+        ...(outcome.blocked ? { blocked: true } : {}),
+        ...documentChangedPayload(outcome),
+        ...pendingNavigationPayload(outcome.pending),
         ...(notes.length ? { note: notes.join(' ') } : {})
       });
     }
   }),
 
   reload: defineTool({
+    // Serialized per session, the same way click is, and for the same reason
+    // the history steps are. Two navigations issued without awaiting each
+    // other tear each other's request down: probed directly, concurrent
+    // navigate calls rejected with "net::ERR_ABORTED" and concurrent reloads
+    // rejected with "net::ERR_ABORTED; maybe frame was detached?", both of
+    // them failures reported for work the browser had partly done. Queuing
+    // them makes the second act on the tab the first one left behind, which
+    // is what a caller issuing two in a row means, and it also keeps a click
+    // from landing in the middle of a navigation.
+    serializesInput: true,
     description:
-      'Reload a session\'s tab: a real page load that discards the JS context, in-page state and everything the page had built up, and re-fetches the document. This is what navigate deliberately does not do when only the URL hash changes. The current URL, hash included, is kept. The result carries "status" (the HTTP status code of the reload) and "ok" (whether it was in the 200 to 299 range), exactly as navigate does, both null on the rare reload with no HTTP response to report, such as one landing on about:blank.',
+      'Reload a session\'s tab: a real page load that discards the JS context, in-page state and everything the page had built up, and re-fetches the document. This is what navigate deliberately does not do when only the URL hash changes. The current URL, hash included, is kept. The result carries "status" (the HTTP status code) and "ok" (whether it was in the 200 to 299 range), exactly as navigate does, both null on the rare reload with no HTTP response to report, such as one landing on about:blank. ONE PAYLOAD ALWAYS DESCRIBES ONE DOCUMENT, on the same terms navigate reports it and through the same machinery: "status" and "ok" belong to the document "url" and "title" describe, not to whatever the reload request itself answered, and the call watches for the same real, stated window ("settleMs", 500ms by default) before reading any of them, with the same "pendingNavigation" and "timedOut" reporting when a page moves later than that or never stops moving, and serialized per session the same way. Reloading a 200 shell that redirects walks the same chain a first visit does, so a reload is no safer than a navigate here: it is usually MORE exposed, because the pages an agent reloads repeatedly are the ones it is waiting on. When the page moves itself the result carries "documentChanged", holding the response the reload measured ("from"), the document finally described ("to"), and every main-frame document this call saw, in order, plus a note. A final document with no HTTP response of its own reports null rather than inheriting the earlier status.',
     inputSchema: z.object({
       sessionId,
       pageId,
-      waitUntil
+      waitUntil,
+      settleMs: z
+        .number()
+        .int()
+        .min(0)
+        .max(30_000)
+        .optional()
+        .describe(
+          'How long to keep watching for the page to move itself before measuring it, in milliseconds. Defaults to 500, and that window is real: it is watched in FULL rather than exited as soon as things look quiet, because there is no signal a page can give that it will NOT navigate again, so the only way to know is to watch. A client-side redirect fired inside the window is caught and reported; one fired after it is not. BEFORE YOU LOWER THIS TO SAVE LATENCY, know what you are buying and what you are giving up. Setting it to 0 makes the call as fast as it used to be and makes "status", "ok", "url" and "title" describe the document as of the moment the response arrived, which is the right answer for a static page and the WRONG one for any page that moves itself: a 200 shell that bounces to a login page then reports ok: true beside the shell it was about to discard. Lowering it rather than zeroing it does not remove that risk, it moves it: a redirect timed just past whatever window you choose produces no "pendingNavigation" either, because at the moment the window closes nothing has happened yet and there is nothing to warn about. Raise it instead for an app whose auth bounce waits on a token check or a first fetch, which is easily past 500ms.'
+        ),
+      timeoutMs: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe(
+          'How long the navigation itself may take before this call gives up on it, in milliseconds. Defaults to 30000. Giving up is REPORTED, not thrown: the result describes whatever the tab is showing, with "timedOut": true and a "pendingNavigation" saying the page was still moving, which is what a redirect loop looks like from the outside.'
+        )
     }),
     async handler(ctx, args) {
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
-      const response = await target.page.reload(args.waitUntil ? { waitUntil: args.waitUntil } : undefined);
+      // Measured exactly the way navigate measures itself, through the same
+      // helper rather than a second implementation of it. Reloading a shell
+      // that redirects walks the same chain a first visit does, so a reload
+      // reporting the shell's own status beside the redirect target's title
+      // was the identical defect: "status": 200, "ok": true next to a 500
+      // error page. Nothing about a reload makes that shape rarer, since the
+      // pages that do it are exactly the ones an agent reloads while waiting
+      // for a fix.
+      const outcome = await performNavigation(
+        target.page,
+        timeout => target.page.reload({ timeout, ...(args.waitUntil ? { waitUntil: args.waitUntil } : {}) }),
+        { settleMs: args.settleMs, timeoutMs: args.timeoutMs }
+      );
+
+      const notes: string[] = [];
+      if (outcome.response === null) {
+        notes.push(
+          'This reload produced no HTTP response, so "status" and "ok" are null: that is what reloading about:blank or a non-HTTP scheme (for instance data:) looks like, not a failure.'
+        );
+      }
+      if (outcome.documentChanged) notes.push(documentChangedNote(outcome, 'reload'));
+      if (outcome.pending) notes.push(`This answer may already be out of date: ${outcome.pending.reason}. Read "pendingNavigation", and reload again, or raise "settleMs", if you need the document it settles on.`);
+
       return text({
         pageId: target.pageId,
-        url: target.page.url(),
-        title: await target.page.title().catch(() => ''),
-        status: response?.status() ?? null,
-        ok: response?.ok() ?? null
+        url: outcome.settled.url,
+        title: outcome.settled.title,
+        status: outcome.status,
+        ok: outcome.ok,
+        ...(outcome.timedOut ? { timedOut: true } : {}),
+        ...(outcome.blocked ? { blocked: true } : {}),
+        ...documentChangedPayload(outcome),
+        ...pendingNavigationPayload(outcome.pending),
+        ...(notes.length ? { note: notes.join(' ') } : {})
       });
     }
   }),
@@ -1094,7 +2645,9 @@ export const interactionTools = defineTools({
   fill: defineTool({
     serializesInput: true,
     description:
-      'Set a field\'s contents in a session\'s tab, REPLACING whatever was there. Use type instead to append, or to fire per-character events. For an input, textarea or select this is Playwright\'s atomic fill. For a contenteditable, including rich editors like CodeMirror and Monaco, it focuses the element and replaces through real keyboard events (select-all, delete, insert), because those editors keep their own document model and treat a plain insertion as an insert at their cursor, appending onto the existing value instead of replacing it. Reads the field back afterwards, but that readback is DOM textContent, and for a real Monaco or CodeMirror instance textContent is not the whole story: both virtualize their lines, so it only covers what is currently rendered and reads back truncated for anything long, and an element with an EditContext attached keeps its real text there rather than in the DOM at all. When the target looks like one of these the result says so plainly: "readbackReliable" is false, "matched" is not claimed either way, and "note" names the editor\'s own API to read the value through instead (e.g. monaco.editor.getModels()[0].getValue()). For an ordinary field the result carries "value" (what the field really contains now), "matched", "readbackReliable": true, and a "note" explaining the difference when value and the request disagree.',
+      'Set a field\'s contents in a session\'s tab, REPLACING whatever was there. Use type instead to append, or to fire per-character events. For an input, textarea or select this is Playwright\'s atomic fill. For a contenteditable, including rich editors like CodeMirror and Monaco, it focuses the element and replaces through real keyboard events (select-all, delete, insert), because those editors keep their own document model and treat a plain insertion as an insert at their cursor, appending onto the existing value instead of replacing it. ' +
+      'The selector has to name an element that can hold typed text AND own what a replacement would delete, and both are checked before anything is written. Replacing means selecting and deleting, and a selection is scoped by the browser: to a form control\'s own value, or to the whole contenteditable EDITING HOST, never to whatever element you happened to name. So this accepts a text-holding input, a textarea, or an element that is itself a contenteditable root. It refuses an element that merely SITS INSIDE an editable region, because isContentEditable is inherited and a deletion there destroys the whole region: measured on a page whose canvas sat inside one, a clear took it from three nodes and 91 characters to one node and 14. The refusal names the host so you can decide whether you meant it. It also refuses <body> and <html> even on a contenteditable or designMode page, a <select> (use select_option), a checkbox, radio, button or file input (click, or file_upload), a readonly or disabled control (said at once rather than after the full timeout), and a selector matching several elements. A selector matching nothing is waited for the way Playwright waits for any selector and then explained, saying what it measured and when. The deletion itself is scoped with a Range over the element\'s own contents rather than the platform select-all chord, so it cannot be redirected by a page that moves focus on that chord. ' +
+      'Reads the field back afterwards, but that readback is DOM textContent, which two families of editor defeat in different ways. Virtualizing code editors (Monaco, CodeMirror 5 and 6, Ace) keep only the lines currently on screen in the DOM, so a long document reads back truncated, with no newlines, and can carry gutter line numbers or a hidden measurement layer along with the text. Rich-text editors (Quill, ProseMirror, TipTap, Slate, Lexical) render everything and lose every line break, and anything that is not text contributes nothing at all. An element with an EditContext attached keeps its real text outside the DOM entirely. All of these markers are looked for at the named element, above it (out through any open shadow root), and ANYWHERE in its subtree, because a selector aimed at a wrapper is the ordinary case and how far above the editor it sits is not the question: whether the text about to be read back contains an editor\'s render is. When the target is one of these the result says so plainly: "readbackReliable" is false, "matched" is not claimed either way, and "note" names the editor\'s own API to read the value through instead. For an ordinary field the result carries "value" (what the field really contains now), "matched", "readbackReliable": true, and a "note" explaining the difference when value and the request disagree.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -1106,23 +2659,58 @@ export const interactionTools = defineTools({
     async handler(ctx, args) {
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
       const locator = target.page.locator(args.selector);
-      await setFieldValue(target.page, locator, args.value);
-      const actual = await readFieldValue(target.page, locator);
-      const readbackWarning = await readReadbackReliability(target.page, locator);
-      return writeResult(
-        { pageId: target.pageId, selector: args.selector, requested: args.value },
-        actual,
-        actual === args.value,
-        `Expected exactly ${JSON.stringify(args.value)}.`,
-        readbackWarning
-      );
+      // Before anything is read or written. A multi-match selector used to
+      // surface as a raw Playwright strict-mode error thrown from deep inside
+      // a readback, naming neither the tool that refused nor the way out,
+      // while hover had proper guidance for the identical situation.
+      const matchedAtStart = await assertSingleWriteTarget('fill', locator, args.selector);
+      // Everything that touches the selector runs inside this, so a selector
+      // that matches nothing produces the same explanation hover gives rather
+      // than a raw Playwright TimeoutError thrown out of a readback. Our own
+      // refusals are ordinary Errors and pass straight through untouched.
+      //
+      // `wrote` is tracked because the explanation used to end "Nothing was
+      // written" unconditionally, and a failure can arrive AFTER the write: a
+      // clear that destroyed the element the locator pointed at made the
+      // readback time out, and the caller was told nothing had happened to a
+      // page that had just been emptied.
+      const startedAt = Date.now();
+      let wrote = false;
+      try {
+        await setFieldValue(target.page, locator, args.value);
+        wrote = true;
+        const actual = await readFieldValue(target.page, locator);
+        const readbackWarning = await readReadbackReliability(target.page, locator);
+        return writeResult(
+          { pageId: target.pageId, selector: args.selector, requested: args.value },
+          actual,
+          actual === args.value,
+          `Expected exactly ${JSON.stringify(args.value)}.`,
+          readbackWarning
+        );
+      } catch (err) {
+        throw await selectorActionFailure(
+          'fill',
+          target.page,
+          args.selector,
+          err,
+          Date.now() - startedAt,
+          'Nothing was written.',
+          matchedAtStart,
+          wrote
+        );
+      }
     }
   }),
 
   type: defineTool({
     serializesInput: true,
     description:
-      'Type text into a session\'s tab character by character, with real key events, so per-character handlers, debounces, autocomplete and anything firing on a keystroke actually run. fill sets the value in one step and cannot exercise those. Does NOT clear the field first: it inserts at the caret, which is what a user typing does, so calling it twice types twice. Pass clear: true to replace the contents instead. Where the caret sits is the browser\'s call, not this tool\'s: focusing an input puts it after the existing text, focusing a contenteditable puts it before, so click the spot first if the insertion point matters. With no selector the keystrokes go to whatever currently has focus, and if NOTHING has focus this refuses outright rather than guessing: with no field to type into or read back, the only thing "no selector" could act on is the document itself, which on a contenteditable page means select-all-and-delete on clear would empty the page, and even without clear, reading the caret holder back would return document.activeElement, which is <body>, so the result would carry the entire page\'s text as "value" instead of any one field\'s. Reads the field back afterwards, but that readback is DOM textContent, and for a real Monaco or CodeMirror instance textContent is not the whole story: both virtualize their lines, so it only covers what is currently rendered and reads back truncated for anything long, and an element with an EditContext attached keeps its real text there rather than in the DOM at all. When the target looks like one of these the result says so plainly: "readbackReliable" is false, "matched" is not claimed either way, and "note" names the editor\'s own API to read the value through instead. For an ordinary field the result carries "value" (what the field really contains now), "previousValue" (what it held BEFORE the call, clear included, so a clear cannot throw something away invisibly), "matched", "readbackReliable": true, and a "note" when what landed is not the typed text inserted into what was already there.',
+      'Type text into a session\'s tab character by character, with real key events, so per-character handlers, debounces, autocomplete and anything firing on a keystroke actually run. fill sets the value in one step and cannot exercise those. Does NOT clear the field first: it inserts at the caret, which is what a user typing does, so calling it twice types twice. Pass clear: true to replace the contents instead. Where the caret sits is the browser\'s call, not this tool\'s: focusing an input puts it after the existing text, focusing a contenteditable puts it before, so click the spot first if the insertion point matters. ' +
+      'With no selector the keystrokes go to whatever currently has focus, and this refuses unless that element can actually HOLD typed text: a text-holding input, a textarea, or a contenteditable root. Taking focus is not the same as taking text, and the difference is destructive. React Flow gives canvas nodes tabindex="0" so they can handle arrow keys, so an ordinary click on an Acres node leaves focus on a plain <div>; with clear: true the select-all and Delete that follow reach the canvas, which reads Delete as "remove the selected node". Measured on the real app: three nodes before the call, two after, reported as matched: false. Without clear, reading that same <div> back returns its rendered text and inline CSS rather than any field\'s value. ' +
+      'clear: true is refused outright when the caret sits in a contenteditable EDITING REGION rather than a form control, because with no selector nothing named what is about to be deleted and the region can be an entire document. Note that clicking a widget inside such a region focuses the REGION, not the widget: on a page whose canvas sat inside one this took it from three nodes and 91 characters to one node and 14. The message names the region, so passing it as "selector" is all the retry needs. Typing without clear is unaffected, since an insertion has no blast radius. The caret holder is resolved through open shadow roots, because document.activeElement reports the shadow HOST rather than the element that really has focus. A selector matching several elements is refused too, since choosing one of them would change the page, and one matching NOTHING is waited for and then explained rather than surfacing as a bare Playwright timeout. ' +
+      'With a selector, this does NOT refuse a target that cannot hold text, because routing real keystrokes at a focused widget is a legitimate thing to want and press_key alone does not cover it. What it will not do is let you believe the characters went where you aimed them. Playwright focuses the located element and then types at whatever holds the caret, so when the focus attempt does not land the text goes somewhere else entirely: the caret holder is compared against the named element before a single character is sent, and when they differ the result names the element that really received the text and does not claim "matched", since reading back an element nothing was typed into answers a different question. ' +
+      'Reads the field back afterwards, but that readback is DOM textContent, which virtualizing code editors (Monaco, CodeMirror 5 and 6, Ace) defeat by rendering only what is on screen, and rich-text editors (Quill, ProseMirror, TipTap, Slate, Lexical) defeat by losing every line break and every non-text node. An element with an EditContext attached keeps its real text outside the DOM entirely. Those markers are looked for at the target, above it (out through any open shadow root) and anywhere in its subtree, so a wrapper any distance above the editor root is still recognised. When the target is one of these the result says so plainly: "readbackReliable" is false, "matched" is not claimed either way, and "note" names the editor\'s own API to read the value through instead. For an ordinary field the result carries "value" (what the field really contains now), "previousValue" (what it held BEFORE the call, clear included, so a clear cannot throw something away invisibly), "matched", "readbackReliable": true, and a "note" when what landed is not the typed text inserted into what was already there.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -1145,22 +2733,42 @@ export const interactionTools = defineTools({
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
       const locator = args.selector === undefined ? null : target.page.locator(args.selector);
 
+      // Before anything is read or written, the same reason fill checks first:
+      // a selector matching several elements would have this tool pick one and
+      // change it, and Playwright's own refusal arrived as a bare strict-mode
+      // error from inside a readback.
+      let matchedAtStart: number | undefined;
+      if (locator !== null && args.selector !== undefined) {
+        matchedAtStart = await assertSingleWriteTarget('type', locator, args.selector);
+      }
+
       // Runs before ANYTHING else, including the very first readback below.
-      // With no selector, "nothing has focus" is not just a clear-time danger
-      // (select-all against the whole document): reading the field back is
-      // document.activeElement too, and an unfocused page's activeElement is
-      // <body>, so its textContent is the entire page rather than any field's.
-      // That produced a result with a multi-thousand-character page dump
-      // masquerading as a field's value, twice over (previousValue and value
-      // both), for a call that never told the caller anything about a field
-      // at all. Refusing outright is the same call fill's own focus guard
-      // makes, just made before the read that clear alone used to gate.
+      //
+      // The question is whether the caret holder can RECEIVE TEXT, not what
+      // its tag is. The guard this replaces rejected only BODY and HTML, and
+      // that is not the same test: React Flow gives every canvas node
+      // tabindex="0" so it can handle arrow keys, so an ordinary click on an
+      // Acres node leaves document.activeElement on a plain <div>, which
+      // sailed through. With clear: true the select-all and Delete that
+      // followed went to the canvas, which handles Delete as "remove the
+      // selected node". Measured on the real app: three nodes before the call,
+      // two after, and a result saying matched: false, which reads as nothing
+      // happened. Without clear, the same call read that <div> back and
+      // returned 1176 characters of rendered widget text and inline CSS as
+      // both previousValue and value, stamped readbackReliable: true.
+      //
+      // The caret holder is resolved THROUGH open shadow roots, because
+      // document.activeElement retargets to the shadow host: a page whose
+      // editor lives in a shadow root reported a plain host <div> here, passed
+      // the old tag test on that basis, landed the write in the editor, and
+      // read the host's own (empty) textContent back as the field's value.
       if (locator === null) {
-        const holder = await target.page.evaluate(() => {
-          const el = document.activeElement;
-          if (!el) return null;
-          return { tag: el.tagName, id: el.id };
-        });
+        const inspection = await inspectTarget(target.page, null);
+        const holder = inspection.caret;
+        // BODY and HTML keep a refusal of their own even when the page has
+        // made them editable, because "can it receive text" is then genuinely
+        // yes and still the wrong thing to act on: the readback would be the
+        // whole document's text, and a clear would empty the page.
         if (holder === null || holder.tag === 'BODY' || holder.tag === 'HTML') {
           throw new Error(
             'type has no selector and nothing has focus, so there is no field to act on: the caret is in the ' +
@@ -1174,63 +2782,174 @@ export const interactionTools = defineTools({
               (args.clear ? ' and nothing was cleared.' : '.')
           );
         }
-      }
+        // Said precisely here rather than left to the selection step below,
+        // which can only report that it could not place one: a readonly or
+        // disabled control is a fact about the page worth naming.
+        if (holder.readOnly || holder.disabled) {
+          throw new Error(
+            `type cannot write into ${describeTextTarget(holder)}, the element that currently has focus: it is ` +
+              `${holder.disabled ? 'disabled' : 'readonly'}, so no keystroke will change it. That is a finding ` +
+              'about the page, not about this call. Nothing was typed' +
+              (args.clear ? ' and nothing was cleared.' : '.')
+          );
+        }
 
-      // Read BEFORE the clear, so "previousValue" means what its name says.
-      // Read after, it was always the emptied field on a clearing call, which
-      // also made "matched" a comparison against nothing: it could not fail,
-      // whatever the clear had just destroyed.
-      const before = await readFieldValue(target.page, locator);
+        // A no-selector CLEAR on an editing host is refused even though the
+        // host can genuinely receive text, and this is the case that looks
+        // safe and is not. Clicking a widget inside a contenteditable region
+        // does not focus the widget: Chromium focuses the REGION, so
+        // document.activeElement is the editing host and clearing it empties
+        // everything in it. Measured on a page whose canvas sat inside one:
+        // three nodes and 91 characters before the call, one node and 14
+        // after, reported as matched: true.
+        //
+        // The rule that decides this is the same one fill uses, applied where
+        // there is no selector: a deletion may only be aimed at a region the
+        // caller actually named, and with no selector the caller named
+        // nothing while the region can be an entire document. A focused input
+        // or textarea is exempt because its region is its own value, which is
+        // bounded and is what "the focused field" plainly means. The message
+        // names the host, so the retry is one argument away.
+        if (args.clear && !formControlTags.includes(holder.tag) && holder.isEditingHost) {
+          throw new Error(
+            `type will not clear ${describeTextTarget(holder)} without being told to: it is a contenteditable ` +
+              'editing region, not a field, and with no selector nothing named it. Clearing it deletes everything ' +
+              'inside it, which on a page that puts widgets inside an editable region is far more than the field ' +
+              'that looks focused. Note that clicking a widget inside such a region focuses the REGION, not the ' +
+              `widget. Pass selector: ${JSON.stringify(cssPathHint(holder))} if clearing the whole region is what ` +
+              'you meant, or name the specific field. Nothing was typed and nothing was cleared.'
+          );
+        }
 
-      if (args.clear) {
-        if (locator) {
-          await setFieldValue(target.page, locator, '');
-        } else {
-          // Focus was already confirmed real above, so this is exactly the
-          // select-all-and-delete fill's own contenteditable path performs,
-          // just against whatever currently holds the caret rather than a
-          // locator, because there is no selector to build one from.
-          await target.page.keyboard.press(selectAllChord);
-          await target.page.keyboard.press('Delete');
+        if (!canReceiveText(holder)) {
+          throw new Error(
+            refusalForUnwritableTarget(
+              'type has no selector, and the element that currently has focus cannot receive text',
+              holder,
+              inspection
+            ) +
+              'The element only has focus because something gave it a tabindex, which is what a canvas, a tree or a ' +
+              'list widget does so it can handle arrow keys; that is not the same as being a field.' +
+              (args.clear
+                ? ' With clear: true the select-all and Delete would have gone to the document, and a widget that ' +
+                  'reads Delete as "remove the selected item" acts on it: this has been measured deleting a node from ' +
+                  'a React Flow canvas.'
+                : ' Reading it back would return its rendered text and inline CSS rather than any field\'s value.') +
+              ' Pass "selector" to name the field, or click into the field itself first. Nothing was typed' +
+              (args.clear ? ' and nothing was cleared.' : '.')
+          );
         }
       }
 
-      // What the field holds going into the typing: the same as `before` on an
-      // ordinary call, and the emptied field on a clearing one. The insertion
-      // check runs against this, while the caller is shown `before`.
-      const baseline = args.clear ? await readFieldValue(target.page, locator) : before;
-      const options = args.delay !== undefined ? { delay: args.delay } : undefined;
-      if (locator) {
-        await locator.pressSequentially(args.text, options);
-      } else {
-        await target.page.keyboard.type(args.text, options);
-      }
-      const actual = await readFieldValue(target.page, locator);
-      const readbackWarning = await readReadbackReliability(target.page, locator);
+      // Everything from here on touches the selector, so a selector matching
+      // nothing gets the same explanation hover gives instead of a raw
+      // Playwright TimeoutError. Our own refusals are ordinary Errors and pass
+      // through untouched, and the no-selector path has no selector to explain.
+      const startedAt = Date.now();
+      let wrote = false;
+      try {
+        // Read BEFORE the clear, so "previousValue" means what its name says.
+        // Read after, it was always the emptied field on a clearing call, which
+        // also made "matched" a comparison against nothing: it could not fail,
+        // whatever the clear had just destroyed.
+        const before = await readFieldValue(target.page, locator);
 
-      // Typing inserts rather than replaces, so what to expect afterwards is
-      // the previous contents with the typed text somewhere inside them, not
-      // the typed text alone.
-      return writeResult(
-        {
-          pageId: target.pageId,
-          ...(args.selector !== undefined ? { selector: args.selector } : {}),
-          typed: args.text,
-          cleared: args.clear ?? false,
-          previousValue: before
-        },
-        actual,
-        isInsertionOf(baseline, args.text, actual),
-        `Expected ${JSON.stringify(args.text)} inserted into ${JSON.stringify(baseline)}.`,
-        readbackWarning
-      );
+        if (args.clear) {
+          wrote = true;
+          if (locator) {
+            await setFieldValue(target.page, locator, '');
+          } else {
+            // Scoped to the caret holder's own contents and re-checked in the
+            // same round trip, rather than pressing the browser's select-all
+            // and hoping the caret has not moved since the guard ran. See
+            // selectFocusedContents for what that hope cost.
+            const cleared = await selectFocusedContents(target.page);
+            if (cleared === null) {
+              throw new Error(
+                'type could not place a selection over the focused element\'s own contents, so it stopped rather ' +
+                  'than pressing Delete against whatever else happened to be selected. Focus has moved since the ' +
+                  'check at the start of this call, or the element does not own its own editing region. Nothing ' +
+                  'was typed and nothing was cleared.'
+              );
+            }
+            await target.page.keyboard.press('Delete');
+          }
+        }
+
+        // What the field holds going into the typing: the same as `before` on an
+        // ordinary call, and the emptied field on a clearing one. The insertion
+        // check runs against this, while the caller is shown `before`.
+        const baseline = args.clear ? await readFieldValue(target.page, locator) : before;
+        const options = args.delay !== undefined ? { delay: args.delay } : undefined;
+
+        // The focus attempt is made HERE rather than left to
+        // pressSequentially, which does it silently, so that where the caret
+        // really ended up can be compared against the element the caller named
+        // before a single character is sent. pressSequentially focuses again
+        // straight after, which is a no-op on an element that already has
+        // focus and lands in the same place on one that does not.
+        let beforeTyping: TextTargetInspection | null = null;
+        if (locator) {
+          await locator.focus().catch(() => undefined);
+          beforeTyping = await inspectTarget(target.page, locator);
+        }
+
+        wrote = true;
+        if (locator) {
+          await locator.pressSequentially(args.text, options);
+        } else {
+          await target.page.keyboard.type(args.text, options);
+        }
+
+        // Checked again AFTER the characters, not only before them. A page
+        // that moves focus partway through a slow type sends the rest of the
+        // keystrokes somewhere else, which the before-check cannot see:
+        // measured with delay: 10, "ab" landed in the named field and "cdef"
+        // in another one, reported as matched: false blaming the page for
+        // rewriting the input.
+        const destination =
+          locator && beforeTyping ? typingDestination(beforeTyping, await inspectTarget(target.page, locator)) : null;
+
+        const actual = await readFieldValue(target.page, locator);
+        const readbackWarning = await readReadbackReliability(target.page, locator);
+
+        // Typing inserts rather than replaces, so what to expect afterwards is
+        // the previous contents with the typed text somewhere inside them, not
+        // the typed text alone.
+        return writeResult(
+          {
+            pageId: target.pageId,
+            ...(args.selector !== undefined ? { selector: args.selector } : {}),
+            typed: args.text,
+            cleared: args.clear ?? false,
+            previousValue: before
+          },
+          actual,
+          isInsertionOf(baseline, args.text, actual),
+          `Expected ${JSON.stringify(args.text)} inserted into ${JSON.stringify(baseline)}.`,
+          readbackWarning,
+          destination
+        );
+      } catch (err) {
+        if (args.selector === undefined) throw err;
+        throw await selectorActionFailure(
+          'type',
+          target.page,
+          args.selector,
+          err,
+          Date.now() - startedAt,
+          'Nothing was typed.',
+          matchedAtStart,
+          wrote
+        );
+      }
     }
   }),
 
   press_key: defineTool({
     serializesInput: true,
     description:
-      'Press a key in a session\'s tab, dispatching a real trusted key event. This is the only way to establish keyboard modality, which matters for accessibility checks: Chrome will not set :focus-visible on a button a script focused with .focus(), so a focus ring measured after a programmatic focus reports absent even when it is perfectly fine for a real user pressing Tab. Key syntax is Playwright\'s: Tab, Enter, Escape, ArrowDown, Backspace, a, Control+A, Shift+Tab. With no selector the key goes to whatever currently has focus. Returns where focus ended up and whether that element matches :focus-visible.',
+      'Press a key in a session\'s tab, dispatching a real trusted key event. This is the only way to establish keyboard modality, which matters for accessibility checks: Chrome will not set :focus-visible on a button a script focused with .focus(), so a focus ring measured after a programmatic focus reports absent even when it is perfectly fine for a real user pressing Tab. Key syntax is Playwright\'s: Tab, Enter, Escape, ArrowDown, Backspace, a, Control+A, Shift+Tab. With no selector the key goes to whatever currently has focus. Returns where focus ended up and whether that element matches :focus-visible, descending into open shadow roots to get there: document.activeElement retargets to the shadow HOST, so a key press into an editor inside a shadow root would otherwise be reported as focus sitting on a plain host div with no text. "inShadowRoot" says when the walk had to cross a boundary to find it.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -1240,10 +2959,12 @@ export const interactionTools = defineTools({
           'Key or chord in Playwright syntax: Enter, Escape, ArrowDown, Backspace, a, Shift+Tab, and so on. Some ' +
             'names are stricter than they look: Return and Esc both throw ("Unknown key"), it is Enter and Escape. ' +
             'Cmd throws too, it is Meta. A modifier chord that merely presses fine is not the same as one that does ' +
-            'anything: Control+a on a platform whose select-all is bound to Meta reports an ordinary success and ' +
-            'selects nothing, because the browser has no accelerator on that chord at all. Use ControlOrMeta+ for a ' +
-            'platform editing accelerator (select-all and the rest): Playwright resolves it to Meta on macOS and ' +
-            'Control everywhere else, so it does the right thing on every platform this runs on.'
+            'what you meant, and this tool does not read the effect back. On a platform whose select-all is bound to ' +
+            'Meta, Control+a reaches no select-all accelerator; it is also not a no-op, because Chromium honours the ' +
+            'macOS emacs bindings, so Control+a moves the caret to the start of the line, Control+e to the end, and ' +
+            'Control+k deletes to the end of the line. Use ControlOrMeta+ for a platform editing accelerator ' +
+            '(select-all and the rest): Playwright resolves it to Meta on macOS and Control everywhere else, so it ' +
+            'does the right thing on every platform this runs on.'
         ),
       selector: z
         .string()
@@ -1268,14 +2989,29 @@ export const interactionTools = defineTools({
         }
       }
 
+      // The REPORT descends into open shadow roots, for the same reason
+      // readFieldValue does: document.activeElement retargets to the shadow
+      // HOST, so a key press into an editor inside a shadow root used to be
+      // reported as focus sitting on a plain host <div> with empty text, while
+      // the element that actually received the keystroke was invisible to the
+      // result. The note's firing logic below is untouched and does not depend
+      // on this: it reads the chord, not the page.
       const activeElement = await target.page.evaluate(() => {
-        const el = document.activeElement;
+        let el = document.activeElement as TreeWalkElement | null;
+        let crossed = false;
+        for (let hops = 0; hops < 32; hops += 1) {
+          const inner = el?.shadowRoot?.activeElement;
+          if (!inner) break;
+          el = inner;
+          crossed = true;
+        }
         if (!el) return null;
         return {
           tag: el.tagName.toLowerCase(),
           id: el.id,
           text: (el.textContent ?? '').trim().slice(0, 80),
-          focusVisible: el.matches(':focus-visible')
+          focusVisible: el.matches(':focus-visible'),
+          inShadowRoot: crossed
         };
       });
 
@@ -1297,6 +3033,7 @@ export const interactionTools = defineTools({
     description:
       'Hover the mouse over an element in a session\'s tab, moving the real pointer to it. Synthetic pointerover/mouseover events dispatched from a script only exercise the page\'s own listeners: they cannot satisfy a CSS-only :hover rule, and they cannot open a tooltip that depends on real pointer geometry. This can. Pass x and y together to hover a specific offset from the element\'s top-left corner. ' +
       'This does NOT require the selector to be unique: like click, when it matches several elements the FIRST one is hovered, and no error is raised. The result carries "matchedElements" for that reason, with a note whenever it is more than one, because Playwright selectors pierce open shadow roots and a positional path can match far more of the page than it appears to. Read it before concluding the right thing was hovered. ' +
+      'A selector matching NOTHING is waited for, not failed immediately, because an element that appears a moment later is still one to hover: the cost is that such a call spends the whole timeout before giving up. When it does, the error says so in plain terms, and says whether the selector still matches nothing (a selector problem: check it with find, or wait_for the element first) or matches something the pointer could not be moved to (a page problem: hidden, still animating, zero-sized or covered, which element_box and computed_style can show). ' +
       'Returns whether the element matches :hover afterwards as "hovering", read back against the exact element that was hovered rather than the bare selector, because reading a multi-match selector through evaluate is strict mode where hovering it is not: without that, hovering a selector matching several elements used to come back as "hovering": false, the opposite of what really happened, since the readback threw on the ambiguity and the failure was swallowed into a false negative. On the rare occasion the readback genuinely cannot run at all, for instance because the hover triggered something that removed the element from the DOM, "hovering" is null rather than false, with a note explaining why, so a readback that could not run is never mistaken for a confirmed "not hovering".',
     inputSchema: z.object({
       sessionId,
@@ -1317,7 +3054,29 @@ export const interactionTools = defineTools({
       // several elements it silently hovers the FIRST one and reports the
       // same result either way.
       const matchedElements = await target.page.locator(args.selector).count().catch(() => undefined);
-      await target.page.hover(args.selector, position ? { position } : undefined);
+      // Playwright WAITS for a selector rather than failing straight away,
+      // which is the right behaviour (an element that appears a moment later
+      // is still an element to hover) and the reason a selector matching
+      // nothing costs the whole timeout. What was wrong is what the caller got
+      // for that wait: a raw Playwright TimeoutError, with none of the
+      // guidance the rest of this file gives for the same class of mistake.
+      // The wait is kept; only the explanation is added. fill and type route
+      // through the same helper, so there is one wording to keep honest.
+      const startedAt = Date.now();
+      try {
+        await target.page.hover(args.selector, position ? { position } : undefined);
+      } catch (err) {
+        throw await selectorActionFailure(
+          'hover',
+          target.page,
+          args.selector,
+          err,
+          Date.now() - startedAt,
+          'The pointer was not moved.',
+          matchedElements,
+          false
+        );
+      }
       // Read back against .first(), not the bare locator. locator.evaluate IS
       // strict mode, so on a selector matching several elements it used to
       // throw where page.hover just silently acted on the first one, and the
@@ -1504,7 +3263,13 @@ export const interactionTools = defineTools({
     serializesInput: true,
     description:
       'Drag from one point to another in a session\'s tab with a real mouse: press, several intermediate moves, release. One atomic gesture, not a separate grab and drop, because a half-finished drag leaves the page in a state nothing else here can recover. Covers BOTH kinds of dragging: pointer-event canvases (React Flow, dnd-kit, d3-drag, anything moving an element from pointermove) and native HTML5 drag-and-drop (draggable="true" with dragstart/dragover/drop). The same mouse sequence drives both, so there is no mode to choose. Source and target each take a selector (the element\'s centre), a raw x/y viewport point (for a region of a canvas that is not a DOM element), or a selector plus x/y (an offset inside it, e.g. a node\'s drag handle). IF THE DRAG APPEARS TO DO NOTHING, in this order: raise "steps", because most drag libraries spend the first move activating the drag and only start following on later ones, so too few moves fires every event and moves nothing; set "holdMs" if the app uses a long-press or delay-activated drag, which cancels outright when the pointer moves too soon; set "settleMs" if the drop lands but the app has not finished reacting; check the coordinates in the result, which are where the mouse really went. Returns the resolved source and target points, plus \'nativeDrag\': true when the browser ran the gesture as a native HTML5 drag rather than as pointer events, which tells a canvas drag that did nothing exactly why; false when the probe genuinely ran and saw no native drag start; and null, with a note, on the rare gesture that navigates the page away before the probe can be read, since a fresh document\'s own counter is not evidence about the document that navigated away, and reporting that as false would be exactly the kind of unearned negative this field exists to avoid. ' +
-      'A resolved selector is only a bounding box, and a box says nothing about what is drawn on top of it, so BOTH endpoints are hit-tested with elementFromPoint before the mouse ever moves, the same test element_box runs for a plain click target. sourceHit and targetHit each carry matchesTarget (true when the point really belongs to the named selector, an ancestor of it, or a descendant of it; null for a raw x/y endpoint, which names nothing to compare against) and elementAtPoint (what is really there, named the way element_box\'s occludedBy is, whenever that differs from a clean match). The hit test accounts for shadow DOM the same way element_box does: an endpoint inside an open or closed shadow root that is genuinely unoccluded reports matchesTarget true, not false against its own host, and a real overlay sitting on top of it INSIDE THAT SAME shadow root is still caught rather than waved through by the retargeting that makes the first case work. When a selector\'s point does not reach its own element the top-level result carries "matched": false and a "note" naming the endpoint and what covered it instead, so a press that silently lands on a modal or a loading overlay cannot read as a normal drag. This does NOT throw for an occluded endpoint: a canvas point that is deliberately under a transparent hit-testing overlay, or a selector naming a node nested inside the thing that truly receives the gesture, are both real drags, so check "matched" rather than assuming a resolved call pressed what it was asked to. ' +
+      'A resolved selector is only a bounding box, and a box says nothing about what is drawn on top of it, so BOTH endpoints are hit-tested before the mouse ever moves, with the same test element_box runs for a plain click target. The question it answers is the one that matters: would a real pointerdown at these coordinates reach the element you named? A pointerdown dispatches on the deepest node at the point and propagates up the FLATTENED tree, so matchesTarget is "the named element is on the composed path of whatever is really topmost there". sourceHit and targetHit each carry it (null for a raw x/y endpoint, which names nothing to compare against) alongside elementAtPoint, which names what really received the press whenever that is not a match. ' +
+      'Read the asymmetry carefully, because it is easy to get backwards and this tool used to have it backwards: an ANCESTOR of the element that took the press is on the composed path and MATCHES (a <button> whose centre is painted by its own inline label, or a parent that receives the press because its child is pointer-events: none), while a DESCENDANT of it is NOT and does not. So a drag endpoint that falls just outside a canvas node and lands on the pane behind it is a MISS, not a hit on the node, even though the pane contains the node. Note that <body> and <html> are on the composed path of every point, so a selector naming "body" matches everywhere, correctly: a press anywhere really does run body\'s listeners. When elementAtPoint is an ancestor of your selector it says so with "containsTarget": true, because that is a different diagnosis from an overlay and needs a different remedy: the point is inside your element\'s box but outside anything it hit-tests, which is what pointer-events: none, visibility: hidden, a ::before or ::after scrim on a wrapper, a clip-path cut-out, a wrapped inline, or an offset that simply falls off the element all look like. Changing a z-index will not help any of those. ' +
+      'Shadow DOM is handled by the same walk, in both directions: an endpoint inside an open or closed shadow root that is genuinely unoccluded matches rather than reading as occluded by its own host; a shadow HOST matches when the press lands on its own shadow content, because the host is on that content\'s composed path; a shadow-tree wrapper matches when the press lands on light-DOM children slotted into it; and a real overlay sitting on top of a target INSIDE THAT SAME shadow root is still caught and named. When a selector\'s point does not reach its own element the top-level result carries "matched": false and a "note" naming the endpoint, what took the press, and what to do about it, so a press that silently lands on a modal, a loading overlay or the container behind a node cannot read as a normal drag. This does NOT throw for a missed endpoint: a canvas point deliberately under a transparent hit-testing overlay is a real drag, so check "matched" rather than assuming a resolved call pressed what it was asked to. ' +
+      'elementAtPoint is filled in whenever the topmost node is not the named element ITSELF, on a match as well as on a miss, so naming "body" with an offset tells you exactly as much about that point as passing the same coordinates raw would. "matched" is true, false, or NULL: null means the hit test could not answer, not that it passed, which currently happens only when the DOM at that point is nested deeper than the walk is allowed to run. A note always says which. ' +
+      'A frame-prefixed selector from list_frames is fully supported and hit-tested in the MAIN frame\'s coordinate space, which is where the mouse actually goes. Every ancestor frame is checked on the way down, because a pointer event cannot cross a frame boundary: if something in a PARENT document covers the iframe, the press never reaches the frame at all, and that is reported with elementAtPoint carrying "inAncestorFrame": true and a note saying nothing inside the frame can fix it. ' +
+      'Both endpoints are waited for and scrolled into view BEFORE either is measured, because resolving one endpoint scrolls the page and would otherwise leave the other one\'s coordinates stale. When the two cannot be on screen at the same time, which no single mouse gesture can do, the result says exactly that rather than letting the hit test blame an overlay at a clamped point. ' +
+      'Neither endpoint selector has to be unique. Like click and hover, a selector matching several elements resolves to the FIRST one and no error is raised; the resolved source and target each carry "matchedElements", with a note whenever it is more than one. That is worth knowing before you read a result: ".react-flow__node" on a canvas with eleven nodes resolves happily to whichever one is first in the DOM. ' +
       'Clears any existing text selection before pressing, deliberately: a press landing inside a selection left over from an earlier drag makes the browser drag that selection instead, and the page then sees no pointermove at all. Does NOT wait for either element to appear: call wait_for first. Does NOT verify that anything moved, so assert the page state yourself afterwards.',
     inputSchema: z.object({
       sessionId,
@@ -1553,8 +3318,28 @@ export const interactionTools = defineTools({
     async handler(ctx, args) {
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
       const timeout = args.timeoutMs ?? POINTER_ENDPOINT_TIMEOUT_MS;
-      const from = await resolvePointerPoint(target.page, args.source, 'drag', 'source', timeout);
-      const to = await resolvePointerPoint(target.page, args.target, 'drag', 'target', timeout);
+      // BOTH endpoints are waited for and scrolled into view BEFORE either is measured.
+      // Resolving an endpoint scrolls it into view, and scrolling moves everything else on the
+      // page, so measuring the source and then resolving the target used to leave the source
+      // point stale by however far the page scrolled. Measured at 2320px stale in one case: the
+      // press landed on <html> and the note blamed a scrim, never mentioning that this call's
+      // own second endpoint had moved the first.
+      const sourcePrepared = await preparePointerEndpoint(target.page, args.source, 'drag', 'source', timeout);
+      const targetPrepared = await preparePointerEndpoint(target.page, args.target, 'drag', 'target', timeout);
+      const from = await measurePointerEndpoint(sourcePrepared, 'drag', 'source', timeout);
+      const to = await measurePointerEndpoint(targetPrepared, 'drag', 'target', timeout);
+
+      // Two elements far enough apart genuinely cannot both be on screen at once, and no
+      // ordering of the resolution fixes that: it is a real property of the gesture being
+      // asked for. Naming it here is the difference between a caller seeing the actual cause
+      // and chasing the phantom overlay the hit test is about to report at a clamped point.
+      const viewport = target.page.viewportSize();
+      const offScreen = viewport
+        ? (['source', 'target'] as const).filter(which => {
+            const point = which === 'source' ? from : to;
+            return point.x < 0 || point.y < 0 || point.x >= viewport.width || point.y >= viewport.height;
+          })
+        : [];
 
       // Checked before the mouse ever moves, not after: an overlay that would swallow the
       // press is true right now, and pressing anyway would tell it the drag succeeded no
@@ -1613,6 +3398,12 @@ export const interactionTools = defineTools({
       const mismatched = (['source', 'target'] as const).filter(
         which => (which === 'source' ? sourceHit : targetHit).matchesTarget === false
       );
+      // An endpoint whose hit test gave up is UNKNOWN, not clean. Folding it into the true
+      // branch of "matched" would turn "we could not tell" into "it landed correctly", which is
+      // the exact shape of unearned confidence this tool exists to avoid.
+      const unknown = (['source', 'target'] as const).filter(
+        which => (which === 'source' ? sourceHit : targetHit).unknownReason !== undefined
+      );
       const anySelectorGiven = from.selector !== undefined || to.selector !== undefined;
 
       // Two independent things can each want to attach a note (an occluded endpoint, and a
@@ -1623,13 +3414,30 @@ export const interactionTools = defineTools({
       // whichever one lost that race, and that is precisely the kind of thing this tool
       // exists to never do to a caller.
       const notes: string[] = [];
+      notes.push(...multiMatchNote([{ which: 'source', point: from }, { which: 'target', point: to }]));
+      if (offScreen.length > 0) {
+        notes.push(
+          `The resolved ${offScreen.join(' and ')} point is outside the viewport, so the mouse could not actually ` +
+            'visit it. Both endpoints were scrolled into view before either was measured, so this is not a stale ' +
+            'coordinate: it means the two endpoints cannot be on screen at the same time, which no single mouse ' +
+            'gesture can do. Scroll or zoom so both are visible, drag in stages, or use raw x/y coordinates for a ' +
+            'point you know is on screen. Whatever the hit test reports for that endpoint is about a clamped point ' +
+            'rather than the element.'
+        );
+      }
+      for (const which of unknown) {
+        notes.push(`At ${which}: ${(which === 'source' ? sourceHit : targetHit).unknownReason}`);
+      }
       if (mismatched.length > 0) {
         notes.push(
           `The press did not land on the ${mismatched.join(' or ')} selector's own element: ` +
             mismatched
               .map(which => `at ${which}, ${describeElement((which === 'source' ? sourceHit : targetHit).elementAtPoint)} received it instead`)
               .join('; ') +
-            '. Coordinates still went where the box math said, but something else was really on top of the point at press time, which is exactly how a modal, a loading overlay or a sibling drawn later swallows a drag while this call still reports a clean gesture. If that element is meant to be there (a transparent hit-testing overlay over a canvas, say) this is not a failure; otherwise raise its z-index down out of the way or point the selector at what is really on top.'
+            '. ' +
+            // Deduplicated: both endpoints missing for the same reason would otherwise print the
+            // same paragraph of advice twice in one note.
+            Array.from(new Set(mismatched.map(which => missRemedy((which === 'source' ? sourceHit : targetHit).elementAtPoint)))).join(' ')
         );
       }
       if (nativeDrag) {
@@ -1654,7 +3462,7 @@ export const interactionTools = defineTools({
         button,
         ...(modifiers.length > 0 ? { modifiers } : {}),
         nativeDrag,
-        ...(anySelectorGiven ? { matched: mismatched.length === 0 } : {}),
+        ...(anySelectorGiven ? { matched: mismatched.length > 0 ? false : unknown.length > 0 ? null : true } : {}),
         ...(notes.length > 0 ? { note: notes.join(' ') } : {})
       });
     }
@@ -1791,16 +3599,74 @@ export const interactionTools = defineTools({
   }),
 
   navigate_back: defineTool({
+    // Serialized per session, the same way click is. Two history steps issued
+    // without awaiting each other tore each other's navigation down and BOTH
+    // rejected with "net::ERR_ABORTED; maybe frame was detached?", while
+    // Chromium's own history showed the tab had moved one entry: two failures
+    // reported for one step that actually happened. Queuing them makes the
+    // second step act on the tab the first one left behind, which is what a
+    // caller issuing two back steps means.
+    serializesInput: true,
     description:
-      'Go back one entry in a session\'s tab history, the way a user presses the browser Back button. Real history matters wherever an app writes its state into the URL and restores it from a popstate event, and nothing else here exercises that path. When there is no entry to go back to this does NOT quietly succeed: the result says "navigated": false with a note, so a no-op can never read as a step. Nor does it quietly succeed when there WAS an entry to go to but the step never actually landed: a page can catch the popstate event this fires and push its own URL right back, which is exactly what a route guard or an unsaved-changes interceptor does, and "navigated" is false with a note for that too, so a back button an app is trapping the user on cannot read as a clean pass. Otherwise it reports the resulting URL and "sameDocument", exactly as navigate does: true means the URL changed without a reload, so the JS context, in-page state and the console buffer all survived, which is what a hash or pushState step back looks like. "historyIndex" and "historyLength" are always read fresh from the browser\'s own history after the step, not computed from where the tab was before it, so they describe where the tab really ended up.',
-    inputSchema: z.object({ sessionId, pageId, waitUntil }),
+      'Go back one entry in a session\'s tab history, the way a user presses the browser Back button. Real history matters wherever an app writes its state into the URL and restores it from a popstate event, and nothing else here exercises that path. When there is no entry to go back to this does NOT quietly succeed: the result says "navigated": false with a note, so a no-op can never read as a step. Nor does it quietly succeed when there WAS an entry to go to but the step never actually landed. A page can catch the popstate event this fires and push its own entries on top, which is what a route guard, an unsaved-changes interceptor or a client-side auth bounce does, and it takes two shapes: the page re-pushes the URL the tab was already on, so nothing appears to move, or it pushes somewhere else entirely, so the URL changes and the tab ends up level with or FURTHER FORWARD than where it started. Both report "navigated": false with a note naming what happened, because neither is a step back. The verdict is settled against Chromium\'s own navigation history rather than against the URL, and against THREE things, because each of the first two alone was found to pass a guarded step: the tab has to have moved, it has to end on the history index the step aimed at (one back, not three), and it has to end on the ENTRY it aimed at. That last one is what catches a guard calling location.replace, which swaps an entry\'s contents in place so the index still moves exactly one the right way while the tab lands on a login page. "previousHistoryIndex", "historyIndex" and "expectedUrl" are all reported so the movement can be checked rather than taken on trust. A guard does not act until it receives the popstate event this step fires, so its own navigation begins AFTER the step resolves: this waits a real, stated window ("settleMs", 500ms by default) for that before measuring anything, which is why "url", "title" and "sameDocument" describe the document that finally loaded rather than the one the guard was about to throw away. A step the page refuses outright, which is what a beforeunload handler does, is reported as a blocked step with "timedOut": true rather than thrown as a raw timeout. Calls are serialized per session, so two history steps issued without awaiting each other queue instead of tearing each other down. "url" always says where the tab really ended up, blocked or not, so read it rather than assuming a blocked step left the tab where it was. Otherwise it reports the resulting URL and "sameDocument", exactly as navigate does: true means the URL changed without a reload, so the JS context, in-page state and the console buffer all survived, which is what a hash or pushState step back looks like. "historyIndex" and "historyLength" are always read fresh from the browser\'s own history after the step, not computed from where the tab was before it, so they describe where the tab really ended up.',
+    inputSchema: z.object({
+      sessionId,
+      pageId,
+      waitUntil,
+      settleMs: z
+        .number()
+        .int()
+        .min(0)
+        .max(30_000)
+        .optional()
+        .describe(
+          'How long to keep watching for the page to move itself after the step, in milliseconds. Defaults to 500. A route guard does not act until it receives the popstate event this step fires, so its own navigation begins AFTER the step resolves: without this window the result would describe the document the guard was about to throw away. Raise it for a guard that waits on a token check.'
+        ),
+      timeoutMs: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe(
+          'How long the step itself may take before this call gives up, in milliseconds. Defaults to 30000. Giving up is REPORTED as a blocked step, not thrown: a beforeunload handler asking the browser to stay is the usual reason, and it comes back with "navigated": false, "timedOut": true and a note.'
+        )
+    }),
     handler: (ctx, args) => historyStep(ctx, args, 'back')
   }),
 
   navigate_forward: defineTool({
+    // Serialized per session, the same way click is. Two history steps issued
+    // without awaiting each other tore each other's navigation down and BOTH
+    // rejected with "net::ERR_ABORTED; maybe frame was detached?", while
+    // Chromium's own history showed the tab had moved one entry: two failures
+    // reported for one step that actually happened. Queuing them makes the
+    // second step act on the tab the first one left behind, which is what a
+    // caller issuing two back steps means.
+    serializesInput: true,
     description:
-      'Go forward one entry in a session\'s tab history, the way a user presses the browser Forward button. The counterpart to navigate_back, and it behaves identically: sitting at the newest entry there is nothing ahead, and the result says "navigated": false with a note rather than looking like a step, and the same is true when there was an entry to go to but a page trapped the step and pushed its own URL right back. Note that navigating anywhere new discards the forward entries, so a forward step is only available directly after a back step.',
-    inputSchema: z.object({ sessionId, pageId, waitUntil }),
+      'Go forward one entry in a session\'s tab history, the way a user presses the browser Forward button. The counterpart to navigate_back, and it behaves identically: sitting at the newest entry there is nothing ahead, and the result says "navigated": false with a note rather than looking like a step. The same is true when there was an entry to go to but a page trapped the step, whether it pushed the tab\'s own URL straight back or pushed it somewhere else: a forward step counts only when the tab really moved, ended on the index one FORWARD of where it started, and ended on the entry it aimed at, so an overshoot and an entry swapped out underneath it are both caught. "previousHistoryIndex", "historyIndex" and "expectedUrl" report the readings, it waits the same "settleMs" window for a guard\'s own navigation to land before measuring, and it reports a refused step rather than throwing a raw timeout. Note that navigating anywhere new discards the forward entries, so a forward step is only available directly after a back step.',
+    inputSchema: z.object({
+      sessionId,
+      pageId,
+      waitUntil,
+      settleMs: z
+        .number()
+        .int()
+        .min(0)
+        .max(30_000)
+        .optional()
+        .describe(
+          'How long to keep watching for the page to move itself after the step, in milliseconds. Defaults to 500. A route guard does not act until it receives the popstate event this step fires, so its own navigation begins AFTER the step resolves: without this window the result would describe the document the guard was about to throw away. Raise it for a guard that waits on a token check.'
+        ),
+      timeoutMs: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe(
+          'How long the step itself may take before this call gives up, in milliseconds. Defaults to 30000. Giving up is REPORTED as a blocked step, not thrown: a beforeunload handler asking the browser to stay is the usual reason, and it comes back with "navigated": false, "timedOut": true and a note.'
+        )
+    }),
     handler: (ctx, args) => historyStep(ctx, args, 'forward')
   }),
 
@@ -1808,7 +3674,11 @@ export const interactionTools = defineTools({
     serializesInput: true,
     description:
       'Turn the mouse wheel in a session\'s tab, which is how a canvas is zoomed and how anything with its own scroll container is scrolled. WHERE the wheel lands matters and is not incidental: a canvas zooms toward the pointer, so "point" takes the same shape as drag\'s endpoints (a selector, a raw x/y viewport point, or a selector plus an offset inside it). Omitting it aims at the centre of the viewport, deliberately, rather than at wherever some earlier click or hover happened to leave the pointer. deltaY is positive to scroll down and negative to scroll up, deltaX positive to scroll right, matching a real wheel. MODIFIERS ARE THE PINCH: a browser delivers a trackpad pinch as a wheel event with ctrlKey set, and canvas libraries branch on exactly that, so modifiers: ["Control"] is the only way to test the zoom path in an app whose plain wheel pans. They are held for the whole gesture and released afterwards. Use "repeat" when one large delta and several small ones are not the same thing, which is common: libraries that accumulate deltas, debounce, or clamp per event behave differently, and "delay" spaces the events out for one that debounces. Always reads back what really moved: the result carries the point used, the total deltas dispatched, the scroll offsets before and after (for the page and for whichever container the browser would actually scroll at that point), and "moved". Note that "moved": false is CORRECT for a canvas zoom, because a zoom is a CSS transform rather than a scroll and nothing here can observe it generically: assert the app\'s own state for that. It is a real failure if you expected a scroll. ' +
-      'Resolving "point" only measures a box, it says nothing about what is drawn on top of it, and mouse.wheel dispatches at raw coordinates with none of Playwright\'s own actionability checks in the way, so the point is hit-tested with elementFromPoint before the event fires, the same test element_box runs for a plain click target. "pointHit" carries matchesTarget (true when the point really belongs to the named selector, an ancestor of it, or a descendant of it; null when point has no selector, which names nothing to compare against) and elementAtPoint (what is really there, named the way element_box\'s occludedBy is, whenever that differs from a clean match, or just informationally for a selector-less point when something is cheap to report). The hit test accounts for shadow DOM the same way element_box does: a point inside an open or closed shadow root that is genuinely unoccluded reports matchesTarget true, not false against its own host, and a real overlay sitting on top of it INSIDE THAT SAME shadow root is still caught rather than waved through by the retargeting that makes the first case work. "scroll" is drilled the same way: a scrollable container that lives inside a shadow root is found and reported on, not just the shadow host\'s own ancestors. When a selector\'s point does not reach its own element the result carries "matched": false and a "note" naming what covered it, so a wheel that silently scrolled or zoomed the wrong container cannot read as having hit the one asked for. This does NOT throw for an occluded point: a canvas point deliberately under a transparent hit-testing overlay is a real target, so check "matched" rather than assuming a resolved call landed where it was aimed. Does NOT dispatch a pinch gesture, a touch event, or a smooth scroll animation of its own.',
+      'Resolving "point" only measures a box, it says nothing about what is drawn on top of it, and mouse.wheel dispatches at raw coordinates with none of Playwright\'s own actionability checks in the way, so the point is hit-tested before the event fires, with the same test drag and element_box run. It answers whether a real pointer event at those coordinates would reach the element named, by checking that element against the COMPOSED PATH of whatever is really topmost at the point. "pointHit" carries matchesTarget (null when point has no selector, which names nothing to compare against) and elementAtPoint, naming what really received the event whenever that is not a match. ' +
+      'The asymmetry is the part to read carefully: an ANCESTOR of the element that took the event is on the composed path and matches, a DESCENDANT of it is not. A wheel aimed at a point that falls outside a scroll container and onto the pane behind it is therefore a MISS, not a hit on the container, even though the pane contains it. That combination, a clean-looking hit with nothing scrolled, is exactly what a canvas zoom looks like, so getting it wrong lets a dead wheel be explained away as a zoom. When elementAtPoint is an ancestor of your selector it says so with "containsTarget": true, which means the point is inside your element\'s box but outside anything it hit-tests (pointer-events: none, a pseudo-element scrim on a wrapper, a clip-path cut-out, or an offset that falls off the element): a z-index change will not fix any of those. Shadow DOM is handled in both directions, so an unoccluded element inside an open or closed shadow root matches, a shadow host matches when the event lands on its own shadow content, and a real overlay inside the same shadow root is still caught and named. "scroll" is drilled the same way: a scrollable container that lives inside a shadow root is found and reported on, not just the shadow host\'s own ancestors. When a selector\'s point does not reach its own element the result carries "matched": false and a "note" naming what took the event and what to do about it. This does NOT throw for a missed point: a canvas point deliberately under a transparent hit-testing overlay is a real target, so check "matched" rather than assuming a resolved call landed where it was aimed. ' +
+      'A frame-prefixed selector from list_frames is hit-tested in the MAIN frame\'s coordinate space, which is where the event actually goes, and every ancestor frame is checked on the way down: a pointer event cannot cross a frame boundary, so something in a PARENT document covering the iframe means the wheel never reaches the frame at all, reported with "inAncestorFrame": true. "matched" is true, false, or NULL, where null means the hit test could not answer rather than that it passed. ' +
+      'Waits for a real renderer round trip after dispatching, so by the time this returns the page has run its own wheel handlers. Without that the readback could observe a page that had not yet seen the event, which was invisible whenever something DID scroll and wide open whenever nothing did. ' +
+      'The point\'s selector does not have to be unique. Like click and hover, a selector matching several elements resolves to the FIRST one with no error; the resolved point carries "matchedElements", with a note whenever it is more than one. Does NOT dispatch a pinch gesture, a touch event, or a smooth scroll animation of its own.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -1902,6 +3772,21 @@ export const interactionTools = defineTools({
         }
       }
 
+      // Chromium returns from the CDP wheel dispatch BEFORE the renderer has necessarily run
+      // the page's own listeners, so reading straight back can observe a page that has not yet
+      // seen the event. Measured directly with a probe that bypassed this tool: the listener
+      // was still unfired in 2 of 20 trials at idle and 3 of 150 under load. What used to hide
+      // it is readSettledScrollState's sleep(25) poll, and only by accident: when nothing on
+      // the page is scrollable its first two reads agree immediately and it returns without
+      // ever sleeping, so the mask is exactly one 25ms tick with no structural relationship to
+      // event delivery. Two chained animation frames are a real renderer round trip, so this
+      // waits for the thing that actually matters instead of for a duration that usually
+      // covers it. Swallowed on failure because a gesture that navigated the page away has no
+      // renderer left to wait for, and that is not a wheel failure.
+      await target.page
+        .evaluate(() => new Promise<void>(resolve => window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve()))))
+        .catch(() => {});
+
       const after = await readSettledScrollState(target.page, point.x, point.y);
       const moved = !sameScrollState(before, after);
 
@@ -1910,10 +3795,15 @@ export const interactionTools = defineTools({
       // spread with its own "note" key for the same reason drag's notes are: two literal
       // `note:` spreads back to back would let the second one silently overwrite the first.
       const notes: string[] = [];
+      notes.push(...multiMatchNote([{ which: 'point', point }]));
+      if (pointHit.unknownReason !== undefined) {
+        notes.push(pointHit.unknownReason);
+      }
       if (pointHit.matchesTarget === false) {
         notes.push(
-          `The wheel event did not land on the point's own selector's element: ${describeElement(pointHit.elementAtPoint)} received it instead. ` +
-            'Coordinates still went where the box math said, but something else was really on top of the point when the event fired, which would make the wheel scroll or zoom whatever that covering element is rather than the one named. If that element is meant to be there (a transparent hit-testing overlay over a canvas, say) this is not a failure; otherwise raise its z-index down out of the way or point the selector at what is really on top.'
+          `The wheel event did not land on the point's own selector's element: ${describeElement(pointHit.elementAtPoint)} received it instead, ` +
+            'so the wheel scrolled or zoomed whatever that element is rather than the one named. ' +
+            missRemedy(pointHit.elementAtPoint)
         );
       }
       if (!moved) {
@@ -1935,7 +3825,9 @@ export const interactionTools = defineTools({
         totalDeltaY: deltaY * repeat,
         scroll: { before, after },
         moved,
-        ...(point.selector !== undefined ? { matched: pointHit.matchesTarget !== false } : {}),
+        ...(point.selector !== undefined
+          ? { matched: pointHit.matchesTarget === false ? false : pointHit.unknownReason !== undefined ? null : true }
+          : {}),
         ...(notes.length > 0 ? { note: notes.join(' ') } : {})
       });
     }
