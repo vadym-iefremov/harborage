@@ -1905,7 +1905,13 @@ export const inspectTools = defineTools({
         .string()
         .optional()
         .describe(
-          'Keep only entries whose URL matches this JavaScript regular expression source, e.g. "/api/.*/save$".'
+          'Keep only entries whose URL matches this JavaScript regular expression source, e.g. "/api/.*/save$". ' +
+            'A pattern whose backtracking can run away is REFUSED at compile time rather than run, because this ' +
+            'daemon is shared by every agent on the machine and a single thread runs the match: "^(a+)+$" against ' +
+            '34 characters took over two minutes, during which nobody else\'s session, and not even the health ' +
+            'endpoint, could be answered. The refusal names the field and says what to rewrite. It errs toward ' +
+            'refusing: some unambiguous patterns are turned away, which costs one rewrite, where letting one ' +
+            'through costs the machine.'
         ),
       method: z
         .string()
@@ -1932,7 +1938,11 @@ export const inspectTools = defineTools({
         .optional()
         .describe(
           'Keep only entries of this Playwright resource type, e.g. "document", "xhr", "fetch", "image", "script". ' +
-            'Only request entries carry one.'
+            'Only request entries carry one. Matched case-insensitively, like method: "XHR" and "xhr" mean the ' +
+            'same thing. It used to be the ONE case-sensitive field here, so "XHR" quietly matched nothing and ' +
+            'came back as "returned": 0 with "dropped": 0, which this tool\'s own description reads as the filter ' +
+            'genuinely having found nothing still in the buffer. A resource type Playwright does not have is now ' +
+            'REJECTED rather than silently matching nothing, since it could only ever have been a typo.'
         ),
       direction: z.enum(['request', 'response']).optional().describe('Keep only one side of each exchange.')
     }),
