@@ -3,6 +3,7 @@ import type { BrowserContext, BrowserContextOptions, Dialog, Page } from 'playwr
 
 import { noopLogger, type Logger } from '../shared/logger.js';
 import type { BrowserManager } from './browserManager.js';
+import { compileNetworkMatch, matchesNetworkEntry, type NetworkMatchCriteria, type NetworkMatchInput } from './networkMatch.js';
 
 export class SessionNotFoundError extends Error {
   constructor(sessionId: string) {
@@ -124,11 +125,33 @@ const defaultTimeouts: Required<SessionTimeouts> = {
   maxInFlightAgeMs: 10 * 60 * 1000
 };
 
-/** Pushes onto a bounded array, dropping the oldest entries once over `max`. */
-function pushBounded<T>(buffer: T[], entry: T, max: number): void {
-  buffer.push(entry);
-  if (buffer.length > max) {
-    buffer.splice(0, buffer.length - max);
+/**
+ * One bounded ring plus a running count of what it has silently thrown away.
+ *
+ * `dropped` is what makes an empty or short `list_network_requests` result
+ * distinguishable from "that traffic never happened": on a Vite dev server
+ * the 200-entry network ring used to fill with module-chunk requests inside
+ * the first second of a page load, quietly evicting the one API call an
+ * agent actually cared about, and `total: 200, returned: 0` read exactly like
+ * a clean result. `dropped` reports the eviction directly instead of leaving
+ * a caller to infer it from a suspiciously round `total`.
+ */
+interface BoundedBuffer<T> {
+  entries: T[];
+  dropped: number;
+}
+
+function newBoundedBuffer<T>(): BoundedBuffer<T> {
+  return { entries: [], dropped: 0 };
+}
+
+/** Pushes onto a bounded ring, dropping the oldest entries once over `max` and counting the drop. */
+function pushBounded<T>(buffer: BoundedBuffer<T>, entry: T, max: number): void {
+  buffer.entries.push(entry);
+  if (buffer.entries.length > max) {
+    const overflow = buffer.entries.length - max;
+    buffer.entries.splice(0, overflow);
+    buffer.dropped += overflow;
   }
 }
 
@@ -167,12 +190,29 @@ interface SessionRecord {
    * reaped out from under them.
    */
   escalatedAt: number | undefined;
-  consoleBuffer: ConsoleEntry[];
-  networkBuffer: NetworkEntry[];
-  dialogBuffer: DialogEntry[];
-  pageErrorBuffer: PageErrorEntry[];
+  consoleBuffer: BoundedBuffer<ConsoleEntry>;
+  networkBuffer: BoundedBuffer<NetworkEntry>;
+  dialogBuffer: BoundedBuffer<DialogEntry>;
+  pageErrorBuffer: BoundedBuffer<PageErrorEntry>;
   /** What the next dialog (or every dialog) gets. Undefined means the safe default, dismiss. */
   dialogPolicy: DialogPolicy | undefined;
+  /**
+   * What is worth putting in the network ring at all. Undefined (the default)
+   * captures everything, matching every session before this filter existed.
+   * Set at create_session or later with set_network_capture_filter, it runs
+   * BEFORE an entry ever reaches `networkBuffer`, so noise excluded here can
+   * never evict signal the way a read-time filter cannot prevent.
+   */
+  networkCaptureFilter: NetworkMatchCriteria | undefined;
+  /**
+   * How many request/response entries this capture filter has turned away
+   * since it was set (or since the last unfiltered clear). Kept separate from
+   * `networkBuffer.dropped`: a filtered-out entry was a deliberate exclusion
+   * the caller asked for, an evicted one was an accident of the ring filling
+   * up, and conflating the two would hide whichever one was actually the
+   * caller's problem.
+   */
+  networkFilteredOut: number;
 }
 
 /**
@@ -191,6 +231,18 @@ export interface CreateSessionOptions {
   viewport?: { width: number; height: number };
   /** Device pixel ratio, e.g. 2 for a retina-density screenshot. Unset means 1. */
   deviceScaleFactor?: number;
+  /**
+   * What to keep in this session's network ring from the moment it opens.
+   * Same vocabulary as list_network_requests' own filters (urlIncludes,
+   * urlMatches, method, resourceType, direction), because a caller who found
+   * the noise with a read-time filter should be able to paste the same
+   * fields in here rather than learn a second vocabulary. Unset captures
+   * everything, matching every session before this option existed. Also
+   * settable, or replaceable, after the session is already running with
+   * set_network_capture_filter, for the common case of only discovering the
+   * flood once it has already happened.
+   */
+  networkCaptureFilter?: NetworkMatchInput;
 }
 
 /** What a tool handler gets back after resolving a sessionId (+ optional pageId). */
@@ -277,18 +329,19 @@ export class SessionStore {
       );
     });
     page.on('request', req => {
-      pushBounded(
-        record.networkBuffer,
-        {
-          pageId,
-          direction: 'request',
-          url: req.url(),
-          method: req.method(),
-          resourceType: req.resourceType(),
-          timestamp: Date.now()
-        },
-        this.bufferLimits.network
-      );
+      const entry: NetworkEntry = {
+        pageId,
+        direction: 'request',
+        url: req.url(),
+        method: req.method(),
+        resourceType: req.resourceType(),
+        timestamp: Date.now()
+      };
+      if (record.networkCaptureFilter !== undefined && !matchesNetworkEntry(entry, record.networkCaptureFilter)) {
+        record.networkFilteredOut += 1;
+        return;
+      }
+      pushBounded(record.networkBuffer, entry, this.bufferLimits.network);
     });
     // Registering ANY dialog listener switches Playwright's own auto-dismiss
     // off, which makes this handler the only thing that can ever unblock a
@@ -347,18 +400,19 @@ export class SessionStore {
     });
 
     page.on('response', res => {
-      pushBounded(
-        record.networkBuffer,
-        {
-          pageId,
-          direction: 'response',
-          url: res.url(),
-          status: res.status(),
-          statusText: res.statusText(),
-          timestamp: Date.now()
-        },
-        this.bufferLimits.network
-      );
+      const entry: NetworkEntry = {
+        pageId,
+        direction: 'response',
+        url: res.url(),
+        status: res.status(),
+        statusText: res.statusText(),
+        timestamp: Date.now()
+      };
+      if (record.networkCaptureFilter !== undefined && !matchesNetworkEntry(entry, record.networkCaptureFilter)) {
+        record.networkFilteredOut += 1;
+        return;
+      }
+      pushBounded(record.networkBuffer, entry, this.bufferLimits.network);
     });
   }
 
@@ -528,11 +582,14 @@ export class SessionStore {
       lastActivity: now,
       inFlightCalls: new Map(),
       escalatedAt: undefined,
-      consoleBuffer: [],
-      networkBuffer: [],
-      dialogBuffer: [],
-      pageErrorBuffer: [],
-      dialogPolicy: undefined
+      consoleBuffer: newBoundedBuffer(),
+      networkBuffer: newBoundedBuffer(),
+      dialogBuffer: newBoundedBuffer(),
+      pageErrorBuffer: newBoundedBuffer(),
+      dialogPolicy: undefined,
+      networkCaptureFilter:
+        options.networkCaptureFilter !== undefined ? compileNetworkMatch(options.networkCaptureFilter) : undefined,
+      networkFilteredOut: 0
     };
 
     // A tab opened by the page itself (window.open, a target="_blank" link,
@@ -686,59 +743,93 @@ export class SessionStore {
     });
   }
 
-  /**
-   * Reads one bounded buffer, and when `clear` is set removes exactly the
-   * entries it returned, matched by identity.
-   *
-   * By identity, and not by re-deriving the filter, because `clear` used to
-   * drop everything belonging to the page it was given. Any read that
-   * narrowed further, by level or by substring, therefore discarded entries
-   * the caller never saw and had no way to notice were gone. Whatever a
-   * caller filters by, it can now only ever clear what it actually read.
-   */
+  /** One buffered read: what matched, how many are sitting in the ring, and how many the ring has ever dropped. */
   private readBuffer<T extends { pageId: string }>(
-    buffer: T[],
+    buffer: BoundedBuffer<T>,
     pageId: string | undefined,
     clear: boolean,
     match: ((entry: T) => boolean) | undefined
-  ): { matches: T[]; remaining: T[] } {
-    const matches = buffer.filter(
+  ): { entries: T[]; dropped: number } {
+    const matches = buffer.entries.filter(
       entry => (pageId === undefined || entry.pageId === pageId) && (match === undefined || match(entry))
     );
-    if (!clear) return { matches, remaining: buffer };
-    const removed = new Set<T>(matches);
-    return { matches, remaining: buffer.filter(entry => !removed.has(entry)) };
+    // dropped is read before any reset below applies, so a caller doing
+    // `clear: true` still sees what was lost during the window that call is
+    // about to close out, rather than the freshly-reset value.
+    const dropped = buffer.dropped;
+    if (clear) {
+      // By identity, and not by re-deriving the filter, because `clear` used
+      // to drop everything belonging to the page it was given. Any read that
+      // narrowed further, by level or by substring, therefore discarded
+      // entries the caller never saw and had no way to notice were gone.
+      // Whatever a caller filters by, it can now only ever clear what it
+      // actually read.
+      const removed = new Set<T>(matches);
+      buffer.entries = buffer.entries.filter(entry => !removed.has(entry));
+      // Reset the drop counter exactly when a session-wide clear (no pageId
+      // scope) leaves NOTHING behind. That is the outcome that actually means
+      // "wipe the slate, tell me only what's new from here", whether it got
+      // there because no filter was given or because the filter happened to
+      // match everything that was there.
+      //
+      // This has to be judged by the outcome, not by whether the caller
+      // technically passed a match function: every tool handler above this
+      // store builds a predicate closure even for "no filters set" (it is
+      // always some function, never a literal `undefined`), so checking
+      // `match === undefined` never fired through the tool surface at all,
+      // only for a direct SessionStore call with no predicate. A clear
+      // scoped to one tab, or one that leaves other entries sitting unread,
+      // must never reset it: that would erase the "you lost N entries"
+      // warning for evidence still in the buffer nobody has seen yet.
+      if (pageId === undefined && buffer.entries.length === 0) buffer.dropped = 0;
+    }
+    return { entries: matches, dropped };
   }
 
   /**
    * Buffered console messages, optionally narrowed to one tab and to
    * whatever else the caller cares about. `match` exists so a tool that
    * filters by level or by text filters here rather than on the way out,
-   * which is what keeps `clear` honest.
+   * which is what keeps `clear` honest. `dropped` is how many console
+   * messages this session's ring has evicted; see BoundedBuffer.
    */
   getConsoleMessages(
     sessionId: string,
     pageId?: string,
     clear = false,
     match?: (entry: ConsoleEntry) => boolean
-  ): ConsoleEntry[] {
+  ): { entries: ConsoleEntry[]; dropped: number } {
     const record = this.getRecord(sessionId);
-    const { matches, remaining } = this.readBuffer(record.consoleBuffer, pageId, clear, match);
-    record.consoleBuffer = remaining;
-    return matches;
+    return this.readBuffer(record.consoleBuffer, pageId, clear, match);
   }
 
-  /** Buffered network request/response entries, same filtering and same `clear` guarantee. */
+  /** Buffered network request/response entries, same filtering, same `clear` guarantee, plus how many were evicted. */
   getNetworkEntries(
     sessionId: string,
     pageId?: string,
     clear = false,
     match?: (entry: NetworkEntry) => boolean
-  ): NetworkEntry[] {
+  ): { entries: NetworkEntry[]; dropped: number; filteredOut: number } {
     const record = this.getRecord(sessionId);
-    const { matches, remaining } = this.readBuffer(record.networkBuffer, pageId, clear, match);
-    record.networkBuffer = remaining;
-    return matches;
+    const { entries, dropped } = this.readBuffer(record.networkBuffer, pageId, clear, match);
+    const filteredOut = record.networkFilteredOut;
+    // Same reasoning and same outcome-based test as the drop counter above,
+    // reset together with it: readBuffer has already applied the clear to
+    // record.networkBuffer.entries by the time this runs, so an empty result
+    // here means the same "genuine whole-buffer clear" that reset dropped.
+    if (clear && pageId === undefined && record.networkBuffer.entries.length === 0) record.networkFilteredOut = 0;
+    return { entries, dropped, filteredOut };
+  }
+
+  /** Sets, replaces or (passing undefined) removes a session's network capture filter. */
+  setNetworkCaptureFilter(sessionId: string, criteria: NetworkMatchCriteria | undefined): void {
+    const record = this.getRecord(sessionId);
+    record.networkCaptureFilter = criteria;
+  }
+
+  /** The capture filter currently in effect for a session's network ring, or undefined if it captures everything. */
+  getNetworkCaptureFilter(sessionId: string): NetworkMatchCriteria | undefined {
+    return this.getRecord(sessionId).networkCaptureFilter;
   }
 
   /** Buffered dialogs the page raised, and what each one was answered with. */
@@ -747,11 +838,9 @@ export class SessionStore {
     pageId?: string,
     clear = false,
     match?: (entry: DialogEntry) => boolean
-  ): DialogEntry[] {
+  ): { entries: DialogEntry[]; dropped: number } {
     const record = this.getRecord(sessionId);
-    const { matches, remaining } = this.readBuffer(record.dialogBuffer, pageId, clear, match);
-    record.dialogBuffer = remaining;
-    return matches;
+    return this.readBuffer(record.dialogBuffer, pageId, clear, match);
   }
 
   /** Buffered uncaught exceptions and unhandled rejections. */
@@ -760,11 +849,9 @@ export class SessionStore {
     pageId?: string,
     clear = false,
     match?: (entry: PageErrorEntry) => boolean
-  ): PageErrorEntry[] {
+  ): { entries: PageErrorEntry[]; dropped: number } {
     const record = this.getRecord(sessionId);
-    const { matches, remaining } = this.readBuffer(record.pageErrorBuffer, pageId, clear, match);
-    record.pageErrorBuffer = remaining;
-    return matches;
+    return this.readBuffer(record.pageErrorBuffer, pageId, clear, match);
   }
 
   /**

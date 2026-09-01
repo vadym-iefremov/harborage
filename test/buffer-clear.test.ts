@@ -59,11 +59,11 @@ test('a filtered read with clear removes only the entries it returned', async ()
   const drained = sessions.getConsoleMessages(sessionId, undefined, true, (e: ConsoleEntry) =>
     e.text.includes('drain me')
   );
-  assert.deepEqual(drained.map(e => e.text), ['drain me']);
+  assert.deepEqual(drained.entries.map(e => e.text), ['drain me']);
 
   const left = sessions.getConsoleMessages(sessionId);
   assert.deepEqual(
-    left.map(e => e.text),
+    left.entries.map(e => e.text),
     ['keep me', 'keep me too'],
     'entries the filter did not match must survive a filtered clear'
   );
@@ -83,8 +83,8 @@ test('clearing one tab leaves another tab\'s buffer intact', async () => {
 
   const firstLeft = sessions.getConsoleMessages(sessionId, first);
   const secondLeft = sessions.getConsoleMessages(sessionId, second);
-  assert.deepEqual(firstLeft, []);
-  assert.deepEqual(secondLeft.map(e => e.text), ['second tab message']);
+  assert.deepEqual(firstLeft.entries, []);
+  assert.deepEqual(secondLeft.entries.map(e => e.text), ['second tab message']);
 
   await handlers.release_session({ sessionId });
 });
@@ -106,24 +106,24 @@ test('the same guarantee holds for network, dialog and page-error buffers', asyn
   await sleep(400);
 
   const drainedDialogs = sessions.getDialogs(sessionId, undefined, true, e => e.message === 'dialog one');
-  assert.deepEqual(drainedDialogs.map(d => d.message), ['dialog one']);
-  assert.deepEqual(sessions.getDialogs(sessionId).map(d => d.message), ['dialog two']);
+  assert.deepEqual(drainedDialogs.entries.map(d => d.message), ['dialog one']);
+  assert.deepEqual(sessions.getDialogs(sessionId).entries.map(d => d.message), ['dialog two']);
 
   const drainedErrors = sessions.getPageErrors(sessionId, undefined, true, e => e.message === 'error one');
-  assert.deepEqual(drainedErrors.map(e => e.message), ['error one']);
-  assert.deepEqual(sessions.getPageErrors(sessionId).map(e => e.message), ['error two']);
+  assert.deepEqual(drainedErrors.entries.map(e => e.message), ['error one']);
+  assert.deepEqual(sessions.getPageErrors(sessionId).entries.map(e => e.message), ['error two']);
 
-  const before = sessions.getNetworkEntries(sessionId).length;
+  const before = sessions.getNetworkEntries(sessionId).entries.length;
   assert.ok(before > 0, 'expected some buffered network activity to filter');
   const drainedNetwork = sessions.getNetworkEntries(sessionId, undefined, true, e => e.url.includes('one'));
-  assert.ok(drainedNetwork.length > 0);
+  assert.ok(drainedNetwork.entries.length > 0);
   const remaining = sessions.getNetworkEntries(sessionId);
   assert.equal(
-    remaining.length,
-    before - drainedNetwork.length,
+    remaining.entries.length,
+    before - drainedNetwork.entries.length,
     'a filtered network clear must remove exactly what it returned, no more'
   );
-  assert.ok(!remaining.some(e => e.url.includes('one')));
+  assert.ok(!remaining.entries.some(e => e.url.includes('one')));
 
   await handlers.release_session({ sessionId });
 });

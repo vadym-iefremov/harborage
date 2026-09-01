@@ -65,6 +65,7 @@ const expectedToolNames = [
   'set_cookies',
   'set_geolocation',
   'set_locale',
+  'set_network_capture_filter',
   'set_network_conditions',
   'set_offline',
   'set_storage',
@@ -107,9 +108,9 @@ test('every tool definition is complete', () => {
   }
 });
 
-test('the tool surface is exactly the 58 tools listed here', () => {
+test('the tool surface is exactly the 59 tools listed here', () => {
   assert.deepEqual([...toolNames].sort(), expectedToolNames);
-  assert.equal(toolNames.length, 58);
+  assert.equal(toolNames.length, 59);
   assert.equal(new Set(toolNames).size, toolNames.length, 'duplicate tool name in toolDefs');
 });
 
