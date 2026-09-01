@@ -220,10 +220,12 @@ declare const document: {
   // pressing the browser's select-all, which the browser scopes for you.
   createRange(): PageRange;
 };
-/** The handful of Range members selectElementContents touches. */
+/** The handful of Range members selectElementContents and the write fence touch. */
 interface PageRange {
   startContainer: unknown;
   endContainer: unknown;
+  /** True when the range covers nothing, which is a caret rather than a selection. */
+  collapsed: boolean;
   selectNodeContents(node: unknown): void;
 }
 declare const window: {
@@ -1185,8 +1187,24 @@ async function selectorActionFailure(
  * satisfy it: the no-selector clear has only a handle to the focused element,
  * and the selector paths have a locator, and both need the same protection.
  */
+/**
+ * What the fence checks at dispatch time.
+ *
+ *   'none'      no document-selection check at all. A form control keeps its
+ *               selection in selectionStart and selectionEnd, and while one
+ *               has focus document.getSelection() reports a range that is not
+ *               inside it, so this check would refuse every write. Measured.
+ *   'inside'    the selection must still be inside the target. Used when the
+ *               placed range was legitimately collapsed, which is what
+ *               selecting the contents of an EMPTY element gives.
+ *   'covering'  the selection must still be inside the target AND still cover
+ *               something. See installWriteFence for why the second half is
+ *               not pedantry.
+ */
+type WriteFenceMode = 'none' | 'inside' | 'covering';
+
 interface FenceTarget {
-  evaluate(fn: (el: PageElement, guardSelection: boolean) => boolean, arg: boolean): Promise<boolean>;
+  evaluate(fn: (el: PageElement, mode: string) => boolean, arg: string): Promise<boolean>;
 }
 
 /**
@@ -1207,7 +1225,7 @@ interface ClearableField extends FenceTarget {
   // Both shapes of Playwright's own overloaded evaluate: the fence passes an
   // argument, the readback does not. Declared here rather than widened on
   // FenceTarget so nothing else in this file loses the argument's type.
-  evaluate(fn: (el: PageElement, guardSelection: boolean) => boolean, arg: boolean): Promise<boolean>;
+  evaluate(fn: (el: PageElement, mode: string) => boolean, arg: string): Promise<boolean>;
   evaluate(fn: (el: PageElement) => string): Promise<string>;
 }
 
@@ -1239,7 +1257,7 @@ interface FenceElement extends PageElement {
  * A capture listener on `document` runs before anything else in the page (only
  * a window-level capture listener could precede it) and answers the question
  * the previous round trip could not answer atomically: is the selection STILL
- * inside the target at the moment the event is dispatched? A page that moves
+ * where it was put at the moment the event is dispatched? A page that moves
  * the selection on `selectionchange` fires after the evaluate that placed and
  * verified the Range has already returned, so verifying in one round trip and
  * writing in the next is a real window however small it is. Checking inside
@@ -1247,6 +1265,18 @@ interface FenceElement extends PageElement {
  * moved, the event is cancelled and stopped dead before any handler, the
  * editor's included, can act on it. `beforeinput` is cancelable, so the check
  * covers the insert as well as a key.
+ *
+ * "Still where it was put" has two halves, and the second was learned the hard
+ * way. Asking only whether the selection is still INSIDE the target misses the
+ * page that collapses it to a caret inside that same element, and a write into
+ * a caret is an insert rather than a replacement: it leaves the old contents
+ * alone and puts the new value beside them. Measured on a fixture that
+ * collapses the selection on selectionchange, "ORIGINALCONTENT" filled with
+ * "NEW" became "NEWORIGINALCONTENT" while the guard reported nothing wrong. So
+ * 'covering' additionally requires the range to still cover something.
+ * 'inside' is for the one case where a collapsed range is honest, an element
+ * that was empty to begin with, which selectElementContents reports separately
+ * for exactly this reason.
  *
  * `beforeinput` is guarded but not stopped from bubbling, because a
  * text-change notification reaching the application is legitimate: the caller
@@ -1269,9 +1299,9 @@ interface FenceElement extends PageElement {
  * pressed, which after this change is `type`'s own characters and whatever
  * `press_key` is told to press, and never a Delete.
  */
-async function installWriteFence(target: FenceTarget, guardSelection: boolean): Promise<boolean> {
+async function installWriteFence(target: FenceTarget, mode: WriteFenceMode): Promise<boolean> {
   return target
-    .evaluate((raw: PageElement, guard: boolean) => {
+    .evaluate((raw: PageElement, fenceMode: string) => {
       const el = raw as unknown as FenceElement;
       const controller = new AbortController();
       const state: { blocked: boolean; controller?: { abort(): void } } = { blocked: false, controller };
@@ -1285,13 +1315,16 @@ async function installWriteFence(target: FenceTarget, guardSelection: boolean): 
       // `__name(...)` call that does not exist in the page. This exact block
       // was written the readable way first and failed with "__name is not
       // defined" on every call.
-      if (guard) {
+      if (fenceMode !== 'none') {
+        const mustCover = fenceMode === 'covering';
         document.addEventListener(
           'keydown',
           function (event: PageEvent) {
             const selection = window.getSelection();
             const range = selection && selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
-            if (range !== null && el.contains(range.startContainer) && el.contains(range.endContainer)) return;
+            const inside =
+              range !== null && el.contains(range.startContainer) && el.contains(range.endContainer);
+            if (inside && !(mustCover && range.collapsed === true)) return;
             state.blocked = true;
             event.preventDefault();
             event.stopImmediatePropagation();
@@ -1303,7 +1336,9 @@ async function installWriteFence(target: FenceTarget, guardSelection: boolean): 
           function (event: PageEvent) {
             const selection = window.getSelection();
             const range = selection && selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
-            if (range !== null && el.contains(range.startContainer) && el.contains(range.endContainer)) return;
+            const inside =
+              range !== null && el.contains(range.startContainer) && el.contains(range.endContainer);
+            if (inside && !(mustCover && range.collapsed === true)) return;
             state.blocked = true;
             event.preventDefault();
             event.stopImmediatePropagation();
@@ -1326,7 +1361,7 @@ async function installWriteFence(target: FenceTarget, guardSelection: boolean): 
         { signal: controller.signal }
       );
       return true;
-    }, guardSelection)
+    }, mode)
     .catch(() => false);
 }
 
@@ -1363,20 +1398,31 @@ async function removeWriteFence(page: Page): Promise<boolean> {
  * deciding and acting. What follows it is an insertText over that Range and no
  * key at all: see setFieldValue for why the Delete that used to follow is gone
  * and what was measured on the live CodeMirror 6 in Acres to retire it.
+ *
+ * Reports which of three things happened, not just whether it worked, because
+ * the write fence has to know what the selection looked like when it was
+ * placed to tell a page's interference from an ordinary empty element:
+ *
+ *   'covering'  the range took and covers something
+ *   'empty'     the range took and is collapsed, because the element has no
+ *               contents to cover, which is the legitimate case of filling an
+ *               empty contenteditable
+ *   null        the range did not take
  */
-async function selectElementContents(locator: Locator): Promise<boolean> {
+async function selectElementContents(locator: Locator): Promise<'covering' | 'empty' | null> {
   return locator.evaluate((el: PageElement) => {
     const selection = window.getSelection();
-    if (!selection) return false;
+    if (!selection) return null;
     const range = document.createRange();
     range.selectNodeContents(el as unknown as never);
     selection.removeAllRanges();
     selection.addRange(range);
     // Verified rather than assumed: an editor can normalize or reject a
-    // selection it does not like, and a deletion aimed at a selection that
-    // never took would fall through to whatever was selected before.
+    // selection it does not like, and a write aimed at a selection that never
+    // took would fall through to whatever was selected before.
     const now = selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
-    return now !== null && el.contains(now.startContainer) && el.contains(now.endContainer);
+    if (now === null || !el.contains(now.startContainer) || !el.contains(now.endContainer)) return null;
+    return now.collapsed === true ? 'empty' : 'covering';
   });
 }
 
@@ -1414,7 +1460,7 @@ async function clearOrFillFormControl(
   value: string,
   toolName: string
 ): Promise<void> {
-  const fenced = await installWriteFence(field, false);
+  const fenced = await installWriteFence(field, 'none');
   try {
     if (!fenced) {
       throw new Error(
@@ -1426,11 +1472,19 @@ async function clearOrFillFormControl(
       await field.fill(value);
       return;
     }
-    await field.selectText();
-    await page.keyboard.insertText('');
+    // selectText is allowed to fail rather than to throw. A control it cannot
+    // select is a control insertText cannot empty either, and both end at the
+    // same fallback. Measured succeeding on a text input, a number input, an
+    // email input, a date input and a textarea, so this guards the types not
+    // enumerated rather than a known failure.
+    const selected = await field
+      .selectText()
+      .then(() => true)
+      .catch(() => false);
+    if (selected) await page.keyboard.insertText('');
     const after = await field.evaluate((el: PageElement) => el.value ?? '').catch(() => '');
     if (after !== '') {
-      // Reached only by a picker-style input, which Playwright empties by
+      // Reached by a picker-style input, which Playwright empties by
       // assignment rather than by a key. See the note above.
       await field.fill('');
     }
@@ -1552,7 +1606,7 @@ async function setFieldValue(page: Page, locator: Locator, value: string): Promi
   }
 
   const selected = await selectElementContents(locator);
-  if (!selected) {
+  if (selected === null) {
     throw new Error(
       'fill could not place a selection over the target element\'s own contents, so it stopped rather than writing ' +
         'over whatever else happened to be selected. The element may be inside a widget that manages its own ' +
@@ -1563,7 +1617,20 @@ async function setFieldValue(page: Page, locator: Locator, value: string): Promi
   // One insertText over the live selection, and no key. See this function's
   // note for what was measured on the live CodeMirror 6 in Acres, for both an
   // empty and a non-empty value.
-  const fenced = await installWriteFence(locator as unknown as FenceTarget, true);
+  //
+  // The fence is told what the selection looked like when it was placed. A
+  // range that covered something and is a bare caret by the time the write is
+  // dispatched has been moved by the page, and writing into a caret is an
+  // INSERT rather than a replacement: it leaves the old contents in place and
+  // puts the new value beside them. Measured on a page that collapses the
+  // selection on selectionchange: "ORIGINALCONTENT" filled with "NEW" became
+  // "NEWORIGINALCONTENT". An element that was empty to begin with is collapsed
+  // for an honest reason and is passed 'inside' instead, so filling an empty
+  // contenteditable still works.
+  const fenced = await installWriteFence(
+    locator as unknown as FenceTarget,
+    selected === 'covering' ? 'covering' : 'inside'
+  );
   let blocked = false;
   try {
     if (!fenced) {
@@ -1652,13 +1719,31 @@ async function replaceKeylesslyOrFallBack(
   // Re-select first: the failed insert has already changed the contents, so
   // the Range placed before it no longer covers them.
   const reselected = await selectElementContents(locator);
-  if (!reselected) return;
+  if (reselected === null) return;
 
-  const fenced = await installWriteFence(locator as unknown as FenceTarget, true);
-  if (!fenced) return;
+  // Two fences rather than one, and the reason is the guard doing its job. The
+  // Delete gets 'covering', because a selection collapsed out from under it
+  // would make it eat a single character somewhere unintended. The insertText
+  // that follows CANNOT get 'covering': the Delete has just emptied the
+  // selection, so the range is legitimately a caret by then, and one fence
+  // spanning both cancelled the insert and left the element empty.
+  const deleteFenced = await installWriteFence(
+    locator as unknown as FenceTarget,
+    reselected === 'covering' ? 'covering' : 'inside'
+  );
+  if (!deleteFenced) return;
+  let deleteBlocked = false;
   try {
     await page.keyboard.press('Delete');
-    if (value.length > 0) await page.keyboard.insertText(value);
+  } finally {
+    deleteBlocked = await removeWriteFence(page);
+  }
+  if (deleteBlocked || value.length === 0) return;
+
+  const fenced = await installWriteFence(locator as unknown as FenceTarget, 'inside');
+  if (!fenced) return;
+  try {
+    await page.keyboard.insertText(value);
   } finally {
     await removeWriteFence(page);
   }

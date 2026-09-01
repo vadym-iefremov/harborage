@@ -103,6 +103,50 @@ const PAGES: Record<string, string> = {
 <script>${LOGGER}</script>
 </body></html>`,
 
+  // A page that collapses the selection to a caret inside the SAME element the
+  // moment one is placed. The guard used to accept this, because the selection
+  // was still inside the target, and a write into a caret is an insert rather
+  // than a replacement.
+  '/thief-collapse': `<!doctype html><html><body>
+<div id="field" contenteditable="true">ORIGINALCONTENT</div>
+<script>
+  ${LOGGER}
+  document.addEventListener('selectionchange', function () {
+    var sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0) return;
+    var r = sel.getRangeAt(0);
+    var f = document.getElementById('field');
+    if (r.collapsed) return;
+    if (!f.contains(r.startContainer) || !f.contains(r.endContainer)) return;
+    sel.collapse(f.firstChild, 0);
+  });
+</script>
+</body></html>`,
+
+  // The same window, with the selection dropped entirely instead.
+  '/thief-drop': `<!doctype html><html><body>
+<div id="field" contenteditable="true">ORIGINALCONTENT</div>
+<script>
+  ${LOGGER}
+  document.addEventListener('selectionchange', function () {
+    var sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0) return;
+    var r = sel.getRangeAt(0);
+    var f = document.getElementById('field');
+    if (r.collapsed) return;
+    if (!f.contains(r.startContainer) || !f.contains(r.endContainer)) return;
+    sel.removeAllRanges();
+  });
+</script>
+</body></html>`,
+
+  // An empty editing host, which is the legitimate reason for a collapsed
+  // range and must NOT be refused by the guard above.
+  '/empty-host': `<!doctype html><html><body>
+<div id="field" contenteditable="true"></div>
+<script>${LOGGER}</script>
+</body></html>`,
+
   // A page that REFUSES an insert: it cancels beforeinput and applies its own
   // edit, inserting at the range start without removing the range contents, so
   // a replacement becomes a prepend. No shipping editor was found doing this,
@@ -445,5 +489,57 @@ test('a multi-line value into a plain contenteditable presses no key', async () 
   const landed = await ev<string>(s, 'document.getElementById("l2").innerHTML');
   assert.match(landed, /first/);
   assert.match(landed, /second/);
+  await sessions.releaseSession(s);
+});
+
+test('a page that collapses the selection gets a refusal, not a mangled field', async () => {
+  // The guard used to accept this: the selection was still inside the target,
+  // so nothing looked wrong, and the write went into a caret and INSERTED.
+  // Measured before the fix: "ORIGINALCONTENT" filled with "NEW" read back as
+  // "NEWORIGINALCONTENT", and the retry made it "NEWEWORIGINALCONTENT".
+  const s = await open('/thief-collapse');
+  await resetKeys(s);
+  let threw = '';
+  try {
+    await handlers.fill({ sessionId: s, selector: '#field', value: 'NEW' });
+  } catch (err) {
+    threw = err instanceof Error ? err.message : String(err);
+  }
+  assert.match(threw, /moved it somewhere else|cancelled/, `expected a refusal, got ${JSON.stringify(threw)}`);
+  assert.equal(
+    await ev(s, 'document.getElementById("field").textContent'),
+    'ORIGINALCONTENT',
+    'the field was written into despite the refusal'
+  );
+  assertNoKeyDispatched(await keys(s), 'a fill the fence refused');
+  await sessions.releaseSession(s);
+});
+
+test('a page that drops the selection gets a refusal, not a mangled field', async () => {
+  const s = await open('/thief-drop');
+  await resetKeys(s);
+  let threw = '';
+  try {
+    await handlers.fill({ sessionId: s, selector: '#field', value: 'NEW' });
+  } catch (err) {
+    threw = err instanceof Error ? err.message : String(err);
+  }
+  assert.match(threw, /moved it somewhere else|cancelled/, `expected a refusal, got ${JSON.stringify(threw)}`);
+  assert.equal(await ev(s, 'document.getElementById("field").textContent'), 'ORIGINALCONTENT');
+  assertNoKeyDispatched(await keys(s), 'a fill the fence refused');
+  await sessions.releaseSession(s);
+});
+
+test('an EMPTY editing host is still writable, collapsed range and all', async () => {
+  // The other half of the guard above. Selecting the contents of an empty
+  // element gives a collapsed range for an honest reason, and refusing that
+  // would make filling an empty contenteditable impossible.
+  const s = await open('/empty-host');
+  await resetKeys(s);
+  const result = payload(await handlers.fill({ sessionId: s, selector: '#field', value: 'WRITTEN' }));
+  assert.equal(result.value, 'WRITTEN');
+  assert.equal(result.matched, true);
+  assert.equal(await ev(s, 'document.getElementById("field").textContent'), 'WRITTEN');
+  assertNoKeyDispatched(await keys(s), 'fill into an empty editing host');
   await sessions.releaseSession(s);
 });
