@@ -413,6 +413,22 @@ const probeAttribute = 'data-harborage-probe';
  */
 const closedHostProbeAttribute = 'data-harborage-closed-host-probe';
 
+/**
+ * Takes harborage's own probe attribute back off the page.
+ *
+ * Never throws: this runs on failure paths where the caller's original error
+ * is what needs to surface, and where the frame may already be gone, in which
+ * case there is no DOM left to tidy and nothing a caller could do about it.
+ */
+async function removeClosedHostProbes(root: Page | Frame): Promise<void> {
+  await root
+    .evaluate((attribute: string) => {
+      const tagged = document.querySelectorAll(`[${attribute}]`);
+      for (let index = 0; index < tagged.length; index += 1) tagged[index].removeAttribute(attribute);
+    }, closedHostProbeAttribute)
+    .catch(() => {});
+}
+
 /** How many matches a diagnostics tool reports per selector unless told otherwise. */
 const defaultMatchLimit = 20;
 
@@ -2602,10 +2618,25 @@ export const inspectTools = defineTools({
           }
         ) as Promise<StyleProbe[]>;
 
-      const probes =
-        args.states !== undefined && args.states.length > 0
-          ? await withForcedStates(target.page, root, matches, args.states, read)
-          : await read();
+      // `read` is what STAMPS closedHostProbeAttribute onto the page's own
+      // elements, so from here until it is removed again this call has left a
+      // mark on a DOM it does not own. Every exit from that window has to take
+      // it back off, including the ones that throw: the removal used to sit on
+      // the happy path with no guard at all, so a failure in the closed-root
+      // CDP walk (or a partial tag before `read` itself threw) left harborage's
+      // attribute behind. The next call self-heals it, which is exactly why it
+      // was easy to miss, and "we put the page back as we found it" is not a
+      // promise that should hold only when nothing goes wrong.
+      let probes: StyleProbe[];
+      try {
+        probes =
+          args.states !== undefined && args.states.length > 0
+            ? await withForcedStates(target.page, root, matches, args.states, read)
+            : await read();
+      } catch (err) {
+        await removeClosedHostProbes(root);
+        throw err;
+      }
 
       // Asked of the frame the elements are in, not of the page: a same-origin
       // iframe can carry its own color-scheme.
@@ -2627,16 +2658,15 @@ export const inspectTools = defineTools({
       // something that could be hiding a closed root. On a page with none it
       // is skipped entirely, so the ordinary call pays nothing for this.
       const taggedAnyPossibleClosedHost = probes.some(probe => probe.ambiguousShadowHosts > 0);
-      const closedRootChains = taggedAnyPossibleClosedHost
-        ? await chainsCrossingAClosedShadowRoot(target.page)
-        : new Set<number>();
-      if (taggedAnyPossibleClosedHost) {
-        await root
-          .evaluate((attribute: string) => {
-            const tagged = document.querySelectorAll(`[${attribute}]`);
-            for (let index = 0; index < tagged.length; index += 1) tagged[index].removeAttribute(attribute);
-          }, closedHostProbeAttribute)
-          .catch(() => {});
+      let closedRootChains: Set<number> | null;
+      try {
+        closedRootChains = taggedAnyPossibleClosedHost
+          ? await chainsCrossingAClosedShadowRoot(target.page)
+          : new Set<number>();
+      } finally {
+        // In a finally rather than after the walk, since the walk is the one
+        // step here that talks to CDP and can fail on its own.
+        if (taggedAnyPossibleClosedHost) await removeClosedHostProbes(root);
       }
 
       // forced-colors replaces every author colour with a system palette
