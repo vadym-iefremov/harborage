@@ -193,9 +193,27 @@ test('a tab the page opens itself still gets exactly one pageId, with its own bu
   const popup = tabs.find(t => t.url.includes('name=popup'));
   assert.ok(popup, `expected the popup among ${JSON.stringify(tabs.map(t => t.url))}`);
 
-  const console = await handlers.read_console({ sessionId, pageId: popup.pageId });
-  const messages = (console.structuredContent as { messages: { text: string }[] }).messages;
-  assert.ok(messages.some(m => m.text.includes('hello from popup')));
+  // Polled rather than read once. The tab being adopted and the popup's own
+  // script having run are two different events, and nothing orders them: the
+  // page listener fires as soon as the target exists, which can be before the
+  // document has executed a line. Reading the buffer at that moment found it
+  // empty and failed roughly one run in three, which is the flakiest possible
+  // way to assert a real property. The property under test is that the popup
+  // gets its OWN buffer, so waiting for the message is the honest wait.
+  const messageDeadline = Date.now() + 5000;
+  let messages: { text: string }[] = [];
+  let sawPopupMessage = false;
+  while (Date.now() < messageDeadline) {
+    const console = await handlers.read_console({ sessionId, pageId: popup.pageId });
+    messages = (console.structuredContent as { messages: { text: string }[] }).messages;
+    sawPopupMessage = messages.some(m => m.text.includes('hello from popup'));
+    if (sawPopupMessage) break;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  assert.ok(
+    sawPopupMessage,
+    `expected the popup's own console buffer to carry its message, saw ${JSON.stringify(messages.map(m => m.text))}`
+  );
 
   await handlers.release_session({ sessionId });
 });
