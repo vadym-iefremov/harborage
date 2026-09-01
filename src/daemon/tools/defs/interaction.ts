@@ -681,6 +681,119 @@ async function assertSingleWriteTarget(tool: string, locator: Locator, selector:
   );
 }
 
+
+/**
+ * Where a typed character actually went, when that is not simply the element
+ * the caller named.
+ *
+ * `type` with a selector does NOT refuse a target that cannot hold text, and
+ * that stays deliberate: routing real keystrokes at a focused widget is a
+ * legitimate thing to want, and press_key alone does not cover it. But
+ * `pressSequentially` focuses the locator and then types at whatever holds the
+ * caret, so when the focus attempt does not land, the characters go somewhere
+ * else entirely and the result still names the caller's selector. Reproduced:
+ * `type` aimed at a plain <div> while an input was focused put the text in the
+ * INPUT, and reported the div's unchanged textContent with a note saying the
+ * write "may have landed somewhere other than the intended element". It knew.
+ * It just did not say where. Refusing is the wrong fix; saying so is.
+ */
+interface WriteDestination {
+  /** Where the characters really went, named the way a refusal names an element. */
+  note: string;
+  /**
+   * Whether reading the NAMED element back still says anything about the
+   * typing. True when the caret sat inside it, because its textContent covers
+   * the child's text. False when the caret was elsewhere: "matched" would then
+   * be an answer about an element nothing was typed into, so it is not claimed.
+   */
+  readbackStillCovers: boolean;
+}
+
+/**
+ * Compares where the caret really ended up against the element the caller
+ * named, after the focus attempt and before a single character is sent.
+ *
+ * Null when the two agree, which is the ordinary case and adds nothing to the
+ * result. The caret holder comes from the same shadow-piercing descent
+ * readFieldValue uses, so an editor inside an open shadow root is named as
+ * itself rather than as the host document.activeElement retargets to.
+ */
+function typingDestination(inspection: TextTargetInspection): WriteDestination | null {
+  if (inspection.caretIsTarget) return null;
+  if (inspection.caret === null) {
+    return {
+      note:
+        'Nothing had focus when the characters were sent, so they went to the document rather than into the element ' +
+        'this selector names: focusing it did not move the caret there. "value" below is that element read back, ' +
+        'which nothing was typed into, so "matched" is not claimed either way. Name a field, or click into one first.',
+      readbackStillCovers: false
+    };
+  }
+  if (inspection.caretInsideTarget) {
+    return {
+      note:
+        `The caret sat on ${describeTextTarget(inspection.caret)} INSIDE the element this selector names, so that is ` +
+        'the element the characters actually went into. "value" below is the named element read back, and its ' +
+        'textContent does cover that child, so the comparison still means something. Name the inner element directly ' +
+        'if you want a readback of just it.',
+      readbackStillCovers: true
+    };
+  }
+  return {
+    note:
+      'The characters did not go into the element this selector names. Focusing it did not move the caret there, so ' +
+      `they went to ${describeTextTarget(inspection.caret)}, which is neither that element nor anything inside it. ` +
+      '"value" below is the named element read back, which nothing was typed into, so "matched" is not claimed ' +
+      'either way. That is a real result if you meant to drive a widget that keeps focus elsewhere; if you meant to ' +
+      'fill a field, name the field.',
+    readbackStillCovers: false
+  };
+}
+
+/**
+ * Turns Playwright's bare TimeoutError into the guidance the rest of this file
+ * gives, or hands back whatever else was thrown, untouched.
+ *
+ * Playwright WAITS for a selector rather than failing straight away, which is
+ * the right behaviour (an element that appears a moment later is still one to
+ * act on) and the reason a selector matching nothing costs the whole timeout.
+ * What was wrong is what the caller got for that wait: a raw TimeoutError,
+ * naming neither the tool nor the way out. The wait is kept; only the
+ * explanation is added, with the match count re-read afterwards so the message
+ * can tell "never appeared" apart from "appeared but could not be acted on".
+ * Those are different problems with different fixes, and a caller cannot tell
+ * them apart from a timeout alone.
+ *
+ * Shared by fill, type and hover so there is one wording to keep honest.
+ */
+async function selectorActionFailure(
+  tool: string,
+  page: Page,
+  selector: string,
+  err: unknown,
+  waitedMs: number,
+  nothingHappened: string
+): Promise<unknown> {
+  if (!(err instanceof Error) || err.name !== 'TimeoutError') return err;
+  const stillMatching = await page.locator(selector).count().catch(() => undefined);
+  if (stillMatching === 0) {
+    return new Error(
+      `${tool} found nothing to act on: ${JSON.stringify(selector)} matched no elements when the call started and ` +
+        `still matches none ${waitedMs}ms later, which is why this took as long as it did. Playwright waits for a ` +
+        'selector to appear rather than failing immediately, so the whole timeout is spent on an element that never ' +
+        'arrives. Check the selector with find, or wait for the element with wait_for first when it is meant to ' +
+        `appear in response to something else. ${nothingHappened}`
+    );
+  }
+  return new Error(
+    `${tool} could not act on ${JSON.stringify(selector)} within ${waitedMs}ms, even though it matches ` +
+      `${stillMatching ?? 'some'} element(s) now. Playwright acts only on an element that is visible, stable, ` +
+      'enabled and actually reachable, so this is a real finding about the page rather than a selector typo: the ' +
+      'element is hidden, still animating, zero-sized, disabled, or covered by something else. element_box reports ' +
+      `its geometry and whether anything is on top of it, and computed_style reports the visibility. ${nothingHappened}`
+  );
+}
+
 /**
  * Replaces a field's contents for real.
  *
@@ -770,27 +883,46 @@ function writeResult(
   actual: string,
   matched: boolean,
   expectation: string,
-  readbackWarning?: string | null
+  readbackWarning?: string | null,
+  destination?: WriteDestination | null
 ): ToolResult {
+  const destinationNote = destination?.note;
+  const withDestination = (rest: string): string => (destinationNote ? `${destinationNote} ${rest}` : rest);
+
   // A rich editor's own textContent readback cannot be trusted, so "matched"
   // is not computed at all here: reporting true would be the false pass this
   // whole file exists to avoid, and reporting false would look like a real
   // write failure when the write may well have landed exactly as asked.
   // Neither claim is honest, so neither is made.
   if (readbackWarning) {
-    return text({ ...base, value: actual, readbackReliable: false, note: readbackWarning });
+    return text({ ...base, value: actual, readbackReliable: false, note: withDestination(readbackWarning) });
+  }
+  // The same refusal to claim, for the other reason a readback can fail to
+  // answer the question: the characters went somewhere the named element does
+  // not cover, so comparing that element against the request says nothing
+  // about whether the typing worked. The readback itself is still honest, so
+  // readbackReliable stays true; it is "matched" that has no answer.
+  if (destination && !destination.readbackStillCovers) {
+    return text({ ...base, value: actual, readbackReliable: true, note: destination.note });
   }
   if (matched) {
-    return text({ ...base, value: actual, matched: true, readbackReliable: true });
+    return text({
+      ...base,
+      value: actual,
+      matched: true,
+      readbackReliable: true,
+      ...(destinationNote ? { note: destinationNote } : {})
+    });
   }
   return text({
     ...base,
     value: actual,
     matched: false,
     readbackReliable: true,
-    note:
+    note: withDestination(
       `The field does not contain what was expected. ${expectation} It now contains ${JSON.stringify(actual)}. ` +
-      'The page may have rewritten, truncated or reformatted the input, or the write may have landed somewhere other than the intended element. Trust "value", not the request.'
+        'The page may have rewritten, truncated or reformatted the input, or the write may have landed somewhere other than the intended element. Trust "value", not the request.'
+    )
   });
 }
 
@@ -1887,7 +2019,7 @@ export const interactionTools = defineTools({
     serializesInput: true,
     description:
       'Set a field\'s contents in a session\'s tab, REPLACING whatever was there. Use type instead to append, or to fire per-character events. For an input, textarea or select this is Playwright\'s atomic fill. For a contenteditable, including rich editors like CodeMirror and Monaco, it focuses the element and replaces through real keyboard events (select-all, delete, insert), because those editors keep their own document model and treat a plain insertion as an insert at their cursor, appending onto the existing value instead of replacing it. ' +
-      'The selector has to name an element that can actually HOLD typed text, and that is checked before anything is written: a text-holding input, a textarea, or something inside a contenteditable. Naming anything else is refused with a message saying what it is. That includes the case that looks like it works: a plain wrapper <div> around a focused field passed the old guard and the write went into the CHILD, reported as a clean success against the wrapper\'s textContent, so a value landed in an element the caller never named. It also refuses a <select> (use select_option), a checkbox, radio, button or file input (click, or file_upload), and a selector matching several elements, because choosing one of them would change the page rather than merely look at the wrong thing. ' +
+      'The selector has to name an element that can actually HOLD typed text, and that is checked before anything is written: a text-holding input, a textarea, or something inside a contenteditable. Naming anything else is refused with a message saying what it is. That includes the case that looks like it works: a plain wrapper <div> around a focused field passed the old guard and the write went into the CHILD, reported as a clean success against the wrapper\'s textContent, so a value landed in an element the caller never named. It also refuses a <select> (use select_option), a checkbox, radio, button or file input (click, or file_upload), and a selector matching several elements, because choosing one of them would change the page rather than merely look at the wrong thing. A selector matching nothing is waited for the way Playwright waits for any selector, and then explained: the error says whether it still matches nothing (check it with find, or wait_for the element first) or matches something that could not be written into, rather than surfacing as a bare timeout. ' +
       'Reads the field back afterwards, but that readback is DOM textContent, and for a real Monaco or CodeMirror instance textContent is not the whole story: both virtualize their lines, so it only covers what is currently rendered and reads back truncated for anything long, and an element with an EditContext attached keeps its real text there rather than in the DOM at all. The markers that detect one of these are looked for at the named element, above it (out through any open shadow root), and up to two levels below it, because a selector aimed at a wrapper one hop above the editor root is the ordinary case: Acres\'s own CodeMirror sits behind [data-testid="expression-editor-input"], whose only child is the .cm-editor root. When the target looks like one of these the result says so plainly: "readbackReliable" is false, "matched" is not claimed either way, and "note" names the editor\'s own API to read the value through instead (e.g. monaco.editor.getModels()[0].getValue()). For an ordinary field the result carries "value" (what the field really contains now), "matched", "readbackReliable": true, and a "note" explaining the difference when value and the request disagree.',
     inputSchema: z.object({
       sessionId,
@@ -1905,16 +2037,32 @@ export const interactionTools = defineTools({
       // a readback, naming neither the tool that refused nor the way out,
       // while hover had proper guidance for the identical situation.
       await assertSingleWriteTarget('fill', locator, args.selector);
-      await setFieldValue(target.page, locator, args.value);
-      const actual = await readFieldValue(target.page, locator);
-      const readbackWarning = await readReadbackReliability(target.page, locator);
-      return writeResult(
-        { pageId: target.pageId, selector: args.selector, requested: args.value },
-        actual,
-        actual === args.value,
-        `Expected exactly ${JSON.stringify(args.value)}.`,
-        readbackWarning
-      );
+      // Everything that touches the selector runs inside this, so a selector
+      // that matches nothing produces the same explanation hover gives rather
+      // than a raw Playwright TimeoutError thrown out of a readback. Our own
+      // refusals are ordinary Errors and pass straight through untouched.
+      const startedAt = Date.now();
+      try {
+        await setFieldValue(target.page, locator, args.value);
+        const actual = await readFieldValue(target.page, locator);
+        const readbackWarning = await readReadbackReliability(target.page, locator);
+        return writeResult(
+          { pageId: target.pageId, selector: args.selector, requested: args.value },
+          actual,
+          actual === args.value,
+          `Expected exactly ${JSON.stringify(args.value)}.`,
+          readbackWarning
+        );
+      } catch (err) {
+        throw await selectorActionFailure(
+          'fill',
+          target.page,
+          args.selector,
+          err,
+          Date.now() - startedAt,
+          'Nothing was written.'
+        );
+      }
     }
   }),
 
@@ -1922,7 +2070,8 @@ export const interactionTools = defineTools({
     serializesInput: true,
     description:
       'Type text into a session\'s tab character by character, with real key events, so per-character handlers, debounces, autocomplete and anything firing on a keystroke actually run. fill sets the value in one step and cannot exercise those. Does NOT clear the field first: it inserts at the caret, which is what a user typing does, so calling it twice types twice. Pass clear: true to replace the contents instead. Where the caret sits is the browser\'s call, not this tool\'s: focusing an input puts it after the existing text, focusing a contenteditable puts it before, so click the spot first if the insertion point matters. ' +
-      'With no selector the keystrokes go to whatever currently has focus, and this refuses unless that element can actually HOLD typed text: a text-holding input, a textarea, or something inside a contenteditable. Taking focus is not the same as taking text, and the difference is destructive. React Flow gives canvas nodes tabindex="0" so they can handle arrow keys, so an ordinary click on an Acres node leaves focus on a plain <div>; with clear: true the select-all and Delete that follow reach the canvas, which reads Delete as "remove the selected node". Measured on the real app: three nodes before the call, two after, reported as matched: false. Without clear, reading that same <div> back returns its rendered text and inline CSS rather than any field\'s value. The caret holder is resolved through open shadow roots, because document.activeElement reports the shadow HOST rather than the element that really has focus. A selector matching several elements is refused too, since choosing one of them would change the page. ' +
+      'With no selector the keystrokes go to whatever currently has focus, and this refuses unless that element can actually HOLD typed text: a text-holding input, a textarea, or something inside a contenteditable. Taking focus is not the same as taking text, and the difference is destructive. React Flow gives canvas nodes tabindex="0" so they can handle arrow keys, so an ordinary click on an Acres node leaves focus on a plain <div>; with clear: true the select-all and Delete that follow reach the canvas, which reads Delete as "remove the selected node". Measured on the real app: three nodes before the call, two after, reported as matched: false. Without clear, reading that same <div> back returns its rendered text and inline CSS rather than any field\'s value. The caret holder is resolved through open shadow roots, because document.activeElement reports the shadow HOST rather than the element that really has focus. A selector matching several elements is refused too, since choosing one of them would change the page, and one matching NOTHING is waited for and then explained rather than surfacing as a bare Playwright timeout. ' +
+      'With a selector, this does NOT refuse a target that cannot hold text, because routing real keystrokes at a focused widget is a legitimate thing to want and press_key alone does not cover it. What it will not do is let you believe the characters went where you aimed them. Playwright focuses the located element and then types at whatever holds the caret, so when the focus attempt does not land the text goes somewhere else entirely: the caret holder is compared against the named element before a single character is sent, and when they differ the result names the element that really received the text and does not claim "matched", since reading back an element nothing was typed into answers a different question. ' +
       'Reads the field back afterwards, but that readback is DOM textContent, and for a real Monaco or CodeMirror instance textContent is not the whole story: both virtualize their lines, so it only covers what is currently rendered and reads back truncated for anything long, and an element with an EditContext attached keeps its real text there rather than in the DOM at all. Those markers are looked for at the target, above it (out through any open shadow root) and up to two levels below it, so a selector aimed at a wrapper just above the editor root is still recognised. When the target looks like one of these the result says so plainly: "readbackReliable" is false, "matched" is not claimed either way, and "note" names the editor\'s own API to read the value through instead. For an ordinary field the result carries "value" (what the field really contains now), "previousValue" (what it held BEFORE the call, clear included, so a clear cannot throw something away invisibly), "matched", "readbackReliable": true, and a "note" when what landed is not the typed text inserted into what was already there.',
     inputSchema: z.object({
       sessionId,
@@ -2014,61 +2163,92 @@ export const interactionTools = defineTools({
         }
       }
 
-      // Read BEFORE the clear, so "previousValue" means what its name says.
-      // Read after, it was always the emptied field on a clearing call, which
-      // also made "matched" a comparison against nothing: it could not fail,
-      // whatever the clear had just destroyed.
-      const before = await readFieldValue(target.page, locator);
+      // Everything from here on touches the selector, so a selector matching
+      // nothing gets the same explanation hover gives instead of a raw
+      // Playwright TimeoutError. Our own refusals are ordinary Errors and pass
+      // through untouched, and the no-selector path has no selector to explain.
+      const startedAt = Date.now();
+      try {
+        // Read BEFORE the clear, so "previousValue" means what its name says.
+        // Read after, it was always the emptied field on a clearing call, which
+        // also made "matched" a comparison against nothing: it could not fail,
+        // whatever the clear had just destroyed.
+        const before = await readFieldValue(target.page, locator);
 
-      if (args.clear) {
-        if (locator) {
-          await setFieldValue(target.page, locator, '');
-        } else {
-          // Focus was already confirmed real above, so this is exactly the
-          // select-all-and-delete fill's own contenteditable path performs,
-          // just against whatever currently holds the caret rather than a
-          // locator, because there is no selector to build one from.
-          await target.page.keyboard.press(selectAllChord);
-          await target.page.keyboard.press('Delete');
+        if (args.clear) {
+          if (locator) {
+            await setFieldValue(target.page, locator, '');
+          } else {
+            // Focus was already confirmed real above, so this is exactly the
+            // select-all-and-delete fill's own contenteditable path performs,
+            // just against whatever currently holds the caret rather than a
+            // locator, because there is no selector to build one from.
+            await target.page.keyboard.press(selectAllChord);
+            await target.page.keyboard.press('Delete');
+          }
         }
-      }
 
-      // What the field holds going into the typing: the same as `before` on an
-      // ordinary call, and the emptied field on a clearing one. The insertion
-      // check runs against this, while the caller is shown `before`.
-      const baseline = args.clear ? await readFieldValue(target.page, locator) : before;
-      const options = args.delay !== undefined ? { delay: args.delay } : undefined;
-      if (locator) {
-        await locator.pressSequentially(args.text, options);
-      } else {
-        await target.page.keyboard.type(args.text, options);
-      }
-      const actual = await readFieldValue(target.page, locator);
-      const readbackWarning = await readReadbackReliability(target.page, locator);
+        // What the field holds going into the typing: the same as `before` on an
+        // ordinary call, and the emptied field on a clearing one. The insertion
+        // check runs against this, while the caller is shown `before`.
+        const baseline = args.clear ? await readFieldValue(target.page, locator) : before;
+        const options = args.delay !== undefined ? { delay: args.delay } : undefined;
 
-      // Typing inserts rather than replaces, so what to expect afterwards is
-      // the previous contents with the typed text somewhere inside them, not
-      // the typed text alone.
-      return writeResult(
-        {
-          pageId: target.pageId,
-          ...(args.selector !== undefined ? { selector: args.selector } : {}),
-          typed: args.text,
-          cleared: args.clear ?? false,
-          previousValue: before
-        },
-        actual,
-        isInsertionOf(baseline, args.text, actual),
-        `Expected ${JSON.stringify(args.text)} inserted into ${JSON.stringify(baseline)}.`,
-        readbackWarning
-      );
+        // The focus attempt is made HERE rather than left to
+        // pressSequentially, which does it silently, so that where the caret
+        // really ended up can be compared against the element the caller named
+        // before a single character is sent. pressSequentially focuses again
+        // straight after, which is a no-op on an element that already has
+        // focus and lands in the same place on one that does not.
+        let destination: WriteDestination | null = null;
+        if (locator) {
+          await locator.focus().catch(() => undefined);
+          destination = typingDestination(await inspectTarget(target.page, locator));
+        }
+
+        if (locator) {
+          await locator.pressSequentially(args.text, options);
+        } else {
+          await target.page.keyboard.type(args.text, options);
+        }
+        const actual = await readFieldValue(target.page, locator);
+        const readbackWarning = await readReadbackReliability(target.page, locator);
+
+        // Typing inserts rather than replaces, so what to expect afterwards is
+        // the previous contents with the typed text somewhere inside them, not
+        // the typed text alone.
+        return writeResult(
+          {
+            pageId: target.pageId,
+            ...(args.selector !== undefined ? { selector: args.selector } : {}),
+            typed: args.text,
+            cleared: args.clear ?? false,
+            previousValue: before
+          },
+          actual,
+          isInsertionOf(baseline, args.text, actual),
+          `Expected ${JSON.stringify(args.text)} inserted into ${JSON.stringify(baseline)}.`,
+          readbackWarning,
+          destination
+        );
+      } catch (err) {
+        if (args.selector === undefined) throw err;
+        throw await selectorActionFailure(
+          'type',
+          target.page,
+          args.selector,
+          err,
+          Date.now() - startedAt,
+          'Nothing was typed.'
+        );
+      }
     }
   }),
 
   press_key: defineTool({
     serializesInput: true,
     description:
-      'Press a key in a session\'s tab, dispatching a real trusted key event. This is the only way to establish keyboard modality, which matters for accessibility checks: Chrome will not set :focus-visible on a button a script focused with .focus(), so a focus ring measured after a programmatic focus reports absent even when it is perfectly fine for a real user pressing Tab. Key syntax is Playwright\'s: Tab, Enter, Escape, ArrowDown, Backspace, a, Control+A, Shift+Tab. With no selector the key goes to whatever currently has focus. Returns where focus ended up and whether that element matches :focus-visible.',
+      'Press a key in a session\'s tab, dispatching a real trusted key event. This is the only way to establish keyboard modality, which matters for accessibility checks: Chrome will not set :focus-visible on a button a script focused with .focus(), so a focus ring measured after a programmatic focus reports absent even when it is perfectly fine for a real user pressing Tab. Key syntax is Playwright\'s: Tab, Enter, Escape, ArrowDown, Backspace, a, Control+A, Shift+Tab. With no selector the key goes to whatever currently has focus. Returns where focus ended up and whether that element matches :focus-visible, descending into open shadow roots to get there: document.activeElement retargets to the shadow HOST, so a key press into an editor inside a shadow root would otherwise be reported as focus sitting on a plain host div with no text. "inShadowRoot" says when the walk had to cross a boundary to find it.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -2108,14 +2288,29 @@ export const interactionTools = defineTools({
         }
       }
 
+      // The REPORT descends into open shadow roots, for the same reason
+      // readFieldValue does: document.activeElement retargets to the shadow
+      // HOST, so a key press into an editor inside a shadow root used to be
+      // reported as focus sitting on a plain host <div> with empty text, while
+      // the element that actually received the keystroke was invisible to the
+      // result. The note's firing logic below is untouched and does not depend
+      // on this: it reads the chord, not the page.
       const activeElement = await target.page.evaluate(() => {
-        const el = document.activeElement;
+        let el = document.activeElement as TreeWalkElement | null;
+        let crossed = false;
+        for (let hops = 0; hops < 32; hops += 1) {
+          const inner = el?.shadowRoot?.activeElement;
+          if (!inner) break;
+          el = inner;
+          crossed = true;
+        }
         if (!el) return null;
         return {
           tag: el.tagName.toLowerCase(),
           id: el.id,
           text: (el.textContent ?? '').trim().slice(0, 80),
-          focusVisible: el.matches(':focus-visible')
+          focusVisible: el.matches(':focus-visible'),
+          inShadowRoot: crossed
         };
       });
 
@@ -2164,32 +2359,19 @@ export const interactionTools = defineTools({
       // nothing costs the whole timeout. What was wrong is what the caller got
       // for that wait: a raw Playwright TimeoutError, with none of the
       // guidance the rest of this file gives for the same class of mistake.
-      // The wait is kept; only the explanation is added, with the match count
-      // re-read afterwards so the message can tell "never appeared" apart from
-      // "appeared but could not be acted on".
+      // The wait is kept; only the explanation is added. fill and type route
+      // through the same helper, so there is one wording to keep honest.
       const startedAt = Date.now();
       try {
         await target.page.hover(args.selector, position ? { position } : undefined);
       } catch (err) {
-        if (!(err instanceof Error) || err.name !== 'TimeoutError') throw err;
-        const waitedMs = Date.now() - startedAt;
-        const stillMatching = await target.page.locator(args.selector).count().catch(() => undefined);
-        if (stillMatching === 0) {
-          throw new Error(
-            `hover found nothing to hover: ${JSON.stringify(args.selector)} matched no elements when the call ` +
-              `started and still matches none ${waitedMs}ms later, which is why this took as long as it did. ` +
-              'Playwright waits for a selector to appear rather than failing immediately, so the whole timeout is ' +
-              'spent on an element that never arrives. Check the selector with find, or wait for the element with ' +
-              'wait_for first when it is meant to appear in response to something else. The pointer was not moved.'
-          );
-        }
-        throw new Error(
-          `hover could not act on ${JSON.stringify(args.selector)} within ${waitedMs}ms, even though it matches ` +
-            `${stillMatching ?? 'some'} element(s) now. Playwright hovers only an element that is visible, stable ` +
-            'and actually hit-testable at the point it aims at, so this is a real finding about the page rather ' +
-            'than a selector typo: the element is hidden, still animating, zero-sized, or covered by something ' +
-            'else. element_box reports its geometry and whether anything is on top of it, and computed_style ' +
-            'reports the visibility. The pointer was not moved.'
+        throw await selectorActionFailure(
+          'hover',
+          target.page,
+          args.selector,
+          err,
+          Date.now() - startedAt,
+          'The pointer was not moved.'
         );
       }
       // Read back against .first(), not the bare locator. locator.evaluate IS

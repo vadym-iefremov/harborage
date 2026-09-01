@@ -70,6 +70,12 @@ const FIXTURE_HTML = `<!doctype html>
   <div id="shadowHost"></div>
   <div class="cm-editor"><div id="richShadowHost"></div></div>
 
+  <input id="thief" value="">
+  <div id="notfocusable">plain div text</div>
+  <div id="mover" tabindex="0">moves focus away on focus</div>
+  <div id="innerWrap"><div id="innerField" contenteditable="true">wrapped</div></div>
+  <div id="keyHost"></div>
+
 <script>
   // A miniature React Flow: nodes take focus on click because they carry a
   // tabindex, and Delete removes the focused one. This is the behaviour that
@@ -92,6 +98,18 @@ const FIXTURE_HTML = `<!doctype html>
   var richHost = document.getElementById('richShadowHost');
   var richRoot = richHost.attachShadow({ mode: 'open' });
   richRoot.innerHTML = '<div id="richShadowEditable" contenteditable="true">richshadowseed</div>';
+
+  // Sends focus somewhere else the instant it receives it. A real page does
+  // this with a wrapper that delegates focus to the control it contains, and
+  // it is the case where a type call's selector and its destination part ways
+  // without either being obviously wrong.
+  document.getElementById('mover').addEventListener('focus', function () {
+    document.getElementById('thief').focus();
+  });
+
+  var keyHost = document.getElementById('keyHost');
+  var keyRoot = keyHost.attachShadow({ mode: 'open' });
+  keyRoot.innerHTML = '<input id="shadowKeyInput" value="">';
 </script>
 </body>
 </html>`;
@@ -582,6 +600,203 @@ test('the modifier note still fires for the case it was built for, and still poi
   // And the exemption still holds: the portable form gets no note.
   const portable = payload(await handlers.press_key({ sessionId, key: 'ControlOrMeta+a' }));
   assert.equal(portable.note, undefined);
+
+  await sessions.releaseSession(sessionId);
+});
+
+// ---------------------------------------------------------------------------
+// Residual 1: type with a selector was honest about the readback and silent
+// about the destination
+// ---------------------------------------------------------------------------
+
+test('type names the element that really received the characters when the selector did not get them', async () => {
+  const sessionId = await freshSession();
+
+  // The trap: pressSequentially focuses the located element and then types at
+  // whatever holds the caret. A plain div cannot take focus, so the caret
+  // never moves and the characters go to the input that already had it, while
+  // the result names the caller's selector and says only that the write "may"
+  // have landed elsewhere.
+  await evaluate(sessionId, "document.getElementById('thief').focus()");
+  const body = payload(await handlers.type({ sessionId, selector: '#notfocusable', text: 'STOLEN' }));
+
+  // The oracle is the element that actually received the characters.
+  assert.equal(
+    await evaluate<string>(sessionId, "document.getElementById('thief').value"),
+    'STOLEN',
+    'the characters really do land in the focused input; that was never in doubt'
+  );
+  assert.equal(
+    await evaluate<string>(sessionId, "document.getElementById('notfocusable').textContent"),
+    'plain div text',
+    'and the named element really did not receive them'
+  );
+
+  assert.equal(body.matched, undefined, 'reading back an element nothing was typed into cannot answer "matched"');
+  assert.match(String(body.note), /did not go into the element this selector names/i);
+  assert.match(String(body.note), /id="thief"/, 'the message has to name where the characters actually went');
+  assert.equal(body.readbackReliable, true, 'the readback itself is honest; it is the destination that differed');
+
+  await sessions.releaseSession(sessionId);
+});
+
+test('type names the destination when the target hands focus straight to something else', async () => {
+  const sessionId = await freshSession();
+
+  const body = payload(await handlers.type({ sessionId, selector: '#mover', text: 'MOVED' }));
+
+  assert.equal(await evaluate<string>(sessionId, "document.getElementById('thief').value"), 'MOVED');
+  assert.equal(body.matched, undefined);
+  assert.match(String(body.note), /id="thief"/);
+
+  await sessions.releaseSession(sessionId);
+});
+
+test('type says so when the caret sat inside the named element, and still claims matched', async () => {
+  const sessionId = await freshSession();
+
+  // Different from the case above: the characters went to a child of the named
+  // element, whose textContent covers them, so the comparison still means
+  // something and "matched" keeps its answer.
+  await evaluate(sessionId, "document.getElementById('innerField').focus()");
+  const body = payload(await handlers.type({ sessionId, selector: '#innerWrap', text: '!' }));
+
+  assert.equal(await evaluate<string>(sessionId, "document.getElementById('innerField').textContent"), '!wrapped');
+  assert.equal(body.matched, true, 'the named element does cover the child, so the comparison is still meaningful');
+  assert.match(String(body.note), /INSIDE the element this selector names/i);
+  assert.match(String(body.note), /id="innerField"/);
+
+  await sessions.releaseSession(sessionId);
+});
+
+test('an ordinary type into the element it names carries no destination note at all', async () => {
+  const sessionId = await freshSession();
+
+  const body = payload(await handlers.type({ sessionId, selector: '#plainInput', text: '!', clear: true }));
+
+  assert.equal(body.matched, true);
+  assert.equal(body.note, undefined, 'the note is for a destination that differs, not for every call');
+  assert.equal(await evaluate<string>(sessionId, "document.getElementById('plainInput').value"), '!');
+
+  await sessions.releaseSession(sessionId);
+});
+
+test('a no-selector type into a focused shadow editor is not reported as a misdirected write', async () => {
+  const sessionId = await freshSession();
+
+  // The destination check must not misread the shadow case as a mismatch:
+  // the caret holder IS the target there, once activeElement is descended.
+  await evaluate(
+    sessionId,
+    "document.getElementById('shadowHost').shadowRoot.getElementById('shadowCmContent').focus()"
+  );
+  const body = payload(await handlers.type({ sessionId, text: 'Q' }));
+
+  assert.doesNotMatch(
+    String(body.note ?? ''),
+    /did not go into the element this selector names/i,
+    'there is no selector here, and the caret is exactly where the keystrokes went'
+  );
+  assert.equal(
+    await evaluate<string>(sessionId, "document.getElementById('shadowHost').shadowRoot.getElementById('shadowCmContent').textContent"),
+    'Qshadowcm'
+  );
+
+  await sessions.releaseSession(sessionId);
+});
+
+// ---------------------------------------------------------------------------
+// Residual 2: fill and type hung the full timeout on a zero-match selector
+// ---------------------------------------------------------------------------
+
+test('fill and type explain a zero-match selector instead of throwing a bare timeout', async () => {
+  const sessionId = await freshSession();
+  // The wait is Playwright's and is kept, for the reason hover keeps it: an
+  // element that appears a moment later is still one to write into. Shortened
+  // here so the suite does not spend a minute proving a message.
+  sessions.resolve(sessionId).page.setDefaultTimeout(1200);
+
+  const filled = await rejection(() => handlers.fill({ sessionId, selector: '#not-a-thing', value: 'x' }));
+  assert.match(String(filled), /^fill found nothing to act on/);
+  assert.match(String(filled), /matched no elements/i);
+  assert.match(String(filled), /find|wait_for/);
+  assert.match(String(filled), /nothing was written/i);
+  assert.doesNotMatch(String(filled), /^TimeoutError/);
+
+  const typed = await rejection(() => handlers.type({ sessionId, selector: '#not-a-thing', text: 'x' }));
+  assert.match(String(typed), /^type found nothing to act on/);
+  assert.match(String(typed), /nothing was typed/i);
+
+  await sessions.releaseSession(sessionId);
+});
+
+test('fill on an element that exists but cannot be written into says which problem it is', async () => {
+  const sessionId = await freshSession();
+  sessions.resolve(sessionId).page.setDefaultTimeout(1200);
+
+  await evaluate(sessionId, "document.getElementById('plainInput').style.display = 'none'");
+  const message = await rejection(() => handlers.fill({ sessionId, selector: '#plainInput', value: 'x' }));
+
+  assert.match(String(message), /could not act on/i);
+  assert.match(String(message), /element_box|computed_style/);
+  assert.doesNotMatch(String(message), /matched no elements/i);
+
+  await sessions.releaseSession(sessionId);
+});
+
+test('a refusal this file raises itself is never rewritten as a selector timeout', async () => {
+  const sessionId = await freshSession();
+  sessions.resolve(sessionId).page.setDefaultTimeout(1200);
+
+  // The catch that turns a TimeoutError into guidance must not swallow the
+  // guards: a checkbox is present, visible and instantly resolvable, and the
+  // reason fill refuses it has nothing to do with waiting.
+  const message = await rejection(() => handlers.fill({ sessionId, selector: '#box', value: 'x' }));
+  assert.match(String(message), /cannot receive text/i);
+  assert.doesNotMatch(String(message), /found nothing to act on/);
+
+  await sessions.releaseSession(sessionId);
+});
+
+// ---------------------------------------------------------------------------
+// Residual 3: press_key reported the shadow host, not the focused element
+// ---------------------------------------------------------------------------
+
+test('press_key reports the element inside a shadow root that actually received the key', async () => {
+  const sessionId = await freshSession();
+
+  await evaluate(sessionId, "document.getElementById('keyHost').shadowRoot.getElementById('shadowKeyInput').focus()");
+  assert.equal(
+    await evaluate<string>(sessionId, 'document.activeElement.id'),
+    'keyHost',
+    'the page itself reports the host: that retargeting is the whole defect'
+  );
+
+  const body = payload(await handlers.press_key({ sessionId, key: 'a' }));
+  const active = body.activeElement as Record<string, unknown>;
+
+  // The oracle: the element that really took the character.
+  assert.equal(
+    await evaluate<string>(sessionId, "document.getElementById('keyHost').shadowRoot.getElementById('shadowKeyInput').value"),
+    'a'
+  );
+  assert.equal(active.id, 'shadowKeyInput', 'the report has to name the element that received the key');
+  assert.equal(active.tag, 'input');
+  assert.equal(active.inShadowRoot, true);
+
+  await sessions.releaseSession(sessionId);
+});
+
+test('press_key in the light DOM reports exactly what it always did', async () => {
+  const sessionId = await freshSession();
+
+  await evaluate(sessionId, "document.getElementById('plainInput').focus()");
+  const body = payload(await handlers.press_key({ sessionId, key: 'a' }));
+  const active = body.activeElement as Record<string, unknown>;
+
+  assert.equal(active.id, 'plainInput');
+  assert.equal(active.tag, 'input');
+  assert.equal(active.inShadowRoot, false, 'no boundary was crossed, and the report should say so');
 
   await sessions.releaseSession(sessionId);
 });
