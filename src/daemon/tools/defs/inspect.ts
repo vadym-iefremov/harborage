@@ -285,6 +285,12 @@ interface ProbeElement {
   // "http://www.w3.org/2000/svg" for an SVG element. SVG text takes its
   // colour from `fill`, not from `color`, so the walk has to know.
   namespaceURI: string | null;
+  // Present on an SVG graphics element. The matrix maps user units onto screen
+  // pixels, which is the only way to turn a stroke-width in user units into a
+  // width in pixels: a viewBox can scale it by any factor.
+  getScreenCTM?(): { a: number; b: number; c: number; d: number } | null;
+  querySelectorAll(selector: string): ArrayLike<ProbeElement>;
+  checkVisibility?(options?: Record<string, boolean>): boolean;
   // Present (possibly null, for a closed root) on any element that is
   // itself a shadow host. Absent entirely on one that is not.
   shadowRoot?: { elementFromPoint?(x: number, y: number): ProbeElement | null } | null;
@@ -757,8 +763,41 @@ interface GlyphPaintProbe {
   fill: string;
   stroke: string;
   strokeWidth: string;
+  strokeDasharray: string;
+  /**
+   * The stroke's width in DEVICE pixels: the CSS width times the viewBox scale
+   * from getScreenCTM times devicePixelRatio. The CSS number on its own says
+   * nothing about how much ink lands on screen, because a viewBox can scale it
+   * by any factor.
+   */
+  deviceStrokeWidth: number;
   backgroundImage: string;
 }
+
+/**
+ * Stroke widths, in DEVICE pixels, where the answer changes character.
+ *
+ * Both boundaries are measured and both have a physical reason, which is why
+ * they are these numbers and not round ones. A stroke of device width w covers
+ * at most w of any pixel row it crosses.
+ *
+ * Below 1, the nominal colour is PROVABLY unattainable: maximum coverage is
+ * below a whole pixel, so every pixel is a blend with the backdrop. Measured on
+ * four geometries at 0.5 device px, the darkest pixel on screen is 3.2:1 to
+ * 4.0:1 against a nominal 21:1, and by 0.1 device px nothing is darker than
+ * 206 while the tool was quoting 21:1 and a clean AA and AAA pass.
+ *
+ * Between 1 and 2 it depends on the geometry and on where the edges fall
+ * relative to the pixel grid, and the tool cannot know which without
+ * rasterising. Measured at 1.0 device px: a diagonal reaches 21.00, a circle
+ * and a Lucide-shaped path reach 20.50, an axis-aligned rectangle only 10.53.
+ *
+ * At 2 and above every geometry measured reaches the nominal colour exactly,
+ * which follows from a band of width 2 always containing a whole pixel in at
+ * least one axis whatever its subpixel offset.
+ */
+const strokeAttainsNominalDevicePx = 2;
+const strokePaintsWholePixelDevicePx = 1;
 
 /**
  * Which CSS property actually paints the glyphs, and whether a single
@@ -804,6 +843,40 @@ function resolveGlyphPaint(
       const stroke = probe.stroke.trim();
       const strokeWidth = parseFloat(probe.strokeWidth);
       if (stroke !== '' && stroke !== 'none' && !stroke.startsWith('url(') && !(strokeWidth === 0)) {
+        // A dasharray whose every dash length is zero draws nothing at all:
+        // stroke-dasharray: "0 100" is all gap. The stroke colour is still a
+        // perfectly good colour and used to be reported as a confident 21:1.
+        const dashes = probe.strokeDasharray
+          .split(/[\s,]+/)
+          .filter(part => part.length > 0)
+          .map(part => parseFloat(part));
+        const dashesDrawNothing =
+          dashes.length > 0 && dashes.every((value, index) => index % 2 === 1 || value === 0);
+        if (dashesDrawNothing) {
+          return {
+            property: 'stroke',
+            value: stroke,
+            code: 'svgNoFill',
+            unavailable:
+              `This is an SVG element with fill: none and stroke-dasharray: ${probe.strokeDasharray}, whose dash ` +
+              'lengths are all zero, so the stroke draws no ink at all. There is nothing painted to have contrast ' +
+              'against, and the stroke colour describes nothing on screen.'
+          };
+        }
+        if (probe.deviceStrokeWidth > 0 && probe.deviceStrokeWidth < strokePaintsWholePixelDevicePx) {
+          return {
+            property: 'stroke',
+            value: stroke,
+            code: 'strokeThinnerThanAPixel',
+            unavailable:
+              `This stroke is ${probe.deviceStrokeWidth.toFixed(2)} device pixels wide, so it cannot fill a single ` +
+              'pixel and NO pixel on screen ever reaches the stroke colour: every one of them is a blend with ' +
+              'whatever is behind it. Measured on four geometries at 0.5 device pixels, the darkest pixel painted ' +
+              'is between 3.2:1 and 4.0:1 where the stroke colour itself is 21:1, so quoting the stroke colour ' +
+              'here overstates the real contrast by up to 19 ratio points. Screenshot the region and read the ' +
+              'darkest ink pixel, or measure it at a larger rendered size.'
+          };
+        }
         return { property: 'stroke', value: stroke, unavailable: null, code: '' };
       }
       return {
@@ -1134,20 +1207,38 @@ function hasAttribute(node: CdpNode, name: string): boolean {
   return false;
 }
 
-/** True if any node tagged with `attribute` anywhere in the pierced tree hosts a CLOSED shadow root. */
-function anyTaggedNodeHostsAClosedRoot(node: CdpNode, attribute: string): boolean {
+/** Reads one attribute's value off a CDP node, or null if it does not carry it. */
+function attributeValue(node: CdpNode, name: string): string | null {
+  const attributes = node.attributes ?? [];
+  for (let index = 0; index < attributes.length; index += 2) {
+    if (attributes[index] === name) return attributes[index + 1] ?? '';
+  }
+  return null;
+}
+
+/**
+ * Which MEASURED ELEMENTS have a closed shadow root on their ancestor chain.
+ *
+ * Per element, not per call. The tag each candidate ancestor carries is the
+ * list of element indices whose walk passed through it, so a closed root found
+ * here condemns exactly those elements and no others. It used to be one
+ * boolean for the whole call, which was correct for a single-element query and
+ * quietly catastrophic for `all: true`: one closed root anywhere in a match set
+ * refused every element in it, and `all: true` is the mode an agent uses to
+ * audit a whole page.
+ */
+function elementsWithAClosedRootOnTheirChain(node: CdpNode, attribute: string, into: Set<number>): void {
   const roots = node.shadowRoots ?? [];
-  for (const root of roots) {
-    if (root.shadowRootType === 'closed' && hasAttribute(node, attribute)) return true;
+  const tag = attributeValue(node, attribute);
+  if (tag !== null && roots.some(root => root.shadowRootType === 'closed')) {
+    for (const part of tag.split(' ')) {
+      const index = Number(part);
+      if (Number.isInteger(index)) into.add(index);
+    }
   }
-  for (const root of roots) {
-    if (anyTaggedNodeHostsAClosedRoot(root, attribute)) return true;
-  }
-  for (const child of node.children ?? []) {
-    if (anyTaggedNodeHostsAClosedRoot(child, attribute)) return true;
-  }
-  if (node.contentDocument && anyTaggedNodeHostsAClosedRoot(node.contentDocument, attribute)) return true;
-  return false;
+  for (const root of roots) elementsWithAClosedRootOnTheirChain(root, attribute, into);
+  for (const child of node.children ?? []) elementsWithAClosedRootOnTheirChain(child, attribute, into);
+  if (node.contentDocument) elementsWithAClosedRootOnTheirChain(node.contentDocument, attribute, into);
 }
 
 /**
@@ -1166,7 +1257,7 @@ function anyTaggedNodeHostsAClosedRoot(node: CdpNode, attribute: string): boolea
  * every mainstream component library emits) never reach. Refusing to quote a
  * number is the whole point of this machinery, and it costs one CDP call.
  */
-async function anyChainCrossesAClosedShadowRoot(page: Page): Promise<boolean | null> {
+async function chainsCrossingAClosedShadowRoot(page: Page): Promise<Set<number> | null> {
   const cdpSession = await page.context().newCDPSession(page).catch(() => null);
   if (cdpSession === null) return null;
   try {
@@ -1174,7 +1265,9 @@ async function anyChainCrossesAClosedShadowRoot(page: Page): Promise<boolean | n
     const tree = (await cdpSession.send('DOM.getDocument', { depth: -1, pierce: true })) as unknown as {
       root: CdpNode;
     };
-    return anyTaggedNodeHostsAClosedRoot(tree.root, closedHostProbeAttribute);
+    const found = new Set<number>();
+    elementsWithAClosedRootOnTheirChain(tree.root, closedHostProbeAttribute, found);
+    return found;
   } catch {
     return null;
   } finally {
@@ -1844,7 +1937,26 @@ export const inspectTools = defineTools({
       'instead. effective.textPaint names the property the foreground actually came from whenever it is not plain ' +
       'color. ' +
       'An SVG shape with fill: none is not unpainted, it is OUTLINED, so its stroke (times stroke-opacity) is ' +
-      'what gets composited. Every Lucide, Feather and Heroicons outline icon is exactly that shape. ' +
+      'what gets composited. Every Lucide, Feather and Heroicons outline icon is exactly that shape. How much ink ' +
+      'that stroke actually lays down decides whether the number means anything, so the DEVICE width is computed ' +
+      '(stroke-width in user units, times the viewBox scale from getScreenCTM, times devicePixelRatio) and drives ' +
+      'the answer. Under 1 device pixel the stroke cannot fill a single pixel, so no pixel on screen ever reaches ' +
+      'the stroke colour and the ratio is refused with strokeThinnerThanAPixel: measured on four geometries at 0.5 ' +
+      'device pixels the darkest pixel painted is 3.2:1 to 4.0:1 where the stroke colour is 21:1. Between 1 and 2 ' +
+      'it depends on the shape and on where its edges fall on the pixel grid, measured at 1.0 as 21.00 for a ' +
+      'diagonal, 20.50 for a circle and a Lucide path, and 10.53 for an axis-aligned rectangle, so it is answered ' +
+      'and marked contrast.borderline. At 2 and above every geometry measured reaches the colour exactly. ' +
+      'effective.textPaint carries strokeWidth and deviceStrokeWidth whenever the stroke is what was measured, ' +
+      'because stroke-width is not in the default property set and without it a 21:1 off a hairline is ' +
+      'indistinguishable from a 21:1 off a solid stroke. A stroke whose stroke-dasharray dashes are all zero long ' +
+      'draws nothing and is refused too. ' +
+      'An SVG CONTAINER (<svg>, <g>, <pattern> and the rest) paints no geometry of its own, so its inherited fill ' +
+      'and stroke are measured only when the shapes inside it all use the same ones, which is the ordinary icon ' +
+      'case. Where they disagree, or where there are no shapes at all, the container is refused with ' +
+      'svgNoOwnGeometry rather than quoting a colour nothing on screen is painted with. ' +
+      'An element that paints nothing, through visibility hidden or collapse or a display: none anywhere above it, ' +
+      'is refused with notPainted: an audit should skip it, not record a pass or a failure against the colours it ' +
+      'would have used. ' +
       'background-color on a non-root SVG element is NOT composited, because Chromium never paints it: only the ' +
       '<svg> root paints a background. Compositing it was reporting black text inside <g style="background-color: ' +
       'black"> on a white page as 1:1 where it is really painted at 21:1. ' +
@@ -1857,15 +1969,20 @@ export const inspectTools = defineTools({
       'backdropFilter (a filter recolours what is behind before the text goes on top); mixBlendMode (not composited ' +
       'with source-over at all); foreignPainter (something painting the same pixels that is not an ancestor, so it ' +
       'cannot be in the stack: a positioned sibling, an overlay, a <canvas> under a transparent container); ' +
-      'closedShadowRoot and closedShadowRootUnchecked; forcedColors (the browser replaced every author colour with ' +
+      'closedShadowRoot and closedShadowRootUnchecked, decided per ELEMENT rather than per call, so one closed root ' +
+      'in an all: true match set refuses only the elements whose own chain crosses it; forcedColors (the browser ' +
+      'replaced every author colour with ' +
       'a system palette, so the cascade below is not what is on screen); detached (the element is not in the ' +
-      'document); wideGamutOverflow (see below); backgroundClipTextImage, svgPaintServerFill and svgNoFill (the ' +
+      'document); notPainted; strokeThinnerThanAPixel; svgNoOwnGeometry; wideGamutOverflow (see below); ' +
+      'backgroundClipTextImage, svgPaintServerFill and svgNoFill (the ' +
       'glyphs or the shape are painted in many colours, or in none). In every case screenshot the region and ' +
       'compare the worst part against its background. ' +
       'A background image or a backdrop-filter further out than an opaque colour is NOT reported, because it ' +
       'cannot change the pixel behind the glyph. A filter or a blend mode is reported wherever it sits, because ' +
       'both recolour their whole subtree no matter what is painted in between. ' +
-      'contrast.borderline marks a ratio that is within 0.25 of a threshold it is being compared against while the ' +
+      'contrast.borderline marks a ratio that should not be read as a verdict, for either of two measured reasons, ' +
+      'with contrast.borderlineNote saying which. One is a thin stroke, above. The other is a ratio within 0.25 of ' +
+      'a threshold it is being compared against while the ' +
       'glyph is translucent. Chromium\'s text rasteriser applies a gamma to glyph coverage that alpha compositing ' +
       'does not model, worth up to one 8-bit step: a full-block glyph at opacity 0.532 over white paints 118 where ' +
       'the same colour in a <div> paints 119. Close to a line that is enough to decide the verdict, so treat a ' +
@@ -1995,6 +2112,24 @@ export const inspectTools = defineTools({
         stroke: string;
         strokeOpacity: string;
         strokeWidth: string;
+        strokeDasharray: string;
+        /** The stroke width in DEVICE pixels, which is what decides how much ink lands on screen. */
+        deviceStrokeWidth: number;
+        /**
+         * True when the element paints nothing at all: visibility hidden or
+         * collapse, or display none. Not an SVG concern, and it predates the
+         * SVG work: hidden text was reporting a confident 21:1.
+         */
+        notPainted: boolean;
+        /**
+         * For an SVG CONTAINER (<svg>, <g>, and the rest), what its painting
+         * descendants actually use. A container paints no geometry itself, so
+         * its own inherited fill describes nothing unless the shapes inside
+         * agree with it.
+         */
+        svgContainer: boolean;
+        svgDescendantPaints: number;
+        svgDescendantAgrees: boolean;
         /** background-clip, falling back to -webkit-background-clip. "text" moves the background onto the glyphs. */
         backgroundClip: string;
         /** The background image, if any, which is what makes gradient text unanswerable with one ratio. */
@@ -2019,8 +2154,17 @@ export const inspectTools = defineTools({
             arg: { properties: string[]; pseudoElement: string | null; limit: number; shadowProbeAttribute: string }
           ) => {
             const elements = Array.prototype.slice.call(nodes, 0, arg.limit) as ProbeElement[];
+            // Clear any tag a previous call left behind. The indices in it
+            // refer to THAT call's match set, so appending to them would map a
+            // stale index onto an unrelated element here. Cheap, and it makes
+            // the tagging self-healing after a call that died before cleanup.
+            const stale = document.querySelectorAll(`[${arg.shadowProbeAttribute}]`);
+            for (let index = 0; index < stale.length; index += 1) {
+              stale[index].removeAttribute(arg.shadowProbeAttribute);
+            }
             const out: StyleProbe[] = [];
-            for (const element of elements) {
+            for (let elementIndex = 0; elementIndex < elements.length; elementIndex += 1) {
+              const element = elements[elementIndex];
               const own = getComputedStyle(element, arg.pseudoElement);
               const styles: Record<string, string> = {};
               for (const property of arg.properties) styles[property] = own.getPropertyValue(property);
@@ -2111,8 +2255,17 @@ export const inspectTools = defineTools({
                 // Document (node type 9) is where the climb ends.
                 node = parent && parent.nodeType === 11 ? (parent.host ?? null) : null;
               }
+              // The tag carries the INDEX of the element whose walk passed
+              // through this ancestor, appended rather than overwritten,
+              // because one ancestor is commonly on several elements' chains.
+              // A closed root found on it then condemns exactly those elements
+              // and no others, which is what makes the answer per element
+              // instead of per call.
               for (let index = 0; index < ambiguous.length; index += 1) {
-                ambiguous[index].setAttribute(arg.shadowProbeAttribute, '1');
+                const already = ambiguous[index].getAttribute(arg.shadowProbeAttribute);
+                const marks = already === null || already === '' ? [] : already.split(' ');
+                if (marks.indexOf(String(elementIndex)) === -1) marks.push(String(elementIndex));
+                ambiguous[index].setAttribute(arg.shadowProbeAttribute, marks.join(' '));
               }
               layers.reverse();
               if (arg.pseudoElement) {
@@ -2208,6 +2361,59 @@ export const inspectTools = defineTools({
 
               const text = (element.textContent || '').replace(/\s+/g, ' ').trim();
               const isSvg = element.namespaceURI === 'http://www.w3.org/2000/svg';
+
+              // An SVG CONTAINER paints no geometry of its own, so the fill it
+              // inherited describes nothing unless the shapes inside it agree.
+              // Measured: an <svg> with no fill set, wrapping a white-filled
+              // rect, was reporting 21:1 off its initial black. Meanwhile an
+              // icon whose paths simply inherit the <svg>'s stroke is the
+              // ordinary case and has to keep working, so the test is
+              // agreement, not containment.
+              const paintingTags = 'path,rect,circle,ellipse,line,polyline,polygon,text,textPath,tspan,use,image';
+              const svgContainer =
+                isSvg && 'path rect circle ellipse line polyline polygon text textPath tspan use image'
+                  .split(' ')
+                  .indexOf(String(element.tagName).toLowerCase()) === -1;
+              let svgDescendantPaints = 0;
+              let svgDescendantAgrees = true;
+              if (svgContainer) {
+                const shapes = element.querySelectorAll(paintingTags);
+                svgDescendantPaints = shapes.length;
+                for (let shapeIndex = 0; shapeIndex < shapes.length; shapeIndex += 1) {
+                  const shapeStyle = getComputedStyle(shapes[shapeIndex]);
+                  if (
+                    shapeStyle.getPropertyValue('fill') !== own.getPropertyValue('fill') ||
+                    shapeStyle.getPropertyValue('stroke') !== own.getPropertyValue('stroke')
+                  ) {
+                    svgDescendantAgrees = false;
+                    break;
+                  }
+                }
+              }
+
+              // stroke-width is in user units; getScreenCTM maps those onto CSS
+              // pixels, and devicePixelRatio onto device pixels. The scale is
+              // the square root of the determinant, so a non-uniform or rotated
+              // transform still gives one representative number.
+              let deviceStrokeWidth = 0;
+              if (isSvg) {
+                const matrix = element.getScreenCTM ? element.getScreenCTM() : null;
+                const scale = matrix
+                  ? Math.sqrt(Math.abs(matrix.a * matrix.d - matrix.b * matrix.c))
+                  : 1;
+                const userWidth = parseFloat(own.getPropertyValue('stroke-width'));
+                deviceStrokeWidth = Number.isFinite(userWidth) ? userWidth * scale * window.devicePixelRatio : 0;
+              }
+
+              // checkVisibility is the one call that also catches a display:
+              // none ANCESTOR, which the element's own computed display does
+              // not report. visibilityProperty has to be asked for explicitly;
+              // opacityProperty is deliberately left off, because opacity is
+              // already composited properly rather than treated as invisible.
+              const visibility = own.getPropertyValue('visibility');
+              const notPainted = element.checkVisibility
+                ? !element.checkVisibility({ visibilityProperty: true, contentVisibilityAuto: true })
+                : visibility === 'hidden' || visibility === 'collapse' || own.getPropertyValue('display') === 'none';
               // background-clip is the standard property and is what modern
               // Chromium reports; -webkit-background-clip is still what a lot
               // of real stylesheets write, and on an older engine it is the
@@ -2229,6 +2435,12 @@ export const inspectTools = defineTools({
                 stroke: isSvg ? own.getPropertyValue('stroke') : '',
                 strokeOpacity: isSvg ? own.getPropertyValue('stroke-opacity') : '',
                 strokeWidth: isSvg ? own.getPropertyValue('stroke-width') : '',
+                strokeDasharray: isSvg ? own.getPropertyValue('stroke-dasharray') : '',
+                deviceStrokeWidth,
+                notPainted,
+                svgContainer,
+                svgDescendantPaints,
+                svgDescendantAgrees,
                 backgroundClip,
                 backgroundImage: own.getPropertyValue('background-image'),
                 crossedSlot,
@@ -2280,7 +2492,9 @@ export const inspectTools = defineTools({
       // something that could be hiding a closed root. On a page with none it
       // is skipped entirely, so the ordinary call pays nothing for this.
       const taggedAnyPossibleClosedHost = probes.some(probe => probe.ambiguousShadowHosts > 0);
-      const closedRootOnChain = taggedAnyPossibleClosedHost ? await anyChainCrossesAClosedShadowRoot(target.page) : false;
+      const closedRootChains = taggedAnyPossibleClosedHost
+        ? await chainsCrossingAClosedShadowRoot(target.page)
+        : new Set<number>();
       if (taggedAnyPossibleClosedHost) {
         await root
           .evaluate((attribute: string) => {
@@ -2360,6 +2574,34 @@ export const inspectTools = defineTools({
         // refusals below are the same kind of statement and join the list.
         const paintReport: PaintReport = { ranPastTheCeiling: false };
         const blockers = unaccountedFor(probe.layers, paintLayers, probe.foreignPainters);
+        if (probe.notPainted) {
+          blockers.unshift({
+            code: 'notPainted',
+            detail:
+              'This element paints nothing: its used visibility is hidden or collapse, or its display is none. ' +
+              'There is no ink on screen to have contrast against, and the colours below are what it WOULD paint ' +
+              'if it were shown. An audit should skip it rather than record a pass or a failure for it.'
+          });
+        }
+        if (probe.svgContainer && probe.isSvg) {
+          if (probe.svgDescendantPaints === 0) {
+            blockers.unshift({
+              code: 'svgNoOwnGeometry',
+              detail:
+                `<${probe.tagName}> is an SVG container, which paints no geometry of its own, and it holds no shape ` +
+                'or text descendants either. The fill and stroke it inherited are real CSS values but nothing on ' +
+                'screen is painted with them.'
+            });
+          } else if (!probe.svgDescendantAgrees) {
+            blockers.unshift({
+              code: 'svgNoOwnGeometry',
+              detail:
+                `<${probe.tagName}> is an SVG container, which paints no geometry of its own, and the shapes inside ` +
+                'it do not all use the fill and stroke it inherited, so its own paint describes nothing on screen. ' +
+                'Measure the shapes themselves, which is where the colour actually is.'
+            });
+          }
+        }
         if (glyph.unavailable !== null) blockers.unshift({ code: glyph.code, detail: glyph.unavailable });
         if (probe.reachedRoot === false) {
           blockers.unshift({
@@ -2369,7 +2611,7 @@ export const inspectTools = defineTools({
               'measured mid-mutation). There is no real canvas behind it to composite onto.'
           });
         }
-        if (closedRootOnChain === true) {
+        if (closedRootChains !== null && closedRootChains.has(index)) {
           blockers.unshift({
             code: 'closedShadowRoot',
             detail:
@@ -2378,7 +2620,7 @@ export const inspectTools = defineTools({
               'cannot see what the shadow tree paints behind the text. Screenshot the region instead.'
           });
         }
-        if (closedRootOnChain === null) {
+        if (closedRootChains === null) {
           blockers.unshift({
             code: 'closedShadowRootUnchecked',
             detail:
@@ -2429,10 +2671,23 @@ export const inspectTools = defineTools({
         // way and says so rather than pretending to a verdict it cannot back.
         const glyphIsTranslucent =
           glyphPaint.a < 1 || paintLayers.some(layer => layer.opacity < 1);
-        const borderline =
+        const nearAThreshold =
           ratio !== null &&
           glyphIsTranslucent &&
           [aaText, aaaText, 3].some(threshold => Math.abs(ratio - threshold) <= textGammaRatioSlack);
+        // A stroke between one and two device pixels DOES reach its nominal
+        // colour on some geometries and falls short on others, and which one
+        // it is cannot be known without rasterising. Measured at 1.0 device
+        // pixel: a diagonal reaches 21.00, a circle and a Lucide path 20.50,
+        // an axis-aligned rectangle only 10.53. That is far too wide a spread
+        // to quote as a verdict, and far too narrow to refuse: every icon on
+        // the live Acres page sits in this band, between 0.92 and 1.17.
+        const thinStroke =
+          ratio !== null &&
+          glyph.property === 'stroke' &&
+          probe.deviceStrokeWidth > 0 &&
+          probe.deviceStrokeWidth < strokeAttainsNominalDevicePx;
+        const borderline = nearAThreshold || thinStroke;
 
         return {
           index,
@@ -2461,6 +2716,17 @@ export const inspectTools = defineTools({
                   textPaint: {
                     property: glyph.property,
                     value: glyph.value,
+                    // Without these a caller cannot tell whether a 21:1 came
+                    // from a 5px stroke or from a hairline that paints almost
+                    // nothing, and stroke-width is not in the default property
+                    // set, so the payload has to carry it where it decides the
+                    // answer.
+                    ...(glyph.property === 'stroke'
+                      ? {
+                          strokeWidth: probe.strokeWidth,
+                          deviceStrokeWidth: round(probe.deviceStrokeWidth, 3)
+                        }
+                      : {}),
                     ...(probe.crossedSlot ? { crossedSlot: true } : {}),
                     ...(glyph.unavailable !== null ? { ratioUnavailable: glyph.unavailable } : {})
                   }
@@ -2539,7 +2805,20 @@ export const inspectTools = defineTools({
                   unaccountedFor: blockers.map(entry => entry.code)
                 }
               : {}),
-            ...(borderline
+            ...(thinStroke
+              ? {
+                  borderline: true,
+                  borderlineNote:
+                    `This is a stroke ${probe.deviceStrokeWidth.toFixed(2)} device pixels wide, under the ` +
+                    `${strokeAttainsNominalDevicePx} at which every geometry measured reaches its nominal colour on ` +
+                    'at least one pixel. Between one and two device pixels it depends on the shape and on where its ' +
+                    'edges fall on the pixel grid: measured at 1.0, a diagonal reaches the full colour, a circle ' +
+                    'and a Lucide-shaped path get to 20.5:1 of a nominal 21:1, and an axis-aligned rectangle only ' +
+                    'to 10.53:1. The ratio below is the stroke colour composited correctly; what is uncertain is ' +
+                    'how much of it any pixel actually receives. Read the darkest ink pixel from a screenshot if ' +
+                    'the verdict matters.'
+                }
+              : borderline
               ? {
                   borderline: true,
                   borderlineNote:
