@@ -186,6 +186,19 @@ test('a resourceType outside Chromium vocabulary is refused, not left to match n
   }
 });
 
+test('add_route_rule shares the guard and the resource-type vocabulary', async () => {
+  // Same two defects, same file family: its urlMatches used to build a bare
+  // RegExp, and Playwright matches a route pattern in THIS process on every
+  // intercepted request, so a runaway pattern there stalls the daemon exactly
+  // the way a capture filter does. Its resourceTypes used to be compared raw
+  // while its methods were uppercased on both sides, so ["XHR"] made a rule
+  // that could never fire.
+  const { networkTools } = await import('../src/daemon/tools/defs/network.js');
+  const shape = networkTools.add_route_rule.inputSchema.shape as Record<string, { description?: string }>;
+  assert.match(shape.urlMatches?.description ?? '', /REFUSED/);
+  assert.match(shape.resourceTypes?.description ?? '', /case-insensitively/);
+});
+
 // ---------------------------------------------------------------------------
 // Oracle 2: a second concurrent request to the same daemon
 // ---------------------------------------------------------------------------
@@ -226,7 +239,7 @@ async function startAdversarialPage(runLength: number): Promise<string> {
   return `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}/`;
 }
 
-test('a caller-supplied capture-filter regex cannot stall the daemon for other callers', { timeout: 180_000 }, async () => {
+test('a caller-supplied capture-filter regex cannot stall the daemon for other callers', { timeout: 180_000 }, async t => {
   // 28 characters, not 34. At 28 the unguarded stall is seconds, which is
   // already two orders of magnitude past the ceiling below; 34 would be two
   // minutes and has no place in a suite that shares a laptop.
@@ -319,6 +332,11 @@ test('a caller-supplied capture-filter regex cannot stall the daemon for other c
   await new Promise(resolve => setTimeout(resolve, 2000));
   stop.done = true;
   const worst = await poller;
+
+  // Printed, not just asserted on. The number is the whole point of this
+  // test, and a run that only says "ok" leaves the next reader guessing how
+  // much headroom the ceiling actually has.
+  t.diagnostic(`/health while filtering: idle ${idle.toFixed(1)}ms, worst ${worst.toFixed(1)}ms`);
 
   const listed = await client.callTool({ name: 'list_network_requests', arguments: { sessionId } });
   assert.ok(!listed.isError, `list_network_requests should work under the filter: ${JSON.stringify(listed)}`);

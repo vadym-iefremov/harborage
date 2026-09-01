@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import type { CDPSession, Page, Route } from 'playwright';
 import * as z from 'zod/v4';
 
-import { compileUrlPattern } from '../../networkMatch.js';
+import { compileUrlPattern, networkResourceTypes } from '../../networkMatch.js';
 import type { ResolvedTarget } from '../../sessions.js';
 import { defineTool, defineTools, text, type ToolContext } from '../types.js';
 import { sessionId } from './common.js';
@@ -213,7 +213,13 @@ function makeHandler(rule: RuleRecord): (route: Route) => Promise<void> {
       await route.fallback();
       return;
     }
-    if (rule.resourceTypes && !rule.resourceTypes.includes(request.resourceType())) {
+    // Lowercased on both sides, the way `methods` is uppercased on both sides
+    // just above. resourceTypes used to be compared raw, so ["XHR"] matched
+    // nothing at all and the rule silently never fired, showing up only as a
+    // matchCount of 0 that reads exactly like "the page never made that
+    // request". The stored values are normalized at rule creation, so this
+    // side is the only one left to fold.
+    if (rule.resourceTypes && !rule.resourceTypes.includes(request.resourceType().toLowerCase())) {
       rule.skippedByFilter += 1;
       await route.fallback();
       return;
@@ -512,8 +518,12 @@ export const networkTools = defineTools({
         .array(z.string())
         .optional()
         .describe(
-          'Only intercept these Playwright resource types, e.g. ["xhr", "fetch"] or ["image"]. Same vocabulary as ' +
-            'list_network_requests\' resourceType. Note that a fetch() for an image URL is type "fetch", not "image".'
+          'Only intercept these Playwright resource types, e.g. ["xhr", "fetch"] or ["image"], matched ' +
+            'case-insensitively. Same vocabulary as list_network_requests\' resourceType, and a value outside it ' +
+            '(document, stylesheet, image, media, font, script, texttrack, xhr, fetch, eventsource, websocket, ' +
+            'manifest, ping, cspreport, other) is REJECTED rather than accepted and left to match nothing, since ' +
+            'a rule that can never fire shows up only as a matchCount of 0, which reads exactly like a request ' +
+            'the page never made. Note that a fetch() for an image URL is type "fetch", not "image".'
         ),
       times: z
         .number()
@@ -583,6 +593,20 @@ export const networkTools = defineTools({
                 }
               };
 
+      // Normalized and checked here rather than at match time, so an
+      // unusable rule is refused at the call that created it instead of
+      // sitting in list_route_rules at matchCount 0 looking like a page that
+      // never made the request. Same reasoning as the resourceType field on
+      // the network filters, and the same closed Chromium vocabulary.
+      const resourceTypes = args.resourceTypes?.map(type => type.toLowerCase());
+      const unknown = resourceTypes?.filter(type => !(networkResourceTypes as readonly string[]).includes(type));
+      if (unknown !== undefined && unknown.length > 0) {
+        throw new Error(
+          `resourceTypes contains ${unknown.map(type => `"${type}"`).join(', ')}, which Chromium never reports, so ` +
+            `the rule could only ever match nothing. Use values from: ${networkResourceTypes.join(', ')}.`
+        );
+      }
+
       const { state, target } = stateFor(ctx, args.sessionId);
       const rule: RuleRecord = {
         id: randomUUID(),
@@ -593,7 +617,7 @@ export const networkTools = defineTools({
         action: args.action,
         detail,
         ...(args.methods ? { methods: args.methods.map(m => m.toUpperCase()) } : {}),
-        ...(args.resourceTypes ? { resourceTypes: args.resourceTypes } : {}),
+        ...(resourceTypes ? { resourceTypes } : {}),
         ...(args.times !== undefined ? { times: args.times } : {}),
         matchCount: 0,
         skippedByFilter: 0,
