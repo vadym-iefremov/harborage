@@ -1662,7 +1662,10 @@ export const inspectTools = defineTools({
       'resolvesToTarget (whether one of them is the element described here) and unique (both, exactly once). ' +
       'READ resolvesToTarget BEFORE USING A SELECTOR: false means it points somewhere else, or nowhere. That ' +
       'happens for an element inside a shadow root, which Playwright finds but a CSS path cannot reach, and the ' +
-      'result carries a note whenever it does. Search by ' +
+      'result carries a note whenever it does. When frame is set and the owning iframe element itself could not ' +
+      'be read (for instance because the iframe sits inside a shadow root), no working selector can be composed ' +
+      'at all: every result comes back with selector null and a top-level frameSelectorUnavailable explaining why, ' +
+      'rather than a selector that looks fine but actually runs in the wrong document. Search by ' +
       'visible text, by ARIA role and accessible name, by test id, or by a raw selector, and combine a raw ' +
       'selector with the others to scope the search to part of the page. ' +
       'Each result also carries the element\'s tag, trimmed text, key attributes, box, and whether it is visible ' +
@@ -1732,7 +1735,25 @@ export const inspectTools = defineTools({
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
       const frame = resolveFrame(target.page, args.frame);
       const root: Page | Frame = frame ?? target.page;
-      const prefix = frame ? ((await frameSelectorPrefix(target.page, frame)) ?? '') : '';
+      // frameSelectorPrefix returns undefined when the owning iframe element
+      // could not be addressed (list_frames hits the same case, and reports
+      // it as selectorPrefixUnavailable rather than guessing). The most
+      // common cause is an iframe living inside a shadow root: the segment
+      // builder indexes it with document.getElementsByTagName, which does
+      // not pierce shadow roots. Falling back to '' here used to be silent:
+      // a selector meant to enter a frame would come back with no prefix at
+      // all, and click would then run it against the MAIN document instead.
+      // Probed with a shadow-hosted iframe holding "Confirm payment" and the
+      // main page holding "Delete account": find returned a bare
+      // "html > body > button" with resolvesToTarget true (that flag was
+      // only ever checked inside the frame's own document), and clicking it
+      // pressed Delete account. resolvesToTarget must never certify a
+      // selector that was verified in a different document from the one it
+      // will actually run in, so when the prefix is unavailable no usable
+      // selector is emitted at all: see frameSelectorUnavailable below.
+      const framePrefix = frame ? await frameSelectorPrefix(target.page, frame) : '';
+      const frameSelectorUnavailable = frame !== undefined && framePrefix === undefined;
+      const prefix = framePrefix ?? '';
       const limit = args.limit ?? defaultMatchLimit;
       const exact = args.exact ?? false;
 
@@ -1889,6 +1910,27 @@ export const inspectTools = defineTools({
                 'data-testid'
               ]
             });
+
+      // The prefix is unavailable, so no result below can carry a working
+      // selector: composing one with an empty prefix would silently resolve
+      // in the wrong document (see the comment where framePrefix is
+      // computed). Every selector comes back null rather than guessing.
+      if (frameSelectorUnavailable) {
+        return text({
+          pageId: target.pageId,
+          ...(args.frame !== undefined ? { frame: args.frame } : {}),
+          matched,
+          returned: elements.length,
+          frameSelectorUnavailable:
+            'the owning iframe element for this frame could not be read (often because it sits inside a shadow ' +
+            'root), so no selector can be built that reaches into it from outside. Every selector below is null ' +
+            'for that reason: do not substitute a bare or empty prefix, since that would resolve in the main ' +
+            'document instead of this frame and click would press whatever it happens to hit there. Use evaluate, ' +
+            'snapshot, computed_style or element_box with frame set to this id instead, which take a frame id ' +
+            'directly and need no prefix.',
+          elements: elements.map(element => ({ ...element, selector: null, resolvesToTarget: false }))
+        });
+      }
 
       const unusable = elements.filter(element => !element.resolvesToTarget);
       return text({
