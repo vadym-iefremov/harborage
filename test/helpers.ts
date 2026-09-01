@@ -2,6 +2,7 @@ import { type ChildProcess, spawn } from 'node:child_process';
 import { mkdtempSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { createServer as createHttpServer, type Server } from 'node:http';
 import { createServer as createNetServer } from 'node:net';
+import { inflateSync } from 'node:zlib';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -265,4 +266,160 @@ export function pngSize(png: Buffer): { width: number; height: number } {
   const magic = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
   if (!png.subarray(0, 4).equals(magic)) throw new Error('not a PNG: bad magic bytes');
   return { width: png.readUInt32BE(16), height: png.readUInt32BE(20) };
+}
+
+/**
+ * One decoded PNG: its dimensions and an RGBA byte array, four bytes per
+ * pixel in row-major order.
+ */
+export interface DecodedPng {
+  width: number;
+  height: number;
+  /** RGBA, 8 bits per channel, length width * height * 4. */
+  pixels: Uint8Array;
+}
+
+/**
+ * Decodes a PNG down to raw RGBA bytes, so a test can read the colour the
+ * browser ACTUALLY painted rather than the colour some other code path in the
+ * same process believes it painted.
+ *
+ * This exists because of how the round-2 contrast fixes failed. They asserted
+ * that computed_style returned the ratio the test had computed from the same
+ * parser and the same compositing code computed_style itself uses, so a whole
+ * class of "the number is confidently wrong" bugs sailed through green. A
+ * screenshot is the one artefact in reach that neither the parser nor the
+ * compositor had a hand in producing: Chromium rasterised it. Comparing
+ * against that is the only assertion here worth making.
+ *
+ * Deliberately narrow: 8-bit non-interlaced truecolour, with or without an
+ * alpha channel, which is every screenshot Chromium's CDP capture produces.
+ * Anything else throws rather than being decoded approximately, because a
+ * silently wrong oracle is worse than no oracle.
+ */
+export function decodePng(png: Buffer): DecodedPng {
+  const magic = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  if (!png.subarray(0, 8).equals(magic)) throw new Error('not a PNG: bad signature');
+
+  const width = png.readUInt32BE(16);
+  const height = png.readUInt32BE(20);
+  const bitDepth = png.readUInt8(24);
+  const colorType = png.readUInt8(25);
+  const interlace = png.readUInt8(28);
+  if (bitDepth !== 8) throw new Error(`decodePng only handles 8-bit PNGs, got bit depth ${bitDepth}`);
+  if (colorType !== 2 && colorType !== 6) {
+    throw new Error(`decodePng only handles truecolour PNGs (colour type 2 or 6), got ${colorType}`);
+  }
+  if (interlace !== 0) throw new Error('decodePng does not handle interlaced PNGs');
+
+  const channels = colorType === 6 ? 4 : 3;
+  const idat: Buffer[] = [];
+  let offset = 8;
+  while (offset + 8 <= png.length) {
+    const length = png.readUInt32BE(offset);
+    const type = png.toString('ascii', offset + 4, offset + 8);
+    const dataStart = offset + 8;
+    if (type === 'IDAT') idat.push(png.subarray(dataStart, dataStart + length));
+    if (type === 'IEND') break;
+    offset = dataStart + length + 4;
+  }
+  if (idat.length === 0) throw new Error('PNG carries no IDAT chunk');
+
+  const raw = inflateSync(Buffer.concat(idat));
+  const stride = width * channels;
+  const out = new Uint8Array(width * height * 4);
+  // The previous row's UNFILTERED bytes, which is what every PNG filter type
+  // above 1 refers back to. Starts as zeroes for row 0, per the spec.
+  let previous = new Uint8Array(stride);
+
+  for (let y = 0; y < height; y += 1) {
+    const filter = raw[y * (stride + 1)];
+    const rowStart = y * (stride + 1) + 1;
+    const current = new Uint8Array(stride);
+    for (let x = 0; x < stride; x += 1) {
+      const value = raw[rowStart + x];
+      const left = x >= channels ? current[x - channels] : 0;
+      const up = previous[x];
+      const upLeft = x >= channels ? previous[x - channels] : 0;
+      let reconstructed: number;
+      switch (filter) {
+        case 0:
+          reconstructed = value;
+          break;
+        case 1:
+          reconstructed = value + left;
+          break;
+        case 2:
+          reconstructed = value + up;
+          break;
+        case 3:
+          reconstructed = value + Math.floor((left + up) / 2);
+          break;
+        case 4: {
+          // Paeth: pick whichever of left / up / up-left the linear estimate
+          // of the three lands closest to.
+          const estimate = left + up - upLeft;
+          const dLeft = Math.abs(estimate - left);
+          const dUp = Math.abs(estimate - up);
+          const dUpLeft = Math.abs(estimate - upLeft);
+          const predictor = dLeft <= dUp && dLeft <= dUpLeft ? left : dUp <= dUpLeft ? up : upLeft;
+          reconstructed = value + predictor;
+          break;
+        }
+        default:
+          throw new Error(`unknown PNG filter type ${filter} on row ${y}`);
+      }
+      current[x] = reconstructed & 0xff;
+    }
+    for (let x = 0; x < width; x += 1) {
+      const from = x * channels;
+      const to = (y * width + x) * 4;
+      out[to] = current[from];
+      out[to + 1] = current[from + 1];
+      out[to + 2] = current[from + 2];
+      out[to + 3] = channels === 4 ? current[from + 3] : 255;
+    }
+    previous = current;
+  }
+
+  return { width, height, pixels: out };
+}
+
+/** The RGBA the browser painted at one pixel of a decoded capture. */
+export function pixelAt(image: DecodedPng, x: number, y: number): { r: number; g: number; b: number; a: number } {
+  if (x < 0 || y < 0 || x >= image.width || y >= image.height) {
+    throw new Error(`pixel (${x}, ${y}) is outside the ${image.width}x${image.height} capture`);
+  }
+  const index = (y * image.width + x) * 4;
+  return {
+    r: image.pixels[index],
+    g: image.pixels[index + 1],
+    b: image.pixels[index + 2],
+    a: image.pixels[index + 3]
+  };
+}
+
+/** WCAG 2.x relative luminance, computed here rather than imported, so the oracle shares no code with the tool. */
+function oracleLuminance(rgb: { r: number; g: number; b: number }): number {
+  const channel = (value: number): number => {
+    const scaled = value / 255;
+    return scaled <= 0.03928 ? scaled / 12.92 : Math.pow((scaled + 0.055) / 1.055, 2.4);
+  };
+  return 0.2126 * channel(rgb.r) + 0.7152 * channel(rgb.g) + 0.0722 * channel(rgb.b);
+}
+
+/**
+ * The true WCAG contrast ratio between two PAINTED pixels.
+ *
+ * Written out longhand here on purpose. Importing contrastRatio from the tool
+ * would make every assertion below circular: the test would be checking that
+ * the tool agrees with itself.
+ */
+export function paintedContrastRatio(
+  a: { r: number; g: number; b: number },
+  b: { r: number; g: number; b: number }
+): number {
+  const first = oracleLuminance(a);
+  const second = oracleLuminance(b);
+  return (Math.max(first, second) + 0.05) / (Math.min(first, second) + 0.05);
 }
