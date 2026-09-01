@@ -88,6 +88,8 @@ interface ShadowDrillElement extends PageElement {
 }
 declare const document: {
   activeElement: PageElement | null;
+  /** Read by navigate's and reload's settle snapshot, together with performance.timeOrigin, in one crossing. */
+  title: string;
   addEventListener(type: string, handler: () => void, options?: unknown): void;
   removeEventListener(type: string, handler: () => void, options?: unknown): void;
   elementFromPoint(x: number, y: number): PageElement | null;
@@ -1017,12 +1019,18 @@ function withoutHash(url: string): string {
  * once: page.url() answered from one document and page.title() from the next.
  */
 async function readPageSnapshot(page: Page): Promise<PageSnapshot> {
-  const identity = await documentIdentity(page);
-  const [url, title] = await Promise.all([
-    Promise.resolve(page.url()),
-    page.title().catch(() => '')
-  ]);
-  return { identity, url, title };
+  // ONE round trip, deliberately. documentIdentity and page.title() are an
+  // evaluate each, and this runs at least twice per navigation, so doing them
+  // separately cost four crossings into a page whose main thread may well be
+  // busy rendering. Measured against a real React app: halving the crossings
+  // halved the settle overhead. Reading them together is also the correctness
+  // point, since a title and an identity fetched separately can come from two
+  // different documents. page.url() is read from the browser side and costs
+  // nothing.
+  const read = await page
+    .evaluate(() => ({ identity: performance.timeOrigin, title: document.title }))
+    .catch(() => null);
+  return { identity: read?.identity ?? null, url: page.url(), title: read?.title ?? '' };
 }
 
 /**
@@ -1060,6 +1068,116 @@ async function settleAfterNavigation(page: Page, documents: DocumentResponse[]):
   }
 }
 
+/** A navigation measured end to end: what was fetched, what the tab finally settled on, and whether those are the same document. */
+interface NavigationOutcome {
+  /** The response for the request the navigation itself made. Null when nothing was fetched over HTTP. */
+  response: Response | null;
+  /** The tab once it stopped replacing its own document. */
+  settled: PageSnapshot;
+  /** Every main-frame document response seen during the call, in order. */
+  documents: DocumentResponse[];
+  /** The response that produced the document `settled` describes, if it had one. */
+  finalDocument: DocumentResponse | undefined;
+  /** Status of the document `settled` describes, NOT of whatever the first request answered. */
+  status: number | null;
+  ok: boolean | null;
+  /** True when the page moved itself after the response was measured. */
+  documentChanged: boolean;
+}
+
+/**
+ * Runs one navigation and measures the document the caller will actually be
+ * looking at when the answer comes back.
+ *
+ * Shared by navigate and reload because the defect is shared: both used to
+ * report the status of the response THEY caused beside a url and title read
+ * fresh afterwards, and those are different documents the moment the page
+ * redirects itself. A 200 shell that runs location.replace on a failing
+ * route does it, a meta refresh does it, and a router bouncing an
+ * unauthenticated visitor to a login page does it. reload is not a
+ * lesser case: reloading such a shell walks the same chain again.
+ *
+ * The response listener has to be attached BEFORE the navigation starts,
+ * because the documents that matter are the ones goto or reload never
+ * returns.
+ */
+async function performNavigation(page: Page, run: () => Promise<Response | null>): Promise<NavigationOutcome> {
+  const documents: DocumentResponse[] = [];
+  const onResponse = (response: Response): void => {
+    try {
+      const request = response.request();
+      if (request.frame() !== page.mainFrame()) return;
+      if (request.resourceType() !== 'document') return;
+      documents.push({ response, url: response.url(), status: response.status(), ok: response.ok() });
+    } catch {
+      // A request whose frame has already gone throws when asked for it.
+      // Nothing to record, and nothing worth failing the navigation over.
+    }
+  };
+  page.on('response', onResponse);
+
+  let response: Response | null;
+  let settled: PageSnapshot;
+  try {
+    response = await run();
+    // Read once the page has stopped replacing its own document, and read
+    // url and title together. Both halves matter: without the wait the answer
+    // describes a document that is already gone, and without the single read
+    // url could come from one document and title from the next.
+    settled = await settleAfterNavigation(page, documents);
+  } finally {
+    page.off('response', onResponse);
+  }
+
+  // WHICH DOCUMENT DOES "status" DESCRIBE? The one "url" and "title"
+  // describe, and nothing else. It used to be the navigation's own response,
+  // unconditionally, which is the same document only when the page did not
+  // move itself afterwards. Matched by URL with the fragment removed, because
+  // a fragment never reaches the server and so never carries a status.
+  const finalKey = withoutHash(settled.url);
+  const finalDocument = documents.filter(entry => withoutHash(entry.url) === finalKey).at(-1);
+  const ownDocument = response === null ? undefined : documents.find(entry => entry.response === response);
+  const status = response === null ? null : (finalDocument?.status ?? null);
+  const ok = response === null ? null : (finalDocument?.ok ?? null);
+
+  // The described document is not the one this navigation measured. Either a
+  // later document response is the one on screen, or the tab ended up
+  // somewhere with no HTTP response of its own at all.
+  const documentChanged =
+    response !== null &&
+    (finalDocument !== undefined ? finalDocument !== ownDocument : finalKey !== withoutHash(response.url()));
+
+  return { response, settled, documents, finalDocument, status, ok, documentChanged };
+}
+
+/**
+ * The note a caller needs when the page moved itself, worded for whichever
+ * tool is reporting it. Kept in one place so navigate and reload cannot drift
+ * into explaining the same situation differently.
+ */
+function documentChangedNote(outcome: NavigationOutcome, what: string): string {
+  const response = outcome.response;
+  if (response === null) return '';
+  return (
+    `The page moved itself after the response was measured: the ${what} of ${response.url()} answered ${response.status()}, and the document now on screen is ${outcome.settled.url}. That is a client-side redirect (location.assign or replace, a meta refresh, or a router bouncing an unauthenticated visitor), and "documentChanged" lists every main-frame document this call saw, in order. ` +
+    (outcome.finalDocument !== undefined
+      ? `"status" and "ok" describe the document "url" and "title" describe, this last one, NOT the ${response.status()} that started the chain.`
+      : 'The final document has no HTTP response of its own to report (about:blank, a data: URL or a same-document rewrite), so "status" and "ok" are null rather than carrying the earlier document\'s status.')
+  );
+}
+
+/** The documentChanged block both navigate and reload attach, or nothing when the document held still. */
+function documentChangedPayload(outcome: NavigationOutcome): Record<string, unknown> {
+  if (!outcome.documentChanged || outcome.response === null) return {};
+  return {
+    documentChanged: {
+      from: { url: outcome.response.url(), status: outcome.response.status(), ok: outcome.response.ok() },
+      to: { url: outcome.settled.url, status: outcome.status, ok: outcome.ok },
+      documents: outcome.documents.map(entry => ({ url: entry.url, status: entry.status, ok: entry.ok }))
+    }
+  };
+}
+
 /** Tools that drive a tab: moving it somewhere and acting on the page. */
 export const interactionTools = defineTools({
   navigate: defineTool({
@@ -1076,41 +1194,10 @@ export const interactionTools = defineTools({
     async handler(ctx, args) {
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
       const before = await documentIdentity(target.page);
-
-      // Every main-frame document response for the life of this call, in
-      // order. goto() hands back exactly one response, the one for the
-      // request IT made, and that is not necessarily the document the caller
-      // ends up looking at: a 200 shell that runs location.replace, or a meta
-      // refresh, fetches further documents that goto knows nothing about.
-      // Recording them is what lets the final document be given its own
-      // status instead of inheriting the shell's.
-      const documents: DocumentResponse[] = [];
-      const onResponse = (response: Response): void => {
-        try {
-          const request = response.request();
-          if (request.frame() !== target.page.mainFrame()) return;
-          if (request.resourceType() !== 'document') return;
-          documents.push({ response, url: response.url(), status: response.status(), ok: response.ok() });
-        } catch {
-          // A request whose frame has already gone throws when asked for it.
-          // Nothing to record, and nothing worth failing the navigation over.
-        }
-      };
-      target.page.on('response', onResponse);
-
-      let response: Response | null;
-      let settled: PageSnapshot;
-      try {
-        response = await target.page.goto(args.url, args.waitUntil ? { waitUntil: args.waitUntil } : undefined);
-        // Read once the page has stopped replacing its own document, and read
-        // url and title together. Both halves matter: without the wait the
-        // answer describes a document that is already gone, and without the
-        // single read url could come from one document and title from the
-        // next.
-        settled = await settleAfterNavigation(target.page, documents);
-      } finally {
-        target.page.off('response', onResponse);
-      }
+      const outcome = await performNavigation(target.page, () =>
+        target.page.goto(args.url, args.waitUntil ? { waitUntil: args.waitUntil } : undefined)
+      );
+      const { response, settled } = outcome;
 
       // A response means a document really was fetched and swapped in. A null
       // response is ambiguous on its own, so the identity check settles it.
@@ -1118,27 +1205,6 @@ export const interactionTools = defineTools({
       // warning the caller: a spurious warning costs one redundant reload, a
       // missed one costs a false pass.
       const sameDocument = response === null && (before === null || settled.identity === null || before === settled.identity);
-
-      // WHICH DOCUMENT DOES "status" DESCRIBE? It describes the one "url" and
-      // "title" describe, and nothing else. It used to be goto's own
-      // response, unconditionally, which is the same document only when the
-      // page did not move itself afterwards. A 200 shell that redirects to a
-      // 500 came back as "status": 200, "ok": true beside the error page's
-      // own title, and a caller reading ok: true there draws exactly the
-      // wrong conclusion. Matched by URL, ignoring the fragment, because a
-      // fragment never reaches the server and so never carries a status.
-      const finalKey = withoutHash(settled.url);
-      const finalDocument = documents.filter(entry => withoutHash(entry.url) === finalKey).at(-1);
-      const gotoDocument = response === null ? undefined : documents.find(entry => entry.response === response);
-      const status = response === null ? null : (finalDocument?.status ?? null);
-      const ok = response === null ? null : (finalDocument?.ok ?? null);
-
-      // The described document is not the one goto measured. Either a later
-      // document response is the one on screen, or the tab ended up somewhere
-      // with no HTTP response of its own at all.
-      const documentChanged =
-        response !== null &&
-        (finalDocument !== undefined ? finalDocument !== gotoDocument : finalKey !== withoutHash(response.url()));
 
       const notes: string[] = [];
       if (sameDocument) {
@@ -1156,31 +1222,16 @@ export const interactionTools = defineTools({
           'This navigation produced no HTTP response, so "status" and "ok" are null: that is what about:blank and a non-HTTP scheme (for instance data: or javascript:) look like, not a failure. The document did change, a fresh one was created, just not through anything this tool can report an HTTP status for.'
         );
       }
-      if (documentChanged && response !== null) {
-        notes.push(
-          `The page moved itself after the response was measured: the navigation to ${response.url()} answered ${response.status()}, and the document now on screen is ${settled.url}. That is a client-side redirect (location.assign or replace, a meta refresh, or a router bouncing an unauthenticated visitor), and "documentChanged" lists every main-frame document this call saw, in order. ` +
-            (finalDocument !== undefined
-              ? `"status" and "ok" describe the document "url" and "title" describe, this last one, NOT the ${response.status()} that started the chain.`
-              : 'The final document has no HTTP response of its own to report (about:blank, a data: URL or a same-document rewrite), so "status" and "ok" are null rather than carrying the earlier document\'s status.')
-        );
-      }
+      if (outcome.documentChanged) notes.push(documentChangedNote(outcome, 'navigation'));
 
       return text({
         pageId: target.pageId,
         url: settled.url,
         title: settled.title,
         sameDocument,
-        status,
-        ok,
-        ...(documentChanged && response !== null
-          ? {
-              documentChanged: {
-                from: { url: response.url(), status: response.status(), ok: response.ok() },
-                to: { url: settled.url, status, ok },
-                documents: documents.map(entry => ({ url: entry.url, status: entry.status, ok: entry.ok }))
-              }
-            }
-          : {}),
+        status: outcome.status,
+        ok: outcome.ok,
+        ...documentChangedPayload(outcome),
         ...(notes.length ? { note: notes.join(' ') } : {})
       });
     }
@@ -1188,7 +1239,7 @@ export const interactionTools = defineTools({
 
   reload: defineTool({
     description:
-      'Reload a session\'s tab: a real page load that discards the JS context, in-page state and everything the page had built up, and re-fetches the document. This is what navigate deliberately does not do when only the URL hash changes. The current URL, hash included, is kept. The result carries "status" (the HTTP status code of the reload) and "ok" (whether it was in the 200 to 299 range), exactly as navigate does, both null on the rare reload with no HTTP response to report, such as one landing on about:blank.',
+      'Reload a session\'s tab: a real page load that discards the JS context, in-page state and everything the page had built up, and re-fetches the document. This is what navigate deliberately does not do when only the URL hash changes. The current URL, hash included, is kept. The result carries "status" (the HTTP status code) and "ok" (whether it was in the 200 to 299 range), exactly as navigate does, both null on the rare reload with no HTTP response to report, such as one landing on about:blank. ONE PAYLOAD ALWAYS DESCRIBES ONE DOCUMENT, on the same terms navigate reports it and through the same machinery: "status" and "ok" belong to the document "url" and "title" describe, not to whatever the reload request itself answered, and the call waits briefly for a page still throwing itself at another document to stop before reading any of them. Reloading a 200 shell that redirects walks the same chain a first visit does, so a reload is no safer than a navigate here: it is usually MORE exposed, because the pages an agent reloads repeatedly are the ones it is waiting on. When the page moves itself the result carries "documentChanged", holding the response the reload measured ("from"), the document finally described ("to"), and every main-frame document this call saw, in order, plus a note. A final document with no HTTP response of its own reports null rather than inheriting the earlier status.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -1196,13 +1247,34 @@ export const interactionTools = defineTools({
     }),
     async handler(ctx, args) {
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
-      const response = await target.page.reload(args.waitUntil ? { waitUntil: args.waitUntil } : undefined);
+      // Measured exactly the way navigate measures itself, through the same
+      // helper rather than a second implementation of it. Reloading a shell
+      // that redirects walks the same chain a first visit does, so a reload
+      // reporting the shell's own status beside the redirect target's title
+      // was the identical defect: "status": 200, "ok": true next to a 500
+      // error page. Nothing about a reload makes that shape rarer, since the
+      // pages that do it are exactly the ones an agent reloads while waiting
+      // for a fix.
+      const outcome = await performNavigation(target.page, () =>
+        target.page.reload(args.waitUntil ? { waitUntil: args.waitUntil } : undefined)
+      );
+
+      const notes: string[] = [];
+      if (outcome.response === null) {
+        notes.push(
+          'This reload produced no HTTP response, so "status" and "ok" are null: that is what reloading about:blank or a non-HTTP scheme (for instance data:) looks like, not a failure.'
+        );
+      }
+      if (outcome.documentChanged) notes.push(documentChangedNote(outcome, 'reload'));
+
       return text({
         pageId: target.pageId,
-        url: target.page.url(),
-        title: await target.page.title().catch(() => ''),
-        status: response?.status() ?? null,
-        ok: response?.ok() ?? null
+        url: outcome.settled.url,
+        title: outcome.settled.title,
+        status: outcome.status,
+        ok: outcome.ok,
+        ...documentChangedPayload(outcome),
+        ...(notes.length ? { note: notes.join(' ') } : {})
       });
     }
   }),
