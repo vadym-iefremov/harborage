@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: typecheck and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # `npm ci` also builds dist/ via the `prepare` script.
+      - run: npm ci
+
+      # The suite drives a real Chromium. There are no mocks of the browser
+      # or the protocol layer, so this download is not optional.
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - run: npm run typecheck
+
+      - run: npm test
+
+      # A daemon that failed to start explains itself here and nowhere else.
+      - name: Upload daemon log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: harborage-daemon-log
+          path: ~/.harborage/daemon.log
+          if-no-files-found: ignore
