@@ -655,7 +655,12 @@ async function readNavigationHistory(
  * failure modes look identical from the outside: `page.goBack()` resolves to
  * null both when there was nothing to go back to and when the step was a
  * same-document one. Chromium's own history is consulted first so the
- * no-op case is stated rather than inferred.
+ * no-op case is stated rather than inferred, and it is consulted again after
+ * the step for the same reason: whether an entry EXISTED to step to says
+ * nothing about whether the step actually landed there, since a page can
+ * catch the popstate event this fires and step itself right back.
+ * "navigated" is decided on evidence of real movement alone: a genuine HTTP
+ * response, a changed URL, or a changed document identity.
  */
 async function historyStep(
   ctx: ToolContext,
@@ -692,12 +697,46 @@ async function historyStep(
   const after = await documentIdentity(target.page);
   const url = target.page.url();
 
+  // Re-read rather than doing arithmetic on the PRE-step `history` above.
+  // Probed against a back-trapping SPA (a popstate handler that re-pushes its
+  // own URL, exactly what a route guard or an unsaved-changes interceptor
+  // does): the trap does not merely leave the index where it was, it moves
+  // the browser back and then pushes a fresh entry forward again, so
+  // `history.index - 1` corroborated a step that never really landed the
+  // caller anywhere. Only a fresh read of Chromium's own history tells the
+  // truth about where the tab ended up.
+  const afterHistory = await readNavigationHistory(target.session.context, target.page);
+
   // Same rule navigate uses, for the same reason: a null response alone is
   // ambiguous, so the document's own identity settles it, and an unreadable
   // identity errs toward warning the caller.
   const sameDocument = response === null && (before === null || after === null || before === after);
-  const navigated =
-    canStep === true || response !== null || url !== previousUrl || (before !== null && after !== null && before !== after);
+  // `canStep` was dropped from this check. It only says a history entry
+  // EXISTS to step to, not that the step actually happened, and it used to
+  // sit first in this expression, short-circuiting the three terms that
+  // genuinely measure movement. Probed against a back-trapping SPA: canStep
+  // was true (there really was an entry to go back to), the trap re-pushed
+  // the same URL, and the result still came back "navigated": true, "url"
+  // unchanged from "previousUrl", a clean pass for a back button that did
+  // nothing. What is left below is evidence a step really happened: a real
+  // HTTP response came back, the URL is different, or the document's own
+  // identity changed.
+  const navigated = response !== null || url !== previousUrl || (before !== null && after !== null && before !== after);
+
+  const notes: string[] = [];
+  if (navigated && sameDocument) {
+    notes.push(
+      'Same-document step: the URL changed but the document was NOT reloaded. The JS context, in-page state and the console buffer all survive, and the page saw a popstate event rather than a load. This is what a hash or pushState entry looks like going back.'
+    );
+  }
+  if (!navigated) {
+    notes.push(
+      `Nothing moved: the tab is still on ${previousUrl}, even though there was a ${direction} entry to step to. ` +
+        'This is what a route guard or an unsaved-changes interceptor looks like from the outside: the page saw the ' +
+        'popstate event this step fired and re-pushed its own URL right back, so the browser genuinely tried to move ' +
+        'and the page genuinely stopped it. Treat this as a blocked step, not a no-op.'
+    );
+  }
 
   return text({
     pageId: target.pageId,
@@ -706,21 +745,8 @@ async function historyStep(
     title: await target.page.title().catch(() => ''),
     sameDocument: navigated ? sameDocument : false,
     previousUrl,
-    ...(history
-      ? {
-          historyIndex: direction === 'back' ? history.index - 1 : history.index + 1,
-          historyLength: history.length
-        }
-      : {}),
-    ...(navigated && sameDocument
-      ? {
-          note:
-            'Same-document step: the URL changed but the document was NOT reloaded. The JS context, in-page state and the console buffer all survive, and the page saw a popstate event rather than a load. This is what a hash or pushState entry looks like going back.'
-        }
-      : {}),
-    ...(!navigated
-      ? { note: `Nothing moved: the tab is still on ${previousUrl}. Treat this as a no-op, not a step.` }
-      : {})
+    ...(afterHistory ? { historyIndex: afterHistory.index, historyLength: afterHistory.length } : {}),
+    ...(notes.length ? { note: notes.join(' ') } : {})
   });
 }
 
@@ -1575,14 +1601,14 @@ export const interactionTools = defineTools({
 
   navigate_back: defineTool({
     description:
-      'Go back one entry in a session\'s tab history, the way a user presses the browser Back button. Real history matters wherever an app writes its state into the URL and restores it from a popstate event, and nothing else here exercises that path. When there is no entry to go back to this does NOT quietly succeed: the result says "navigated": false with a note, so a no-op can never read as a step. Otherwise it reports the resulting URL and "sameDocument", exactly as navigate does: true means the URL changed without a reload, so the JS context, in-page state and the console buffer all survived, which is what a hash or pushState step back looks like.',
+      'Go back one entry in a session\'s tab history, the way a user presses the browser Back button. Real history matters wherever an app writes its state into the URL and restores it from a popstate event, and nothing else here exercises that path. When there is no entry to go back to this does NOT quietly succeed: the result says "navigated": false with a note, so a no-op can never read as a step. Nor does it quietly succeed when there WAS an entry to go to but the step never actually landed: a page can catch the popstate event this fires and push its own URL right back, which is exactly what a route guard or an unsaved-changes interceptor does, and "navigated" is false with a note for that too, so a back button an app is trapping the user on cannot read as a clean pass. Otherwise it reports the resulting URL and "sameDocument", exactly as navigate does: true means the URL changed without a reload, so the JS context, in-page state and the console buffer all survived, which is what a hash or pushState step back looks like. "historyIndex" and "historyLength" are always read fresh from the browser\'s own history after the step, not computed from where the tab was before it, so they describe where the tab really ended up.',
     inputSchema: z.object({ sessionId, pageId, waitUntil }),
     handler: (ctx, args) => historyStep(ctx, args, 'back')
   }),
 
   navigate_forward: defineTool({
     description:
-      'Go forward one entry in a session\'s tab history, the way a user presses the browser Forward button. The counterpart to navigate_back, and it behaves identically: sitting at the newest entry there is nothing ahead, and the result says "navigated": false with a note rather than looking like a step. Note that navigating anywhere new discards the forward entries, so a forward step is only available directly after a back step.',
+      'Go forward one entry in a session\'s tab history, the way a user presses the browser Forward button. The counterpart to navigate_back, and it behaves identically: sitting at the newest entry there is nothing ahead, and the result says "navigated": false with a note rather than looking like a step, and the same is true when there was an entry to go to but a page trapped the step and pushed its own URL right back. Note that navigating anywhere new discards the forward entries, so a forward step is only available directly after a back step.',
     inputSchema: z.object({ sessionId, pageId, waitUntil }),
     handler: (ctx, args) => historyStep(ctx, args, 'forward')
   }),
