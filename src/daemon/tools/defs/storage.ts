@@ -210,8 +210,37 @@ function storageBase(
 // ---------------------------------------------------------------------------
 
 /** Identity of one cookie in the jar, which is the triple the browser keys on. */
+function cookieKeyOf(name: string, domain: string, path: string): string {
+  return `${name} ${domain} ${path}`;
+}
+
 function cookieKey(cookie: Cookie): string {
-  return `${cookie.name} ${cookie.domain} ${cookie.path}`;
+  return cookieKeyOf(cookie.name, cookie.domain, cookie.path);
+}
+
+/**
+ * The identity a REQUESTED cookie will land in the jar under, computed the
+ * same way the browser derives it, so a read-back can match on it rather
+ * than on name alone.
+ *
+ * A cookie given with domain and path already has an explicit identity. One
+ * given only with a url does not, until addCookies resolves it: verified
+ * directly against Playwright (1.62) that it takes domain from the url's
+ * hostname (port dropped) and path from the url's directory, i.e. everything
+ * up to and including the last "/", defaulting to "/" when there is none.
+ * Matching on name alone here is exactly the bug this replaces: "session",
+ * "token" and "sid" collide across domains constantly, so a cookie one
+ * domain rejected could be reported present because a same-named cookie for
+ * an unrelated domain already sat in the jar.
+ */
+function requestedCookieKey(cookie: { name: string; domain?: string; path?: string; url?: string }): string {
+  if (cookie.domain !== undefined && cookie.path !== undefined) {
+    return cookieKeyOf(cookie.name, cookie.domain, cookie.path);
+  }
+  const parsed = new URL(cookie.url as string);
+  const lastSlash = parsed.pathname.lastIndexOf('/');
+  const path = lastSlash === -1 ? '/' : parsed.pathname.slice(0, lastSlash + 1) || '/';
+  return cookieKeyOf(cookie.name, parsed.hostname, path);
 }
 
 /**
@@ -320,7 +349,10 @@ export const storageTools = defineTools({
       '/some/page gives path "/some/"), and an https url marks the cookie secure, so it will not be sent over http. ' +
       'Pass domain and path explicitly when either matters. This tool does NOT reload the page: a page already open ' +
       'will not re-read cookies by itself, so call reload or navigate afterwards for the app to see them. The result ' +
-      'reports the cookies as they now exist in the jar, read back, not the request echoed.',
+      'reports the cookies as they now exist in the jar, read back, not the request echoed. The read-back matches ' +
+      'each requested cookie by its FULL identity, name, domain and path together, not by name alone: cookie names ' +
+      'like "session" or "sid" collide across domains constantly, and matching by name alone would report a cookie ' +
+      'as installed just because a same-named cookie for a different domain already sat in the jar.',
     inputSchema: z.object({
       sessionId,
       cookies: z
@@ -380,12 +412,18 @@ export const storageTools = defineTools({
       await target.session.context.addCookies(args.cookies);
 
       // Read the jar back and report the entries matching what was asked
-      // for. A cookie the browser rejected outright (sameSite "None" without
-      // secure, say) is simply absent here, which is the point of reading back.
-      const wanted = new Set(args.cookies.map(c => c.name));
+      // for, keyed on the full name+domain+path identity rather than name
+      // alone. Matching by name alone let a cookie the browser genuinely
+      // rejected (sameSite "None" without secure, say) read as installed
+      // whenever an unrelated, same-named cookie for a different domain
+      // already sat in the jar: the jar filter found THAT cookie and this
+      // tool reported it as if it were the one just requested.
       const jar = await target.session.context.cookies();
-      const cookies = jar.filter(c => wanted.has(c.name));
-      const missing = [...wanted].filter(name => !cookies.some(c => c.name === name));
+      const jarByKey = new Map(jar.map(c => [cookieKey(c), c] as const));
+      const cookies = [...new Set(args.cookies.map(requestedCookieKey))]
+        .map(key => jarByKey.get(key))
+        .filter((c): c is Cookie => c !== undefined);
+      const missing = args.cookies.filter(c => !jarByKey.has(requestedCookieKey(c))).map(c => c.name);
 
       return text({
         sessionId: args.sessionId,
@@ -398,7 +436,9 @@ export const storageTools = defineTools({
               note:
                 `The browser did not keep ${missing.join(', ')}. A cookie is dropped silently when its attributes ` +
                 'contradict each other, most often sameSite "None" without secure: true, or a domain that does not ' +
-                'match the url. Trust "cookies", not the request.'
+                'match the url. This is also what a genuinely rejected cookie looks like when a same-named cookie ' +
+                'for a different domain or path already exists: "missing" is computed on the full name, domain and ' +
+                'path triple, so that case is not hidden by the coincidence. Trust "cookies", not the request.'
             }
           : {})
       });
