@@ -1280,7 +1280,19 @@ export class SessionStore {
     const record = this.getRecord(sessionId);
     const previousActive = record.activePageId;
     const page = await record.context.newPage();
-    const pageId = this.adoptPage(record, page);
+    // Same shape as everything else in this round: the tab exists in Chromium
+    // the moment newPage resolves, and adoptPage is what makes it reachable
+    // through list_tabs and close_tab. A throw in between (a listener
+    // registration failing, a page that died on arrival) would leave a tab
+    // open in the context that no tool can name, let alone close, until the
+    // whole session is released.
+    let pageId: string;
+    try {
+      pageId = this.adoptPage(record, page);
+    } catch (err) {
+      await page.close().catch(() => {});
+      throw err;
+    }
     record.activePageId = pageId;
     if (url !== undefined) {
       try {
@@ -1607,10 +1619,8 @@ export class SessionStore {
     const chained = (previous ?? Promise.resolve()).then(() => held);
     this.inputLocks.set(sessionId, chained);
 
-    if (previous) await previous.catch(() => {});
-
     let released = false;
-    return () => {
+    const releaseLock = (): void => {
       if (released) return;
       released = true;
       release();
@@ -1618,6 +1628,24 @@ export class SessionStore {
       // long-lived session does not accumulate one entry per session forever.
       if (this.inputLocks.get(sessionId) === chained) this.inputLocks.delete(sessionId);
     };
+
+    // The lock is published above, so from here on every exit must either
+    // hand the releaser back or call it. What this guards is not a leak but a
+    // permanent deadlock: `chained` settles only when `held` does, `held`
+    // settles only when the releaser runs, and the releaser only escapes this
+    // function through the return below. A throw in between would leave every
+    // later input call on the session queued behind a promise that can never
+    // settle, and nothing short of releasing the session would clear it. The
+    // await is already defensive, so this closes the shape rather than a live
+    // bug, which is the right trade when the failure mode is unrecoverable.
+    try {
+      if (previous) await previous.catch(() => {});
+    } catch (err) {
+      releaseLock();
+      throw err;
+    }
+
+    return releaseLock;
   }
 
   async releaseSession(sessionId: string): Promise<void> {
