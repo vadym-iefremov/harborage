@@ -167,7 +167,11 @@ function stateFor(ctx: ToolContext, id: string): { state: SessionNetState; targe
     cdp: new Map(),
     closeHooked: new WeakSet()
   };
-  netStates.set(id, state);
+  // Both listeners are registered BEFORE the entry is published, so there is
+  // no window in which netStates holds an entry that nothing will ever remove.
+  // Registered first, the worst case is a listener on a context with no state
+  // behind it, which is inert; published first, a throwing addListener leaks
+  // the entry for the life of the daemon.
   target.session.context.once('close', () => {
     netStates.delete(id);
   });
@@ -176,6 +180,7 @@ function stateFor(ctx: ToolContext, id: string): { state: SessionNetState; targe
   target.session.context.on('page', page => {
     void attachThrottleToPage(state, target, page).catch(() => {});
   });
+  netStates.set(id, state);
   return { state, target };
 }
 
@@ -343,13 +348,50 @@ function hookClose(state: SessionNetState, page: Page): void {
   });
 }
 
+/**
+ * Attaches a CDP session to one page and enables the Network domain, leaving
+ * NOTHING behind if either step fails.
+ *
+ * The session is recorded in `state.cdp` before the first await that can
+ * throw, because that map is the only handle any teardown path has. Attaching
+ * and enabling first and recording afterwards is what orphaned a session:
+ * `newCDPSession` had already attached it to Chromium, a throwing
+ * `Network.enable` skipped the line that recorded it, and the result was a
+ * live CDP session that release_session, the close hook and syncConditions'
+ * own detach loop could all no longer see. Verified against real Chromium:
+ * after a failed enable the orphan still answered Runtime.evaluate, and the
+ * next attempt attached a SECOND session to the same page. Same defect class
+ * as the BrowserContext a rejected create_session used to leak, one layer
+ * down, and it matters for the same reason: this daemon is shared
+ * machine-wide, so it accumulates one per attempt across every agent.
+ *
+ * Both callers go through here rather than repeating the sequence, since two
+ * copies of it is how one of them came to be fixed and the other not.
+ */
+async function attachCdp(state: SessionNetState, target: ResolvedTarget, page: Page): Promise<CDPSession> {
+  const cdp = await target.session.context.newCDPSession(page);
+  state.cdp.set(page, cdp);
+  hookClose(state, page);
+  try {
+    await cdp.send('Network.enable');
+  } catch (err) {
+    // Undo the registration as well as the attachment: a session that never
+    // enabled the Network domain must not be handed to emulateNetworkConditions
+    // by the next sync as though it were ready.
+    state.cdp.delete(page);
+    await cdp.detach().catch(() => {
+      // Already gone, or its page died with it. The caller's original failure
+      // is what needs to surface, not this one.
+    });
+    throw err;
+  }
+  return cdp;
+}
+
 /** Attaches to one page and applies the current conditions, if there is anything to apply. */
 async function attachThrottleToPage(state: SessionNetState, target: ResolvedTarget, page: Page): Promise<void> {
   if (state.throttle === null || page.isClosed() || state.cdp.has(page)) return;
-  const cdp = await target.session.context.newCDPSession(page);
-  await cdp.send('Network.enable');
-  state.cdp.set(page, cdp);
-  hookClose(state, page);
+  const cdp = await attachCdp(state, target, page);
   await cdp.send('Network.emulateNetworkConditions', conditionsFor(state));
 }
 
@@ -377,10 +419,7 @@ async function syncConditions(
       // Nothing to throttle and nothing already attached: leave the tab alone
       // rather than attaching a CDP session just to say "no limits".
       if (state.throttle === null) continue;
-      cdp = await target.session.context.newCDPSession(page);
-      await cdp.send('Network.enable');
-      state.cdp.set(page, cdp);
-      hookClose(state, page);
+      cdp = await attachCdp(state, target, page);
     }
     try {
       await cdp.send('Network.emulateNetworkConditions', conditionsFor(state));
@@ -652,8 +691,22 @@ export const networkTools = defineTools({
             'removed. Call list_route_rules to see the active rules.'
         );
       }
-      const [rule] = state.rules.splice(index, 1) as [RuleRecord];
+      // Unrouted BEFORE the rule leaves the bookkeeping, because that record
+      // holds the ONLY reference to the handler function Playwright needs in
+      // order to remove the interceptor. Splicing first and unrouting after
+      // meant a failed unroute discarded that reference while the interceptor
+      // stayed registered, so the route went on being mocked for the life of
+      // the context with nothing able to take it off. Proved against a real
+      // page: after a failed unroute, list_route_rules reported no rules and
+      // the request was still answered by the mock rather than the server.
+      // clear_route_rules already did these two steps in this order.
+      const rule = state.rules[index] as RuleRecord;
       await target.session.context.unroute(rule.pattern, rule.handler);
+      // Re-found rather than reusing `index`: the await above is a suspension
+      // point, and another call on this session may have changed the array
+      // while it ran.
+      const current = state.rules.indexOf(rule);
+      if (current !== -1) state.rules.splice(current, 1);
       return text({
         sessionId: args.sessionId,
         removed: describeRule(rule, -1),
