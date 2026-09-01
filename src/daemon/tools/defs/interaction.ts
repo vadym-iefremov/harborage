@@ -36,6 +36,7 @@ interface PageElement {
   clientWidth?: number;
   clientHeight?: number;
   matches(selector: string): boolean;
+  getAttribute(name: string): string | null;
   // Loosely typed on purpose: the real DOM signature takes a Node, and the
   // test tsconfig does pull in lib.dom, so anything narrower stops these
   // callbacks type-checking under it.
@@ -334,6 +335,79 @@ async function resolvePointerPoint(
   return hasX
     ? { selector, x: box.x + (spec.x as number), y: box.y + (spec.y as number) }
     : { selector, x: box.x + box.width / 2, y: box.y + box.height / 2 };
+}
+
+/** How a covering element is named, the same shape element_box's occludedBy uses. */
+interface TopmostElement {
+  tagName: string;
+  id: string;
+  classes: string | null;
+}
+
+/**
+ * Whether a resolved pointer point really belongs to the element a caller named, and what
+ * is there if it does not.
+ *
+ * resolvePointerPoint only ever measures a bounding box: it has no opinion on what is drawn
+ * on top of that box, so a selector that used to be safe to press stays "resolved" correctly
+ * even after a modal or a loading spinner covers it completely. The mouse still goes to the
+ * right coordinates; the coordinates just no longer belong to the element the caller thinks
+ * they do. element_box catches exactly this for a plain click target with elementFromPoint,
+ * and this reuses the same test rather than inventing a second one.
+ *
+ * The match is deliberately wider than element_box's topmostAtCentre, which only accepts the
+ * element itself or a descendant of it. A descendant is still accepted here for the same
+ * reason (a click aimed at a <button>'s centre is received by whatever inline element paints
+ * there, and the button still opens). An ANCESTOR is accepted too, which topmostAtCentre is
+ * not asked to do: a selector can legitimately name a node nested inside the thing that
+ * really receives pointer events, such as a label inside a bigger draggable region, or a
+ * canvas whose interactive overlay is the target's own parent. Rejecting that as an
+ * "occlusion" would turn a normal, working drag into a false failure. Anything that is
+ * neither the target, an ancestor, nor a descendant of it really is a different element
+ * receiving the gesture, and that is what gets reported.
+ *
+ * A raw x/y endpoint names no element, so there is nothing to compare against: matchesTarget
+ * comes back null rather than false, which would read as a failure that was never checked.
+ * elementAtPoint is still filled in when something is there, purely as a diagnostic: a canvas
+ * drag that silently does nothing is much faster to debug once you know the point actually
+ * landed on a debug banner rather than the canvas.
+ */
+async function hitTestPointerPoint(
+  page: Page,
+  point: PointerPoint
+): Promise<{ matchesTarget: boolean | null; elementAtPoint: TopmostElement | null }> {
+  if (point.selector === undefined) {
+    const elementAtPoint = await page.evaluate((arg: { x: number; y: number }) => {
+      const hit = document.elementFromPoint(arg.x, arg.y);
+      return hit ? { tagName: String(hit.tagName).toLowerCase(), id: hit.id || '', classes: hit.getAttribute('class') } : null;
+    }, point);
+    return { matchesTarget: null, elementAtPoint };
+  }
+
+  // A fresh locator rather than the one resolvePointerPoint already built: this runs
+  // immediately afterwards against the same page, so it resolves to the same element, and
+  // reusing it here would mean threading a Locator through resolvePointerPoint's return
+  // value for every caller that never needs it.
+  const locator = page.locator(point.selector);
+  return locator.evaluate((el: PageElement, arg: { x: number; y: number }) => {
+    const hit = document.elementFromPoint(arg.x, arg.y);
+    if (!hit) return { matchesTarget: false, elementAtPoint: null };
+    const matchesTarget = hit === el || el.contains(hit) || hit.contains(el);
+    return {
+      matchesTarget,
+      elementAtPoint: matchesTarget
+        ? null
+        : { tagName: String(hit.tagName).toLowerCase(), id: hit.id || '', classes: hit.getAttribute('class') }
+    };
+  }, point);
+}
+
+/** How `elementAtPoint` is named in a sentence, for the note a mismatched hit test writes. */
+function describeElement(el: TopmostElement | null): string {
+  if (!el) return 'nothing that elementFromPoint could find';
+  const id = el.id ? ` id=${JSON.stringify(el.id)}` : '';
+  const classes = el.classes ? ` class=${JSON.stringify(el.classes)}` : '';
+  return `<${el.tagName}${id}${classes}>`;
 }
 
 /** A pointer endpoint's schema, shared by drag's source and target and by wheel's point, so all three mean the same thing. */
@@ -1029,7 +1103,9 @@ export const interactionTools = defineTools({
   drag: defineTool({
     serializesInput: true,
     description:
-      'Drag from one point to another in a session\'s tab with a real mouse: press, several intermediate moves, release. One atomic gesture, not a separate grab and drop, because a half-finished drag leaves the page in a state nothing else here can recover. Covers BOTH kinds of dragging: pointer-event canvases (React Flow, dnd-kit, d3-drag, anything moving an element from pointermove) and native HTML5 drag-and-drop (draggable="true" with dragstart/dragover/drop). The same mouse sequence drives both, so there is no mode to choose. Source and target each take a selector (the element\'s centre), a raw x/y viewport point (for a region of a canvas that is not a DOM element), or a selector plus x/y (an offset inside it, e.g. a node\'s drag handle). IF THE DRAG APPEARS TO DO NOTHING, in this order: raise "steps", because most drag libraries spend the first move activating the drag and only start following on later ones, so too few moves fires every event and moves nothing; set "holdMs" if the app uses a long-press or delay-activated drag, which cancels outright when the pointer moves too soon; set "settleMs" if the drop lands but the app has not finished reacting; check the coordinates in the result, which are where the mouse really went. Returns the resolved source and target points, plus \'nativeDrag\': true when the browser ran the gesture as a native HTML5 drag rather than as pointer events, which tells a canvas drag that did nothing exactly why. Clears any existing text selection before pressing, deliberately: a press landing inside a selection left over from an earlier drag makes the browser drag that selection instead, and the page then sees no pointermove at all. Does NOT wait for either element to appear: call wait_for first. Does NOT verify that anything moved, so assert the page state yourself afterwards.',
+      'Drag from one point to another in a session\'s tab with a real mouse: press, several intermediate moves, release. One atomic gesture, not a separate grab and drop, because a half-finished drag leaves the page in a state nothing else here can recover. Covers BOTH kinds of dragging: pointer-event canvases (React Flow, dnd-kit, d3-drag, anything moving an element from pointermove) and native HTML5 drag-and-drop (draggable="true" with dragstart/dragover/drop). The same mouse sequence drives both, so there is no mode to choose. Source and target each take a selector (the element\'s centre), a raw x/y viewport point (for a region of a canvas that is not a DOM element), or a selector plus x/y (an offset inside it, e.g. a node\'s drag handle). IF THE DRAG APPEARS TO DO NOTHING, in this order: raise "steps", because most drag libraries spend the first move activating the drag and only start following on later ones, so too few moves fires every event and moves nothing; set "holdMs" if the app uses a long-press or delay-activated drag, which cancels outright when the pointer moves too soon; set "settleMs" if the drop lands but the app has not finished reacting; check the coordinates in the result, which are where the mouse really went. Returns the resolved source and target points, plus \'nativeDrag\': true when the browser ran the gesture as a native HTML5 drag rather than as pointer events, which tells a canvas drag that did nothing exactly why. ' +
+      'A resolved selector is only a bounding box, and a box says nothing about what is drawn on top of it, so BOTH endpoints are hit-tested with elementFromPoint before the mouse ever moves, the same test element_box runs for a plain click target. sourceHit and targetHit each carry matchesTarget (true when the point really belongs to the named selector, an ancestor of it, or a descendant of it; null for a raw x/y endpoint, which names nothing to compare against) and elementAtPoint (what is really there, named the way element_box\'s occludedBy is, whenever that differs from a clean match). When a selector\'s point does not reach its own element the top-level result carries "matched": false and a "note" naming the endpoint and what covered it instead, so a press that silently lands on a modal or a loading overlay cannot read as a normal drag. This does NOT throw for an occluded endpoint: a canvas point that is deliberately under a transparent hit-testing overlay, or a selector naming a node nested inside the thing that truly receives the gesture, are both real drags, so check "matched" rather than assuming a resolved call pressed what it was asked to. ' +
+      'Clears any existing text selection before pressing, deliberately: a press landing inside a selection left over from an earlier drag makes the browser drag that selection instead, and the page then sees no pointermove at all. Does NOT wait for either element to appear: call wait_for first. Does NOT verify that anything moved, so assert the page state yourself afterwards.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -1080,6 +1156,15 @@ export const interactionTools = defineTools({
       const from = await resolvePointerPoint(target.page, args.source, 'drag', 'source', timeout);
       const to = await resolvePointerPoint(target.page, args.target, 'drag', 'target', timeout);
 
+      // Checked before the mouse ever moves, not after: an overlay that would swallow the
+      // press is true right now, and pressing anyway would tell it the drag succeeded no
+      // matter what the covering element does with the event. mouse.move/down/up bypass
+      // Playwright's own actionability checks entirely (that is the whole reason this tool
+      // exists, to reach a pointer-event canvas rather than a Locator), so nothing else here
+      // would ever have caught this.
+      const sourceHit = await hitTestPointerPoint(target.page, from);
+      const targetHit = await hitTestPointerPoint(target.page, to);
+
       const steps = args.steps ?? 20;
       const holdMs = args.holdMs ?? 0;
       const settleMs = args.settleMs ?? 0;
@@ -1117,22 +1202,56 @@ export const interactionTools = defineTools({
       }
       const nativeDrag = await readDragProbe(target.page);
 
+      // Occlusion is reported, not thrown on, and that is a deliberate choice rather than
+      // an oversight: a canvas point deliberately sitting under a transparent hit-testing
+      // overlay, or a selector naming a child of the element that actually receives the
+      // gesture, are both legitimate drags that a hard failure would break for no reason.
+      // What matters is that a caller can never mistake "the mouse visited the coordinates"
+      // for "the press reached the element it was told to press", so a mismatch is
+      // surfaced loudly in the result instead: the same matched/note shape fill, wheel and
+      // every other tool in this file already use for "it ran, but not on what you meant".
+      const mismatched = (['source', 'target'] as const).filter(
+        which => (which === 'source' ? sourceHit : targetHit).matchesTarget === false
+      );
+      const anySelectorGiven = from.selector !== undefined || to.selector !== undefined;
+
+      // Two independent things can each want to attach a note (an occluded endpoint, and a
+      // native drag), and a result only has one "note" field. Building the notes as a list
+      // and joining them, rather than two separate spreads each keyed "note", is what stops
+      // the second one from silently overwriting the first: object spread applies keys in
+      // the order they are listed, so two literal `note:` spreads back to back would lose
+      // whichever one lost that race, and that is precisely the kind of thing this tool
+      // exists to never do to a caller.
+      const notes: string[] = [];
+      if (mismatched.length > 0) {
+        notes.push(
+          `The press did not land on the ${mismatched.join(' or ')} selector's own element: ` +
+            mismatched
+              .map(which => `at ${which}, ${describeElement((which === 'source' ? sourceHit : targetHit).elementAtPoint)} received it instead`)
+              .join('; ') +
+            '. Coordinates still went where the box math said, but something else was really on top of the point at press time, which is exactly how a modal, a loading overlay or a sibling drawn later swallows a drag while this call still reports a clean gesture. If that element is meant to be there (a transparent hit-testing overlay over a canvas, say) this is not a failure; otherwise raise its z-index down out of the way or point the selector at what is really on top.'
+        );
+      }
+      if (nativeDrag) {
+        notes.push(
+          'The browser ran this as a NATIVE HTML5 drag (a dragstart fired), not as a stream of pointer events. That is correct for a draggable="true" element with a drop handler. It is the wrong mechanism for a canvas library, which sees no pointermove at all while a native drag is in flight: something under the press point is draggable by default, such as an image or a link.'
+        );
+      }
+
       return text({
         pageId: target.pageId,
         source: from,
         target: to,
+        sourceHit,
+        targetHit,
         steps,
         holdMs,
         settleMs,
         button,
         ...(modifiers.length > 0 ? { modifiers } : {}),
         nativeDrag,
-        ...(nativeDrag
-          ? {
-              note:
-                'The browser ran this as a NATIVE HTML5 drag (a dragstart fired), not as a stream of pointer events. That is correct for a draggable="true" element with a drop handler. It is the wrong mechanism for a canvas library, which sees no pointermove at all while a native drag is in flight: something under the press point is draggable by default, such as an image or a link.'
-            }
-          : {})
+        ...(anySelectorGiven ? { matched: mismatched.length === 0 } : {}),
+        ...(notes.length > 0 ? { note: notes.join(' ') } : {})
       });
     }
   }),
@@ -1284,7 +1403,8 @@ export const interactionTools = defineTools({
   wheel: defineTool({
     serializesInput: true,
     description:
-      'Turn the mouse wheel in a session\'s tab, which is how a canvas is zoomed and how anything with its own scroll container is scrolled. WHERE the wheel lands matters and is not incidental: a canvas zooms toward the pointer, so "point" takes the same shape as drag\'s endpoints (a selector, a raw x/y viewport point, or a selector plus an offset inside it). Omitting it aims at the centre of the viewport, deliberately, rather than at wherever some earlier click or hover happened to leave the pointer. deltaY is positive to scroll down and negative to scroll up, deltaX positive to scroll right, matching a real wheel. MODIFIERS ARE THE PINCH: a browser delivers a trackpad pinch as a wheel event with ctrlKey set, and canvas libraries branch on exactly that, so modifiers: ["Control"] is the only way to test the zoom path in an app whose plain wheel pans. They are held for the whole gesture and released afterwards. Use "repeat" when one large delta and several small ones are not the same thing, which is common: libraries that accumulate deltas, debounce, or clamp per event behave differently, and "delay" spaces the events out for one that debounces. Always reads back what really moved: the result carries the point used, the total deltas dispatched, the scroll offsets before and after (for the page and for whichever container the browser would actually scroll at that point), and "moved". Note that "moved": false is CORRECT for a canvas zoom, because a zoom is a CSS transform rather than a scroll and nothing here can observe it generically: assert the app\'s own state for that. It is a real failure if you expected a scroll. Does NOT dispatch a pinch gesture, a touch event, or a smooth scroll animation of its own.',
+      'Turn the mouse wheel in a session\'s tab, which is how a canvas is zoomed and how anything with its own scroll container is scrolled. WHERE the wheel lands matters and is not incidental: a canvas zooms toward the pointer, so "point" takes the same shape as drag\'s endpoints (a selector, a raw x/y viewport point, or a selector plus an offset inside it). Omitting it aims at the centre of the viewport, deliberately, rather than at wherever some earlier click or hover happened to leave the pointer. deltaY is positive to scroll down and negative to scroll up, deltaX positive to scroll right, matching a real wheel. MODIFIERS ARE THE PINCH: a browser delivers a trackpad pinch as a wheel event with ctrlKey set, and canvas libraries branch on exactly that, so modifiers: ["Control"] is the only way to test the zoom path in an app whose plain wheel pans. They are held for the whole gesture and released afterwards. Use "repeat" when one large delta and several small ones are not the same thing, which is common: libraries that accumulate deltas, debounce, or clamp per event behave differently, and "delay" spaces the events out for one that debounces. Always reads back what really moved: the result carries the point used, the total deltas dispatched, the scroll offsets before and after (for the page and for whichever container the browser would actually scroll at that point), and "moved". Note that "moved": false is CORRECT for a canvas zoom, because a zoom is a CSS transform rather than a scroll and nothing here can observe it generically: assert the app\'s own state for that. It is a real failure if you expected a scroll. ' +
+      'Resolving "point" only measures a box, it says nothing about what is drawn on top of it, and mouse.wheel dispatches at raw coordinates with none of Playwright\'s own actionability checks in the way, so the point is hit-tested with elementFromPoint before the event fires, the same test element_box runs for a plain click target. "pointHit" carries matchesTarget (true when the point really belongs to the named selector, an ancestor of it, or a descendant of it; null when point has no selector, which names nothing to compare against) and elementAtPoint (what is really there, named the way element_box\'s occludedBy is, whenever that differs from a clean match, or just informationally for a selector-less point when something is cheap to report). When a selector\'s point does not reach its own element the result carries "matched": false and a "note" naming what covered it, so a wheel that silently scrolled or zoomed the wrong container cannot read as having hit the one asked for. This does NOT throw for an occluded point: a canvas point deliberately under a transparent hit-testing overlay is a real target, so check "matched" rather than assuming a resolved call landed where it was aimed. Does NOT dispatch a pinch gesture, a touch event, or a smooth scroll animation of its own.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -1348,6 +1468,13 @@ export const interactionTools = defineTools({
             y: Math.round(window.innerHeight / 2)
           }));
 
+      // Same reason drag hit-tests before pressing: resolving "point" only measures a box,
+      // it does not check what is actually drawn on top of it, and mouse.wheel dispatches
+      // at raw coordinates with none of Playwright's own actionability checks in the way.
+      // Run even when the point has no selector: elementFromPoint is cheap, and it can be
+      // the difference between "the zoomed canvas got the event" and "a debug banner did".
+      const pointHit = await hitTestPointerPoint(target.page, point);
+
       const repeat = args.repeat ?? 1;
       const delay = args.delay ?? 0;
       const modifiers = args.modifiers ?? [];
@@ -1374,9 +1501,27 @@ export const interactionTools = defineTools({
       const after = await readSettledScrollState(target.page, point.x, point.y);
       const moved = !sameScrollState(before, after);
 
+      // Two independent things can each want a note (the point missing its own element, and
+      // a scroll that did not move), and joined into a list rather than each being a separate
+      // spread with its own "note" key for the same reason drag's notes are: two literal
+      // `note:` spreads back to back would let the second one silently overwrite the first.
+      const notes: string[] = [];
+      if (pointHit.matchesTarget === false) {
+        notes.push(
+          `The wheel event did not land on the point's own selector's element: ${describeElement(pointHit.elementAtPoint)} received it instead. ` +
+            'Coordinates still went where the box math said, but something else was really on top of the point when the event fired, which would make the wheel scroll or zoom whatever that covering element is rather than the one named. If that element is meant to be there (a transparent hit-testing overlay over a canvas, say) this is not a failure; otherwise raise its z-index down out of the way or point the selector at what is really on top.'
+        );
+      }
+      if (!moved) {
+        notes.push(
+          'No scroll offset changed. That is expected and correct for a canvas zoom, which is a CSS transform rather than a scroll and cannot be observed generically here: assert the app\'s own zoom state instead. If a scroll WAS expected, the usual causes are the point not being over the scrollable element, the element already being at that end of its range, or the app requiring a modifier this call did not hold.'
+        );
+      }
+
       return text({
         pageId: target.pageId,
         point,
+        pointHit,
         deltaX,
         deltaY,
         repeat,
@@ -1386,12 +1531,8 @@ export const interactionTools = defineTools({
         totalDeltaY: deltaY * repeat,
         scroll: { before, after },
         moved,
-        ...(moved
-          ? {}
-          : {
-              note:
-                'No scroll offset changed. That is expected and correct for a canvas zoom, which is a CSS transform rather than a scroll and cannot be observed generically here: assert the app\'s own zoom state instead. If a scroll WAS expected, the usual causes are the point not being over the scrollable element, the element already being at that end of its range, or the app requiring a modifier this call did not hold.'
-            })
+        ...(point.selector !== undefined ? { matched: pointHit.matchesTarget !== false } : {}),
+        ...(notes.length > 0 ? { note: notes.join(' ') } : {})
       });
     }
   })
