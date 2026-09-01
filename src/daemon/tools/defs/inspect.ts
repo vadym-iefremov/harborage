@@ -1526,20 +1526,36 @@ export const inspectTools = defineTools({
                     hitTestPoint = { x: Math.round(centreX * 100) / 100, y: Math.round(centreY * 100) / 100 };
                     hitTestPointIsCentre = centreX === trueX && centreY === trueY;
                     // document.elementFromPoint retargets into the shadow host for
-                    // ANYTHING inside a shadow tree, open or closed. Measured
-                    // against real Chromium: a plain unoccluded <button> inside an
-                    // open shadow root, nothing on top of it, still came back with
-                    // hit equal to its own host <div id="host">, topmostAtCentre
-                    // false and occludedBy naming the host, a fabricated overlay
-                    // on every web component on the page. hit.contains(element)
-                    // alone would fix that, but it would ALSO wave through a real
+                    // ANYTHING inside a shadow tree, open or closed, and
+                    // Node.contains() does not cross that boundary the other way:
+                    // confirmed directly against real Chromium, a shadow host does
+                    // not contain() its own shadow content, because a node's parent
+                    // inside a shadow tree is the shadow root, not the host. So a
+                    // plain unoccluded <button> inside an open shadow root, nothing
+                    // on top of it, came back with hit equal to its own host
+                    // <div id="host">, topmostAtCentre false and occludedBy naming
+                    // the host, a fabricated overlay on every web component on the
+                    // page. Loosening the check to also accept hit.contains(element)
+                    // would not have rescued that case either, for the same reason:
+                    // it still needs hit to actually BE (an ancestor of) element,
+                    // and the host never is. What actually fixes it is recovering
+                    // the real topmost node so the comparison has something true to
+                    // find, which is also what keeps a real overlay honest: an
                     // overlay sitting on top of the element inside the SAME shadow
-                    // root, because that overlay retargets to the identical host
-                    // too. ShadowRoot.elementFromPoint, unlike Document's, does not
-                    // retarget, so re-querying the same point against
+                    // root drills down to become `hit` itself, a SIBLING of
+                    // element, not an ancestor, so it still fails every comparison
+                    // and is reported as the occluder. ShadowRoot.elementFromPoint,
+                    // unlike Document's, does not retarget, so re-querying the same
+                    // point against
                     // hit.shadowRoot recovers what is actually topmost inside the
                     // shadow tree, and repeating it handles shadow roots nested in
-                    // shadow roots.
+                    // shadow roots. hitTestPointerPoint in interaction.ts (drag and
+                    // wheel's hit test) runs the identical drill for the identical
+                    // reason; kept as a second copy rather than a shared helper
+                    // because both run as in-page snippets under a tsconfig with no
+                    // dom lib, each with its own minimal element shim, so sharing
+                    // would cost more than it saves. If one changes, change the
+                    // other.
                     let hit = document.elementFromPoint(centreX, centreY);
                     let shadowDrillDepth = 0;
                     while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function' && shadowDrillDepth < 20) {

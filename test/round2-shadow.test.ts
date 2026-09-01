@@ -23,6 +23,18 @@ import { getFreePort } from './helpers.js';
  * #shadowFrameHost's shadow root holds an <iframe>, whose inner page has
  * "Confirm payment"; the main (light DOM) page has "Delete account", for
  * find's frame-scoped selector.
+ * #shadowDragNode / #shadowDragOverlay: a miniature pointer-event drag
+ * sensor and a real overlay, both inside the SAME shadow root, for
+ * hitTestPointerPoint's own version of the shadowOccludedButton trap: drag
+ * and wheel hit-test through document.elementFromPoint too, and
+ * hit.contains(el) alone (needed so an unoccluded shadow element does not
+ * read as occluded by its own host) also waves an in-root overlay through,
+ * since it retargets to the identical host.
+ * #shadowScrollBox / #shadowScrollOverlay: a scrollable container and a real
+ * overlay, both inside the SAME shadow root, for the identical trap on
+ * wheel's "point". #shadowScrollBoxClean is the same container with nothing
+ * on top of it, so readScrollState's own shadow-boundary blindness (it never
+ * used to look inside a shadow root at all) has something to prove against.
  */
 const INNER_FRAME_HTML = `<!doctype html>
 <html><body>
@@ -55,7 +67,35 @@ const OUTER_HTML = `<!doctype html>
         'Occluded button' +
       '</button>' +
       '<div id="shadowOverlay" style="position: absolute; inset: 0; width: 100%; height: 100%; background: rgba(0, 0, 0, 0.01);"></div>' +
+    '</div>' +
+    '<div id="shadowDragWrap" style="position: fixed; left: 20px; top: 220px; width: 120px; height: 50px;">' +
+      '<div id="shadowDragNode" style="position: absolute; left: 0px; top: 0px; width: 100%; height: 100%; background: rgb(51, 153, 255);"></div>' +
+      '<div id="shadowDragOverlay" style="position: absolute; inset: 0; width: 100%; height: 100%; background: rgba(0, 0, 0, 0.01);"></div>' +
+    '</div>' +
+    '<div id="shadowScrollBox" style="position: fixed; left: 160px; top: 220px; width: 150px; height: 80px; overflow: auto; border: 1px solid rgb(153, 153, 153);">' +
+      '<div style="height: 400px;">tall content</div>' +
+    '</div>' +
+    '<div id="shadowScrollOverlay" style="position: fixed; left: 160px; top: 220px; width: 150px; height: 80px; background: rgba(0, 0, 0, 0.01);"></div>' +
+    '<div id="shadowScrollBoxClean" style="position: fixed; left: 320px; top: 220px; width: 150px; height: 80px; overflow: auto; border: 1px solid rgb(153, 153, 153);">' +
+      '<div style="height: 400px;">tall content</div>' +
     '</div>';
+
+  // A real pointer-event drag sensor in miniature, the same shape
+  // round2-pointer.test.ts's own #occludedNode fixture uses, just queried
+  // off the shadow root: without it a covered node moving anyway would hide
+  // the exact bug this fixture exists to reproduce.
+  var dragNode = root.getElementById('shadowDragNode');
+  var shadowDragging = false, shadowStartX = 0, shadowOriginLeft = 0;
+  dragNode.addEventListener('pointerdown', function (e) {
+    shadowDragging = true;
+    shadowStartX = e.clientX;
+    shadowOriginLeft = dragNode.offsetLeft;
+  });
+  window.addEventListener('pointermove', function (e) {
+    if (!shadowDragging) return;
+    dragNode.style.left = (shadowOriginLeft + e.clientX - shadowStartX) + 'px';
+  });
+  window.addEventListener('pointerup', function () { shadowDragging = false; });
 
   var frameHost = document.getElementById('shadowFrameHost');
   var frameRoot = frameHost.attachShadow({ mode: 'open' });
@@ -113,6 +153,12 @@ async function freshSession(): Promise<string> {
 
 function payload(result: unknown): Record<string, any> {
   return (result as { structuredContent: Record<string, any> }).structuredContent;
+}
+
+/** Evaluates an expression in the session's tab and returns its value. */
+async function evaluate<T>(sessionId: string, expression: string): Promise<T> {
+  const result = await handlers.evaluate({ sessionId, expression });
+  return payload(result).result as T;
 }
 
 // ---------------------------------------------------------------------------
@@ -227,6 +273,118 @@ test('element_box still catches a real overlay sitting on top of a shadow-DOM el
   assert.equal(el.topmostAtCentre, false, 'the overlay genuinely swallows the click; the fix must not blind the check to real occlusion');
   assert.ok(el.occludedBy, 'occludedBy must name something');
   assert.equal(el.occludedBy.id, 'shadowOverlay', `expected the overlay to be named, got ${JSON.stringify(el.occludedBy)}`);
+
+  await sessions.releaseSession(sessionId);
+});
+
+// ---------------------------------------------------------------------------
+// Defect 5 (this round): hitTestPointerPoint, drag and wheel's own shared hit
+// test, has to run the same shadow drill element_box does.
+//
+// Confirmed directly against real Chromium, running these four tests
+// against the pre-fix code: without the drill, hit.contains(el) does NOT
+// cross the shadow boundary (Node.contains() follows parentNode, and a
+// shadow root's host is not its content's parentNode), so
+// document.elementFromPoint's retargeting to the host made EVERY selector
+// inside a shadow root read as occluded by that host, occluded or not.
+// #shadowDragNode and #shadowScrollBox, which have nothing genuinely wrong
+// with them, failed matchesTarget before this fix exactly like
+// #shadowOccludedButton did before element_box's own fix. The drill fixes
+// both directions at once: an unoccluded element now compares correctly
+// against the real topmost node instead of the host, and a real overlay
+// sitting on top of it INSIDE THE SAME shadow root is still caught and
+// named, rather than either being missed or misattributed to the host.
+// ---------------------------------------------------------------------------
+
+test('drag names the overlay covering a source inside a shadow root, in the same root as the target', async () => {
+  const sessionId = await freshSession();
+  const startLeft = await evaluate<number>(
+    sessionId,
+    "document.getElementById('shadowHost').shadowRoot.getElementById('shadowDragNode').offsetLeft"
+  );
+
+  const body = payload(
+    await handlers.drag({ sessionId, source: { selector: '#shadowDragNode' }, target: { x: 500, y: 500 }, steps: 5 })
+  );
+
+  assert.equal(
+    body.sourceHit.matchesTarget,
+    false,
+    'the overlay lives in the SAME shadow root as the target, so it retargets to the identical host and must not be waved through by hit.contains(el)'
+  );
+  assert.ok(body.sourceHit.elementAtPoint, 'elementAtPoint must name something');
+  assert.equal(
+    body.sourceHit.elementAtPoint.id,
+    'shadowDragOverlay',
+    `expected the overlay to be named, got ${JSON.stringify(body.sourceHit.elementAtPoint)}`
+  );
+  assert.equal(body.matched, false, 'a mismatched endpoint has to fail the top-level matched flag, not just a nested one');
+  assert.equal(typeof body.note, 'string');
+  assert.match(String(body.note), /shadowDragOverlay/, 'the note has to name what really received the press');
+
+  // The trap this fixture exists to catch: without the fix, this call reported matched: true
+  // for exactly this gesture, while the node underneath, provably, never moved at all.
+  const endLeft = await evaluate<number>(
+    sessionId,
+    "document.getElementById('shadowHost').shadowRoot.getElementById('shadowDragNode').offsetLeft"
+  );
+  assert.equal(endLeft, startLeft, 'the overlay really did swallow the gesture: the node underneath never moved, which is the silent false pass a flipped flag alone would not prove');
+
+  await sessions.releaseSession(sessionId);
+});
+
+test('drag reports a clean pass for an unoccluded element inside a shadow root', async () => {
+  const sessionId = await freshSession();
+
+  const body = payload(
+    await handlers.drag({ sessionId, source: { selector: '#shadowOkButton' }, target: { x: 500, y: 500 }, steps: 5 })
+  );
+
+  assert.equal(body.sourceHit.matchesTarget, true, 'an unoccluded shadow-DOM element must not read as occluded by its own host');
+  assert.equal(body.sourceHit.elementAtPoint, null);
+  assert.equal(body.matched, true);
+  assert.ok(!('note' in body), 'a clean, non-native drag must carry no note at all');
+
+  await sessions.releaseSession(sessionId);
+});
+
+test('wheel names the overlay covering a point inside a shadow root, in the same root as the scrollable container', async () => {
+  const sessionId = await freshSession();
+
+  const body = payload(await handlers.wheel({ sessionId, point: { selector: '#shadowScrollBox' }, deltaY: 50 }));
+
+  assert.equal(
+    body.pointHit.matchesTarget,
+    false,
+    'the overlay lives in the SAME shadow root as the scroll box, so it retargets to the identical host and must not be waved through'
+  );
+  assert.ok(body.pointHit.elementAtPoint, 'elementAtPoint must name something');
+  assert.equal(body.pointHit.elementAtPoint.id, 'shadowScrollOverlay', `expected the overlay to be named, got ${JSON.stringify(body.pointHit.elementAtPoint)}`);
+  assert.equal(body.matched, false);
+  assert.match(String(body.note), /shadowScrollOverlay/, 'the note has to name the real coverer');
+
+  // The overlay is not itself scrollable, so nothing actually scrolled either: both signals
+  // agree this event never reached the box.
+  assert.equal(body.moved, false);
+
+  await sessions.releaseSession(sessionId);
+});
+
+test('wheel reports a clean pass and a real scroll for an unoccluded scrollable container inside a shadow root', async () => {
+  const sessionId = await freshSession();
+
+  const body = payload(await handlers.wheel({ sessionId, point: { selector: '#shadowScrollBoxClean' }, deltaY: 50 }));
+
+  assert.equal(body.pointHit.matchesTarget, true, 'an unoccluded shadow-DOM point must not read as occluded by its own host');
+  assert.equal(body.pointHit.elementAtPoint, null);
+  assert.equal(body.matched, true);
+  assert.ok(!('note' in body), 'a clean pass that really scrolled needs no note');
+
+  // Exercises readScrollState's own shadow-boundary blindness: document.elementFromPoint
+  // retargets straight to the shadow host, which is not itself scrollable, so without
+  // drilling through hit.shadowRoot the walk would never find #shadowScrollBoxClean at all
+  // and this would report moved: false for a scroll that genuinely happened.
+  assert.equal(body.moved, true, 'readScrollState must drill into the shadow root to find the real scrollable container, not stop at its host');
 
   await sessions.releaseSession(sessionId);
 });
