@@ -113,6 +113,37 @@ For a bug fix, write the test that fails first, then fix it. Several tests in
 the suite exist because a QA agent recorded a false pass, and each one is
 named after the lie it caught.
 
+### A probe that cannot tell fixed from broken is not evidence
+
+Write the check, then run it against the **unfixed** code and confirm it
+fails. If it passes both before and after, it is measuring nothing, and a
+green result from it means only that it was run.
+
+This is not hypothetical caution. Three separate probes in one round graded
+against the wrong thing and all three reported the same verdict on fixed and
+broken code:
+
+- one asserted a value that nothing could ever produce, so it always failed
+  and looked like a permanent defect;
+- one compared a store by array index, on a canvas whose library reorders
+  that array, so it always disagreed;
+- one asserted a specific field value where the fix had deliberately changed
+  the field to a refusal, so it kept reporting the old shape as broken.
+
+A fourth was a malformed fixture: a `srcdoc` attribute URL-encoded where it
+needed HTML-encoding, so the element under test never existed and the probe
+timed out against a page that was fine.
+
+Two habits that catch all four:
+
+1. **Grade the property, not the value.** "Must not report a clean hit"
+   survives a fix that changes `false` to `null`. `=== false` does not.
+2. **Verify the fixture before trusting the verdict.** If a probe reports a
+   failure, confirm the thing it is pointing at actually exists and is
+   painted before concluding the code is wrong. A probe that fails because
+   its own page is broken is worse than no probe, because it sends someone
+   to fix working code.
+
 ### Running more than one suite at a time: use `./suitelock.sh`
 
 ```sh
