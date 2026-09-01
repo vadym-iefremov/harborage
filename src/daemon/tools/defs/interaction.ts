@@ -78,13 +78,55 @@ declare const window: {
 const formControlTags = ['INPUT', 'TEXTAREA', 'SELECT'];
 
 /**
- * The select-all chord a real user would press on this machine. Derived
- * rather than hardcoded: Chromium binds select-all to Meta on macOS and to
- * Control everywhere else, and pressing the wrong one selects nothing at all,
- * silently turning a "replace" back into the append that `fill` exists to
- * prevent.
+ * The modifier this machine's own browser binds its editing accelerators to:
+ * Meta on macOS, Control everywhere else. Pressing the other one does not
+ * throw, it just presses a chord the browser has no accelerator bound to, and
+ * that is a trap `press_key` shares with the select-all logic below: a chord
+ * built on the wrong platform's modifier reports an ordinary success and
+ * silently does nothing.
  */
-const selectAllChord = `${process.platform === 'darwin' ? 'Meta' : 'Control'}+a`;
+const platformAcceleratorModifier = process.platform === 'darwin' ? 'Meta' : 'Control';
+
+/** The other one: the modifier that looks plausible but is not this platform's own. */
+const nonAcceleratorModifier = platformAcceleratorModifier === 'Meta' ? 'Control' : 'Meta';
+
+/**
+ * The select-all chord a real user would press on this machine. Derived
+ * rather than hardcoded, for the reason `platformAcceleratorModifier` above
+ * exists: pressing the wrong one selects nothing at all, silently turning a
+ * "replace" back into the append that `fill` exists to prevent.
+ */
+const selectAllChord = `${platformAcceleratorModifier}+a`;
+
+/**
+ * Why `press_key` should not be trusted at face value when the caller reached
+ * for a specific modifier: null when the chord is fine as is, otherwise the
+ * note to attach.
+ *
+ * The chord itself is never rewritten: a page can genuinely listen for
+ * ctrl+A on its own regardless of what the OS binds, and silently swapping
+ * the modifier would be its own false pass, reporting success for a chord
+ * that was never actually pressed. What this catches instead is the trap a
+ * page cannot save the caller from: Control+a on macOS presses cleanly and
+ * selects nothing, because the browser has no built-in accelerator on that
+ * chord at all, so the call reports an ordinary success while nothing
+ * happened. ControlOrMeta is exempt: Playwright itself resolves it to
+ * whichever modifier is this platform's own, so it is never the wrong one.
+ */
+function nonAcceleratorChordNote(key: string): string | null {
+  const modifiers = key.split('+').slice(0, -1);
+  if (modifiers.includes('ControlOrMeta')) return null;
+  if (modifiers.includes(platformAcceleratorModifier)) return null;
+  if (!modifiers.includes(nonAcceleratorModifier)) return null;
+  return (
+    `This chord's modifier is "${nonAcceleratorModifier}", but ${process.platform}'s own accelerator modifier is ` +
+    `"${platformAcceleratorModifier}". The press above did not throw, and it also did not trigger a browser ` +
+    `built-in editing accelerator (select-all and the rest all bind to ${platformAcceleratorModifier} here), so a ` +
+    'chord built for one of those can succeed and do nothing at all. Use ' +
+    `"${platformAcceleratorModifier}+..." for this platform specifically, or "ControlOrMeta+..." for the portable ` +
+    'form that resolves to the right modifier on every platform.'
+  );
+}
 
 /** Playwright's navigation wait conditions, shared by navigate and reload. */
 const waitUntil = z
@@ -946,7 +988,15 @@ export const interactionTools = defineTools({
       pageId,
       key: z
         .string()
-        .describe('Key or chord in Playwright syntax, e.g. "Tab", "Enter", "Escape", "ArrowDown", "Control+A", "Shift+Tab".'),
+        .describe(
+          'Key or chord in Playwright syntax: Enter, Escape, ArrowDown, Backspace, a, Shift+Tab, and so on. Some ' +
+            'names are stricter than they look: Return and Esc both throw ("Unknown key"), it is Enter and Escape. ' +
+            'Cmd throws too, it is Meta. A modifier chord that merely presses fine is not the same as one that does ' +
+            'anything: Control+a on a platform whose select-all is bound to Meta reports an ordinary success and ' +
+            'selects nothing, because the browser has no accelerator on that chord at all. Use ControlOrMeta+ for a ' +
+            'platform editing accelerator (select-all and the rest): Playwright resolves it to Meta on macOS and ' +
+            'Control everywhere else, so it does the right thing on every platform this runs on.'
+        ),
       selector: z
         .string()
         .optional()
@@ -981,12 +1031,15 @@ export const interactionTools = defineTools({
         };
       });
 
+      const note = nonAcceleratorChordNote(args.key);
       return text({
         pageId: target.pageId,
         key: args.key,
         repeat,
+        platform: process.platform,
         activeElement,
-        focusVisible: activeElement?.focusVisible ?? false
+        focusVisible: activeElement?.focusVisible ?? false,
+        ...(note ? { note } : {})
       });
     }
   }),
