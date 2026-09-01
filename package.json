@@ -19,8 +19,8 @@
     "build": "tsc -p tsconfig.json && chmod +x dist/client/cli.js",
     "prepare": "npm run build",
     "daemon": "npm run build && node dist/daemon/index.js",
-    "test": "npm run build && tsx --test test/*.test.ts",
-    "test:watch": "tsx --test --watch test/*.test.ts",
+    "test": "npm run build && tsx --test --test-force-exit --test-timeout=180000 test/*.test.ts",
+    "test:watch": "tsx --test --watch --test-force-exit --test-timeout=180000 test/*.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json"
   },
   "dependencies": {

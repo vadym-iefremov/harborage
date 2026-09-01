@@ -46,8 +46,15 @@ export async function makeTestConfig(overrides: Partial<Config> = {}): Promise<C
     requestTimeoutFloorMs: 60 * 1000,
     sweepIntervalMs: 60 * 1000,
     shutdownGraceMs: 10 * 1000,
+    // No owner by default. Individual `Config` objects here are used for
+    // in-process sweeps as often as for spawned daemons, and an in-process
+    // sweep watching the test process that owns it would shut itself down
+    // instantly. `spawnDaemonProcess` sets the owner in the child's
+    // environment instead, where it belongs.
+    ownerPid: null,
     stateDir,
     registryPath: join(stateDir, 'registry.json'),
+    ownedProcessesPath: join(stateDir, 'owned-processes.json'),
     daemonLogPath: join(stateDir, 'daemon.log'),
     screenshotCacheDir: join(stateDir, 'screenshots'),
     screenshotCacheTtlMs: 30 * 60 * 1000,
@@ -119,17 +126,154 @@ export interface SpawnedProcess {
   stderrText: () => string;
 }
 
-/** Spawns a long-lived, otherwise-inert Node process: a stand-in "client" with a real, controllable PID. */
+/**
+ * Every process this module has spawned and not yet seen exit, so cleanup
+ * never depends on an individual test remembering to kill its own fixture.
+ *
+ * This set exists because of a measured, machine-wide failure. Two fixtures
+ * in registry-and-shutdown.test.ts were spawned, then killed several lines
+ * later, with load-sensitive assertions in between. On a loaded machine one
+ * of those assertions failed, the kill was skipped, and the surviving child's
+ * handle held its test file's event loop open forever: the file never exited,
+ * the runner waited on it, and `npm test` never returned. When the run was
+ * eventually killed by hand, the test file and its fixture both reparented to
+ * PID 1 and stayed there. Six such fixtures and ten such test-file processes
+ * were alive at once on the developer's machine, the oldest 42 minutes old.
+ *
+ * Tracking centrally rather than per test is the point: a helper that
+ * registers what it spawned cannot be forgotten, an `after()` hook that only
+ * kills what a test remembered to hand it can.
+ */
+const spawnedProcs = new Set<ChildProcess>();
+
+function track(proc: ChildProcess): void {
+  spawnedProcs.add(proc);
+  proc.once('exit', () => spawnedProcs.delete(proc));
+}
+
+/**
+ * SIGKILLs every process spawned by this module that is still alive, by
+ * explicit PID. Safe to call repeatedly. Returns the PIDs it signalled.
+ *
+ * Deliberately by PID and only over processes we ourselves spawned. Never by
+ * name or command-line pattern: an earlier round of this project lost the
+ * shared daemon out from under every other agent to exactly that mistake.
+ */
+export function killSpawnedProcesses(): number[] {
+  const killed: number[] = [];
+  for (const proc of [...spawnedProcs]) {
+    const pid = proc.pid;
+    if (pid === undefined || proc.exitCode !== null || proc.signalCode !== null) continue;
+    try {
+      process.kill(pid, 'SIGKILL');
+      killed.push(pid);
+    } catch {
+      // Already gone between the liveness check and the signal. Nothing to do.
+    }
+  }
+  return killed;
+}
+
+// The last line of defence, and the one that does not depend on any test hook
+// running: whatever else happened, nothing this process spawned outlives it.
+// `exit` handlers must be synchronous, which `process.kill` is.
+process.once('exit', () => {
+  killSpawnedProcesses();
+});
+for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+  process.once(signal, () => {
+    killSpawnedProcesses();
+    process.exit(1);
+  });
+}
+
+/**
+ * The body of the inert fixture process, as a `node -e` program.
+ *
+ * It watches its own parent rather than trusting the parent to kill it. The
+ * `process.ppid` getter reads the live value from the OS on every access, so
+ * when the parent dies this becomes 1 (or whatever reaps orphans on the
+ * platform) and the fixture exits on its own within a quarter second.
+ * Verified directly: the parent was SIGKILLed, which runs no handler in the
+ * parent at all, and the fixture still exited by itself.
+ *
+ * This is the half of the fix that does not rely on any code running in the
+ * parent. `killSpawnedProcesses` covers the parent exiting cleanly; this
+ * covers the parent being killed outright, which is exactly how the leaked
+ * fixtures found on the developer's machine came to have parent PID 1.
+ *
+ * The expected parent arrives in the environment rather than being read from
+ * `process.ppid` at startup, and that is not incidental. Reading it at startup
+ * loses a race that a first version of this actually lost in a real test run:
+ * if the parent dies during the few tens of milliseconds Node takes to boot,
+ * the fixture reads its parent as 1, compares 1 against 1 forever, and becomes
+ * precisely the immortal orphan it was written to prevent. A value captured by
+ * the parent BEFORE the child existed cannot be the post-death value.
+ *
+ * It never signals another process, only itself, so it carries no PID-reuse
+ * hazard: a recycled parent PID would at worst make it exit, which is the safe
+ * direction. `harborage-test-fixture` is in the command line so a human
+ * reading `ps` can tell what these are. That string is a label for people, not
+ * a kill criterion for code.
+ */
+export const inertFixtureParentEnvVar = 'HARBORAGE_FIXTURE_PARENT_PID';
+
+export const inertFixtureProgram = [
+  '/* harborage-test-fixture */',
+  `const expected = Number(process.env.${inertFixtureParentEnvVar});`,
+  '// No expected parent given: fall back to whatever we were born under, which',
+  '// is still better than never checking at all.',
+  'const parent = Number.isInteger(expected) && expected > 0 ? expected : process.ppid;',
+  'const check = () => { if (process.ppid !== parent) process.exit(0); };',
+  '// Immediately as well as on the interval, so a fixture that was already',
+  '// orphaned before its first tick does not linger for a quarter second.',
+  'check();',
+  'setInterval(check, 250);'
+].join('\n');
+
+/**
+ * Spawns a long-lived, otherwise-inert Node process: a stand-in "client" with
+ * a real, controllable PID.
+ *
+ * Tracked (see `spawnedProcs`), so it dies with this test process even if the
+ * test that made it never reaches its own `kill()`.
+ *
+ * Deliberately NOT `unref`ed, which was tried and reverted. Unrefing does stop
+ * a leaked child from pinning the event loop, but it also lets the loop drain
+ * while a test is still awaiting `exited`, and Node then tears the run down
+ * with "Promise resolution is still pending but the event loop has already
+ * resolved". The pinning problem is handled where it belongs instead, by
+ * `--test-force-exit` in the `test` script, which bounds the whole run rather
+ * than one handle at a time.
+ */
 export function spawnInertProcess(): SpawnedProcess {
-  const proc = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+  const proc = spawn(process.execPath, ['-e', inertFixtureProgram], {
+    stdio: 'ignore',
+    env: { ...process.env, [inertFixtureParentEnvVar]: String(process.pid) }
+  });
   const exited = new Promise<number | null>(resolve => {
     proc.once('exit', code => resolve(code));
   });
   if (proc.pid === undefined) throw new Error('failed to spawn inert process: no pid');
+  track(proc);
   return { proc, pid: proc.pid, exited, kill: () => proc.kill('SIGKILL'), stderrText: () => '' };
 }
 
-/** Spawns the real daemon entrypoint against `config`, with extra env overrides layered on top. */
+/**
+ * Spawns the real daemon entrypoint against `config`, with extra env
+ * overrides layered on top.
+ *
+ * `HARBORAGE_OWNER_PID` is set to this test process, which ties the daemon's
+ * life to the test that made it (see `ownerPid` in `src/shared/config.ts`).
+ * Without it, a daemon holding a live browser session whose test process died
+ * sat there for the full fifteen-minute idle timeout with a Chromium
+ * attached, because an empty client registry alone cannot shut a daemon down
+ * while a session is live. Production never sets this variable, so the shared
+ * machine-wide daemon keeps exactly the lifetime it had.
+ *
+ * A test that genuinely needs a daemon outliving its parent can still pass
+ * `HARBORAGE_OWNER_PID: ''` in `extraEnv` to opt out.
+ */
 export function spawnDaemonProcess(config: Config, extraEnv: Record<string, string> = {}): SpawnedProcess {
   const proc = spawn(
     process.execPath,
@@ -152,6 +296,7 @@ export function spawnDaemonProcess(config: Config, extraEnv: Record<string, stri
         HARBORAGE_SHUTDOWN_GRACE_MS: String(config.shutdownGraceMs),
         HARBORAGE_STATE_DIR: config.stateDir,
         HARBORAGE_REGISTRY_PATH: config.registryPath,
+        HARBORAGE_OWNED_PROCESSES_PATH: config.ownedProcessesPath,
         HARBORAGE_DAEMON_LOG_PATH: config.daemonLogPath,
         HARBORAGE_SCREENSHOT_CACHE_DIR: config.screenshotCacheDir,
         HARBORAGE_SCREENSHOT_CACHE_TTL_MS: String(config.screenshotCacheTtlMs),
@@ -160,6 +305,7 @@ export function spawnDaemonProcess(config: Config, extraEnv: Record<string, stri
         HARBORAGE_DIALOG_BUFFER_SIZE: String(config.dialogBufferSize),
         HARBORAGE_PAGE_ERROR_BUFFER_SIZE: String(config.pageErrorBufferSize),
         HARBORAGE_TEST_STARTUP_DELAY_MS: String(config.testStartupDelayMs),
+        HARBORAGE_OWNER_PID: String(process.pid),
         ...extraEnv
       }
     }
@@ -172,6 +318,7 @@ export function spawnDaemonProcess(config: Config, extraEnv: Record<string, stri
     proc.once('exit', code => resolve(code));
   });
   if (proc.pid === undefined) throw new Error('failed to spawn daemon: no pid');
+  track(proc);
   return {
     proc,
     pid: proc.pid,
@@ -240,6 +387,7 @@ export function wrapperEnv(config: Config, extra: Record<string, string> = {}): 
     HARBORAGE_SHUTDOWN_GRACE_MS: String(config.shutdownGraceMs),
     HARBORAGE_STATE_DIR: config.stateDir,
     HARBORAGE_REGISTRY_PATH: config.registryPath,
+    HARBORAGE_OWNED_PROCESSES_PATH: config.ownedProcessesPath,
     HARBORAGE_DAEMON_LOG_PATH: config.daemonLogPath,
     HARBORAGE_SCREENSHOT_CACHE_DIR: config.screenshotCacheDir,
     HARBORAGE_SCREENSHOT_CACHE_TTL_MS: String(config.screenshotCacheTtlMs),

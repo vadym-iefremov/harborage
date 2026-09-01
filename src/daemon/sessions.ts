@@ -475,6 +475,18 @@ export interface SessionSummary {
 }
 
 /**
+ * The live-session count at which the daemon logs a one-off high-water-mark
+ * line. Twelve, because a parallel QA fan-out of six to eight agents is the
+ * shape this pool was built for and must stay unremarkable, while double that
+ * is worth a line in the log for whoever is reading it after the fact.
+ *
+ * Logged exactly once per daemon, on the transition to this count, rather than
+ * on every create above it: a threshold that fires repeatedly becomes the
+ * wallpaper that hides everything else in the log.
+ */
+const highSessionCountWarningThreshold = 12;
+
+/**
  * Holds every live session (one Playwright `BrowserContext` per session,
  * possibly multiple tabs/pages each) in memory, keyed by sessionId.
  *
@@ -1151,6 +1163,31 @@ export class SessionStore {
 
     this.sessions.set(sessionId, record);
     this.logger.log('session.create', { sessionId, sessions: this.sessions.size });
+
+    // A warning, not a cap, and deliberately so.
+    //
+    // Sessions here are BrowserContexts inside one shared Chromium, not
+    // separate browsers: the expensive thing a session adds is a renderer per
+    // open tab, not another 300MB browser process. So the load a single daemon
+    // can produce grows far more slowly than the session count suggests, and
+    // refusing a create_session would deny a legitimate parallel fan-out the
+    // one thing this pool exists to serve, with the worst possible failure
+    // shape: one subagent in a fan-out fails while its siblings succeed, at a
+    // point where nothing sensible can be done about it.
+    //
+    // Overload on this machine came from running several DAEMONS at once, one
+    // per test worktree, not from one daemon serving many sessions. A cap here
+    // would not have prevented any of it. What a cap cannot do and a line in
+    // the log can is tell whoever reads daemon.log afterwards that the pool
+    // was carrying an unusual amount at the time.
+    if (this.sessions.size === highSessionCountWarningThreshold) {
+      this.logger.log('sessions.high-water-mark', {
+        sessions: this.sessions.size,
+        note:
+          'this daemon is carrying an unusual number of live browser contexts; not an error and nothing is refused, ' +
+          'but sessions nobody releases are reaped only at the idle timeout, so release them when done'
+      });
+    }
     return { sessionId, pageId };
   }
 

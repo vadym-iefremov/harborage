@@ -105,10 +105,53 @@ export interface Config {
    * fires before the client that just spawned the daemon has registered.
    */
   shutdownGraceMs: number;
+  /**
+   * A PID whose death should take this daemon down with it, or `null` (the
+   * default, and the only value production ever uses) for the ordinary
+   * machine-wide daemon whose lifetime nothing else owns.
+   *
+   * The shared daemon deliberately outlives the client wrapper that spawned
+   * it: wrappers come and go with each Claude Code session, browser sessions
+   * do not, and that independence is the whole point of the pool. So
+   * `spawnDaemon` never sets this, and strips it from the environment it
+   * passes on, because a wrapper's own PID ending up here would silently undo
+   * that design.
+   *
+   * It exists for the case where a daemon genuinely does belong to one
+   * process: a test. A test spawns a daemon on a free port and kills it in an
+   * `after()` hook, and a hook that never runs (the test threw, the runner was
+   * killed, the machine was too loaded for a health check to answer inside its
+   * timeout) used to leave that daemon running. An empty client registry alone
+   * cannot reap it either, because a live browser session vetoes the
+   * registry-empty shutdown by design, so a stranded test daemon holding one
+   * session sat on a Chromium for the full fifteen-minute idle timeout.
+   * Naming the owner means the daemon notices for itself instead of depending
+   * on somebody else's cleanup code getting to run.
+   *
+   * Checked with the same pid-plus-start-time guard the client registry uses,
+   * so a recycled PID cannot make a daemon believe a dead owner is still
+   * alive, and an owner that cannot be read at startup is treated as "no
+   * owner" rather than as "owner already dead": refusing to start, or exiting
+   * immediately, would be a far worse failure than not having the watch.
+   */
+  ownerPid: number | null;
   /** Directory holding the registry file and daemon log. `~/.harborage` by default. */
   stateDir: string;
   /** Path to the shared client registry file. */
   registryPath: string;
+  /**
+   * Path to the daemon's owned-process ledger: the record of which OS
+   * processes this daemon has itself started, so they can be identified and
+   * reaped later even after the daemon that owned them is gone.
+   *
+   * This is what makes `harborage gc` safe. Once a daemon dies its Chromium
+   * reparents to PID 1 and every trace of who started it is gone from the
+   * process table, and the only way left to identify it would be matching its
+   * command line, which would also match every unrelated Playwright browser on
+   * the machine. A ledger the daemon writes about itself is provenance we
+   * actually own.
+   */
+  ownedProcessesPath: string;
   /** Path the detached daemon's stdout/stderr get redirected to. */
   daemonLogPath: string;
   /** Directory `screenshot`'s `mode: 'cached'` writes PNGs to. `~/.harborage/screenshots` by default. */
@@ -180,6 +223,20 @@ function str(name: string, fallback: string): string {
 }
 
 /**
+ * An optional PID-valued variable. Unset, empty, or not a positive integer all
+ * mean "absent" rather than being an error, because the one thing worse than a
+ * daemon with no owner watch is a daemon that refuses to start over a typo in
+ * a variable nothing in production sets.
+ */
+function optionalPid(name: string): number | null {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return null;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) return null;
+  return parsed;
+}
+
+/**
  * Builds a `Config` from environment variables, applying documented
  * defaults for anything unset. Called once at process startup in both the
  * daemon and the client wrapper; tests construct their own `Config` objects
@@ -198,8 +255,10 @@ export function loadConfig(): Config {
     requestTimeoutFloorMs: num('HARBORAGE_REQUEST_TIMEOUT_FLOOR_MS', 60 * 1000),
     sweepIntervalMs: num('HARBORAGE_SWEEP_INTERVAL_MS', 60 * 1000),
     shutdownGraceMs: num('HARBORAGE_SHUTDOWN_GRACE_MS', 10 * 1000),
+    ownerPid: optionalPid('HARBORAGE_OWNER_PID'),
     stateDir,
     registryPath: str('HARBORAGE_REGISTRY_PATH', join(stateDir, 'registry.json')),
+    ownedProcessesPath: str('HARBORAGE_OWNED_PROCESSES_PATH', join(stateDir, 'owned-processes.json')),
     daemonLogPath: str('HARBORAGE_DAEMON_LOG_PATH', join(stateDir, 'daemon.log')),
     screenshotCacheDir: str('HARBORAGE_SCREENSHOT_CACHE_DIR', join(stateDir, 'screenshots')),
     screenshotCacheTtlMs: num('HARBORAGE_SCREENSHOT_CACHE_TTL_MS', 4 * 60 * 60 * 1000),
