@@ -254,6 +254,18 @@ interface ProbeElement {
   // test tsconfig does pull in lib.dom, so anything narrower stops these
   // callbacks type-checking under it.
   contains(other: any): boolean;
+  // True once the node is connected all the way to a document, following
+  // shadow trees the way the spec requires. Used to tell a chain that
+  // stopped at the real document root from one that stopped because the
+  // element is detached (mid-mutation, or removed).
+  isConnected: boolean;
+  // Real signature returns Node, which is not this interface, but callers
+  // here only ever read .host off the result, and both a Document and a
+  // ShadowRoot structurally satisfy "optionally has a host".
+  getRootNode(): { host?: ProbeElement };
+  // Present (possibly null, for a closed root) on any element that is
+  // itself a shadow host. Absent entirely on one that is not.
+  shadowRoot?: { elementFromPoint?(x: number, y: number): ProbeElement | null } | null;
 }
 
 declare const document: {
@@ -1071,6 +1083,13 @@ export const inspectTools = defineTools({
       'an overlay paints on top (element_box\'s topmostAtCentre is what catches that last one). It composites ' +
       'background-color and opacity only, up to the document root of the frame the element is in, onto the canvas the ' +
       'browser really paints behind the page, and it reports colours it could not parse rather than guessing. ' +
+      'The ancestor walk crosses shadow boundaries: an element inside an open or closed shadow root has its chain ' +
+      'continued through the shadow host, not stopped at the shadow root, because that host is what genuinely ' +
+      'paints behind it. Measured against real Chromium: text at rgb(30, 30, 30) inside a shadow root on a page ' +
+      'painted rgb(10, 10, 10), a real ratio of about 1.1:1 and unreadable, used to stop at the shadow root and ' +
+      'report a confident 16.67:1 AA pass composited onto an assumed white canvas. On the rare occasion the chain ' +
+      'still cannot reach the document (a detached element being measured mid-mutation), effective.layerChainIncomplete ' +
+      'is true and the ratio should be read as unreliable rather than final. ' +
       'Colour syntaxes understood: rgb()/rgba() and hsl()/hsla() in both the legacy comma form and the modern ' +
       'space form with a slash alpha, hwb(), lab(), lch(), oklab(), oklch(), color() in the predefined spaces ' +
       'srgb, srgb-linear, display-p3, a98-rgb, prophoto-rgb, rec2020, xyz, xyz-d50 and xyz-d65, and the keyword ' +
@@ -1088,8 +1107,10 @@ export const inspectTools = defineTools({
       'dark-mode page that paints no background of its own composites onto rgb(18, 18, 18) the way it looks on ' +
       'screen; effective.canvasColor reports which one was used. Reading it appends a zero-sized node to the ' +
       'document for the length of one getComputedStyle call and removes it again, the same kind of temporary ' +
-      'mutation the states option makes. When any of the unmodelled features above are in play the ratio is a ' +
-      'strong hint, not a verdict: look at a screenshot too.',
+      'mutation the states option makes. If that read itself fails, canvasReadFailed is true on the top-level ' +
+      'result and the assumed-white fallback is used, so a dark-mode page whose canvas could not be read is not ' +
+      'mistaken for one that was genuinely measured white. When any of the unmodelled features above are in play ' +
+      'the ratio is a strong hint, not a verdict: look at a screenshot too.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -1163,6 +1184,10 @@ export const inspectTools = defineTools({
         color: string;
         fontSizePx: number;
         fontWeight: number;
+        // False when the ancestor walk below could not reach the document,
+        // most often a detached element mid-mutation. See where this is
+        // consumed for what that means for the reported ratio.
+        reachedRoot: boolean;
       }
 
       const read = (): Promise<StyleProbe[]> =>
@@ -1185,7 +1210,24 @@ export const inspectTools = defineTools({
                   backgroundColor: style.getPropertyValue('background-color'),
                   opacity: style.getPropertyValue('opacity')
                 });
-                node = node.parentElement;
+                const parent: ProbeElement | null = node.parentElement;
+                if (parent) {
+                  node = parent;
+                  continue;
+                }
+                // parentElement stops dead at a shadow boundary: the top node
+                // inside an open OR closed shadow root has parentElement null
+                // even though it is visually painted directly on top of its
+                // host. Measured against real Chromium: a <span> at
+                // rgb(30, 30, 30) inside a shadow root, on a page painted
+                // rgb(10, 10, 10) (a real ratio of about 1.1:1, unreadable),
+                // used to stop the walk right there and composite onto an
+                // assumed white canvas, reporting a confident 16.6712:1 AA
+                // pass. getRootNode().host steps across the boundary onto the
+                // host element, which is what actually paints behind the
+                // shadow tree, and the loop continues climbing from there.
+                const rootNode = node.getRootNode();
+                node = rootNode.host ?? null;
               }
               layers.reverse();
               if (arg.pseudoElement) {
@@ -1207,7 +1249,14 @@ export const inspectTools = defineTools({
                 layers,
                 color: own.getPropertyValue('color'),
                 fontSizePx: parseFloat(own.getPropertyValue('font-size')),
-                fontWeight: parseFloat(own.getPropertyValue('font-weight'))
+                fontWeight: parseFloat(own.getPropertyValue('font-weight')),
+                // isConnected follows shadow trees the way the spec requires,
+                // so it is true for an element inside a shadow root whose
+                // host is itself in the document. Checked on the element
+                // itself rather than at each step of the walk above: if the
+                // element is connected, the walk is guaranteed to reach the
+                // document by climbing parentElement and shadow hosts alone.
+                reachedRoot: element.isConnected
               });
             }
             return out;
@@ -1222,7 +1271,17 @@ export const inspectTools = defineTools({
 
       // Asked of the frame the elements are in, not of the page: a same-origin
       // iframe can carry its own color-scheme.
-      const rawCanvas = await root.evaluate<string>(CANVAS_COLOR_PROBE).catch(() => 'rgb(255, 255, 255)');
+      let canvasReadFailed = false;
+      const rawCanvas = await root.evaluate<string>(CANVAS_COLOR_PROBE).catch(() => {
+        // A previous round (748d000) replaced an assumed-white canvas with a
+        // real read specifically because dark-mode pages were being reported
+        // as passing AA on text nobody could read. If the read itself throws
+        // (a detached frame, a mid-navigation race), falling back to the same
+        // white silently reintroduces exactly that bug with no trace of it in
+        // the payload. canvasReadFailed makes the fallback visible instead.
+        canvasReadFailed = true;
+        return 'rgb(255, 255, 255)';
+      });
       const parsedCanvas = parseCssColor(rawCanvas);
       const canvasColor: Rgba = parsedCanvas ?? { ...opaqueWhite };
 
@@ -1282,6 +1341,15 @@ export const inspectTools = defineTools({
                     'Chromium paints on an sRGB screen. The ratio is right for that rendering. On a wide-gamut ' +
                     'display the colour shown is not exactly this one.'
                 }
+              : {}),
+            ...(probe.reachedRoot === false
+              ? {
+                  layerChainIncomplete: true,
+                  layerChainWarning:
+                    'The ancestor walk used to build this stack did not reach the document, most likely because ' +
+                    'the element is detached from the page (removed, or measured mid-mutation). There is no real ' +
+                    'canvas behind it to composite onto, so the ratio below is not reliable.'
+                }
               : {})
           },
           contrast: {
@@ -1305,6 +1373,15 @@ export const inspectTools = defineTools({
         matched,
         returned: elements.length,
         properties,
+        ...(canvasReadFailed
+          ? {
+              canvasReadFailed: true,
+              canvasWarning:
+                'The page\'s Canvas system colour could not be read, so every element below falls back to an ' +
+                'assumed rgb(255, 255, 255) background. On a dark-mode page that fallback is wrong, and every ' +
+                'ratio composited against it is unreliable.'
+            }
+          : {}),
         elements
       });
     }
@@ -1326,8 +1403,12 @@ export const inspectTools = defineTools({
       'not a paint test: false means something else would receive a click there, and occludedBy names it, which is ' +
       'how a fully transparent overlay that swallows clicks gets caught. The mirror case is the one to watch: an ' +
       'opaque overlay with pointer-events: none completely hides an element on screen while this still reports ' +
-      'topmostAtCentre true and occludedBy null, correctly, because the click does reach through it. For "is it ' +
-      'actually visible to a human", take a screenshot. ' +
+      'topmostAtCentre true and occludedBy null, correctly, because the click does reach through it. The hit test ' +
+      'accounts for shadow DOM: an element inside an open or closed shadow root that is genuinely unoccluded ' +
+      'reports topmostAtCentre true and occludedBy null, not the shadow host, because the point is re-tested ' +
+      'against the shadow root itself rather than trusted at the host it retargets to first. An actual overlay ' +
+      'sitting on top of that element inside the same shadow root is still caught, at whatever nesting depth of ' +
+      'shadow roots it is at. For "is it actually visible to a human", take a screenshot. ' +
       'The point tested comes back as hitTestPoint, with hitTestPointIsCentre alongside it, because an element ' +
       'whose centre falls outside the viewport is tested at the nearest point inside it instead: without that, ' +
       'occludedBy could name something sitting nowhere near the middle of the element. ' +
