@@ -10,7 +10,6 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/vadym-iefremov/harborage/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/vadym-iefremov/harborage/actions/workflows/ci.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="MIT licence" src="https://img.shields.io/badge/licence-MIT-0E3B45"></a>
   <img alt="Node 20+" src="https://img.shields.io/badge/node-%E2%89%A520-0E3B45">
 </p>
