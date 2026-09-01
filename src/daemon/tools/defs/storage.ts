@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, stat } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import { domainToASCII } from 'node:url';
 
 import type { Cookie, Page } from 'playwright';
 import * as z from 'zod/v4';
@@ -209,9 +210,69 @@ function storageBase(
 // Cookies
 // ---------------------------------------------------------------------------
 
-/** Identity of one cookie in the jar, which is the triple the browser keys on. */
 /**
- * The full identity of a cookie in the jar.
+ * Chromium's own normalisation of a cookie domain, reproduced from what it
+ * was measured doing rather than from what the cookie spec says it should
+ * do.
+ *
+ * This exists because the read-back used to key a requested cookie on the
+ * caller's `domain` string verbatim. Chromium rewrites that string before it
+ * stores the cookie, so `set_cookies({ domain: ".127.0.0.1" })` installed a
+ * cookie perfectly well, filed it in the jar under "127.0.0.1", missed the
+ * key lookup, and reported a successful install in `missing` with a note
+ * saying the browser had dropped it. Pointing a cookie at an IP literal or
+ * at a single-label host is what you do when you are driving a local dev
+ * server, so the false failure hit the common case.
+ *
+ * Measured against Playwright 1.62 / Chromium by installing each domain and
+ * reading `context.cookies()` back:
+ *
+ *   ".127.0.0.1"        gives "127.0.0.1"            dot dropped
+ *   ".192.168.1.1"      gives "192.168.1.1"          dot dropped
+ *   ".[::1]"            gives "[::1]"                dot dropped
+ *   ".localhost"        gives "localhost"            dot dropped
+ *   ".my-host"          gives "my-host"              dot dropped
+ *   ".example.com"      gives ".example.com"         dot kept
+ *   ".sub.example.com"  gives ".sub.example.com"     dot kept
+ *   ".dev.local"        gives ".dev.local"           dot kept
+ *   ".example.com."     gives ".example.com."        dot kept, trailing dot kept
+ *   ".EXAMPLE.COM"      gives ".example.com"         lowercased
+ *   ".Munchen.de" (IDN) gives ".xn--mnchen-3ya.de"   converted to punycode
+ *
+ * The rule behind it is that the leading dot survives only for a host that
+ * could actually BE a domain cookie, so it is dropped for an IP literal and
+ * for a host with nothing above it to cover. Two measured cases go further
+ * than that shape can express, because Chromium consults the public suffix
+ * list: ".co.uk" is stored as "co.uk" and ".localhost." as "localhost.".
+ * Shipping a copy of the public suffix list to key a read-back would be
+ * absurd, so those are caught by the tolerant fallback in `matchInJar`
+ * instead, which only ever forgives a leading dot the browser removed.
+ */
+const ipv4Literal = /^\d{1,3}(\.\d{1,3}){3}$/;
+
+function normalizeCookieDomain(domain: string): string {
+  const leadingDot = domain.startsWith('.');
+  const host = leadingDot ? domain.slice(1) : domain;
+  // domainToASCII lowercases and punycodes in one step. It returns '' for
+  // anything it will not parse as a domain name, a bracketed IPv6 literal
+  // included, which is what the fallback here is for.
+  const ascii = domainToASCII(host) || host.toLowerCase();
+  if (!leadingDot) return ascii;
+  const cannotBeADomainCookie = ipv4Literal.test(ascii) || ascii.startsWith('[') || !ascii.includes('.');
+  return cannotBeADomainCookie ? ascii : `.${ascii}`;
+}
+
+/** The full identity of a cookie: what the browser keys its jar on. */
+interface CookieIdentity {
+  name: string;
+  /** Already through `normalizeCookieDomain`, never the raw string a caller typed. */
+  domain: string;
+  path: string;
+  partitionKey?: string;
+}
+
+/**
+ * The full identity of a cookie in the jar, as one comparable string.
  *
  * The partition is part of it, not decoration: a partitioned cookie and an
  * unpartitioned one sharing a name, domain and path are two different
@@ -220,12 +281,25 @@ function storageBase(
  * level further in: installing a partitioned cookie would find the
  * unpartitioned one already in the jar and report the write as successful.
  */
-function cookieKeyOf(name: string, domain: string, path: string, partitionKey?: string): string {
-  return `${name} ${domain} ${path} ${partitionKey ?? ''}`;
+function cookieKeyOf(identity: CookieIdentity): string {
+  return `${identity.name} ${identity.domain} ${identity.path} ${identity.partitionKey ?? ''}`;
+}
+
+function identityOf(cookie: Cookie): CookieIdentity {
+  return {
+    name: cookie.name,
+    // Normalising a domain the browser itself reported is a no-op: every
+    // stored form in the table above is already a fixed point of this
+    // function, checked. It runs anyway so that both sides of every
+    // comparison go through exactly one code path.
+    domain: normalizeCookieDomain(cookie.domain),
+    path: cookie.path,
+    partitionKey: (cookie as { partitionKey?: string }).partitionKey
+  };
 }
 
 function cookieKey(cookie: Cookie): string {
-  return cookieKeyOf(cookie.name, cookie.domain, cookie.path, (cookie as { partitionKey?: string }).partitionKey);
+  return cookieKeyOf(identityOf(cookie));
 }
 
 /**
@@ -243,20 +317,145 @@ function cookieKey(cookie: Cookie): string {
  * domain rejected could be reported present because a same-named cookie for
  * an unrelated domain already sat in the jar.
  */
-function requestedCookieKey(cookie: {
+function requestedCookieIdentity(cookie: {
   name: string;
   domain?: string;
   path?: string;
   url?: string;
   partitionKey?: string;
-}): string {
+}): CookieIdentity {
   if (cookie.domain !== undefined && cookie.path !== undefined) {
-    return cookieKeyOf(cookie.name, cookie.domain, cookie.path, cookie.partitionKey);
+    return {
+      name: cookie.name,
+      domain: normalizeCookieDomain(cookie.domain),
+      path: cookie.path,
+      partitionKey: cookie.partitionKey
+    };
   }
   const parsed = new URL(cookie.url as string);
   const lastSlash = parsed.pathname.lastIndexOf('/');
   const path = lastSlash === -1 ? '/' : parsed.pathname.slice(0, lastSlash + 1) || '/';
-  return cookieKeyOf(cookie.name, parsed.hostname, path, cookie.partitionKey);
+  return {
+    name: cookie.name,
+    domain: normalizeCookieDomain(parsed.hostname),
+    path,
+    partitionKey: cookie.partitionKey
+  };
+}
+
+/**
+ * Whether a partition the browser reports is the one that was asked for.
+ *
+ * Chromium stores a partition as the top-level SITE, not as the URL it was
+ * handed: `partitionKey: "https://top.example.com"` comes back from
+ * `context.cookies()` as "https://example.com". Measured, and it is the same
+ * class of false failure as the domain one, one field along, so the
+ * comparison has to allow the browser to have shortened the host to a site
+ * it derived from the public suffix list. It allows shortening only: a
+ * partition the browser reports as MORE specific than the one requested is
+ * a different partition, and must not match.
+ */
+function partitionMatches(requested: string | undefined, stored: string | undefined): boolean {
+  if (requested === undefined) return stored === undefined;
+  if (stored === undefined) return false;
+  if (stored === requested) return true;
+  let requestedUrl: URL;
+  let storedUrl: URL;
+  try {
+    requestedUrl = new URL(requested);
+    storedUrl = new URL(stored);
+  } catch {
+    return false;
+  }
+  if (requestedUrl.protocol !== storedUrl.protocol) return false;
+  return requestedUrl.hostname === storedUrl.hostname || requestedUrl.hostname.endsWith(`.${storedUrl.hostname}`);
+}
+
+/**
+ * The jar entry a requested cookie landed in, or undefined if there is none.
+ *
+ * The exact key covers everything `normalizeCookieDomain` can predict. The
+ * scan below is the residual: the handful of cases where only the public
+ * suffix list decides, ".co.uk" stored as "co.uk", and a partitionKey
+ * shortened to its site. It is deliberately tolerant in ONE direction only,
+ * towards what the browser is known to strip, never towards what a caller
+ * asked for. A request for host-only "example.com" can therefore never be
+ * satisfied by a domain cookie ".example.com" sitting in the jar.
+ *
+ * That tolerance is what would turn finding 5 back into finding 6 if it
+ * stood alone, since a pre-existing host-only cookie can be reached by a
+ * request for the dotted form that the browser actually rejected. The
+ * attribute check in `unhonouredAttributes` is what stops it: the surviving
+ * cookie carries the old value, so it is reported as stale rather than as
+ * the write landing. The one hole left is a rejected dotted write whose
+ * name, path, value and flags all coincide exactly with a host-only cookie
+ * already in the jar, which is as far as this can go without shipping the
+ * public suffix list.
+ */
+function matchInJar(jar: Cookie[], jarByKey: Map<string, Cookie>, identity: CookieIdentity): Cookie | undefined {
+  const exact = jarByKey.get(cookieKeyOf(identity));
+  if (exact) return exact;
+  const withoutDot = identity.domain.startsWith('.') ? identity.domain.slice(1) : null;
+  return jar.find(candidate => {
+    if (candidate.name !== identity.name || candidate.path !== identity.path) return false;
+    if (!partitionMatches(identity.partitionKey, (candidate as { partitionKey?: string }).partitionKey)) return false;
+    const candidateDomain = normalizeCookieDomain(candidate.domain);
+    return candidateDomain === identity.domain || candidateDomain === withoutDot;
+  });
+}
+
+/**
+ * Which of the attributes a caller actually asked for the jar entry does not
+ * carry.
+ *
+ * Being present in the jar under the right identity is not evidence that the
+ * write landed. Chromium does not replace a cookie with one it refuses, it
+ * drops the refused one and leaves the existing cookie alone, so an
+ * overwrite it rejects (sameSite "None" without secure, most often) leaves
+ * the PREVIOUS cookie sitting under exactly the identity that was requested.
+ * The value is not part of the identity, so that read as a clean success:
+ * `missing: null`, no note, and the old value reported back as if it were
+ * the new one. Measured directly against the raw jar: it held "ORIGINAL"
+ * before the rejected write and "ORIGINAL" after it.
+ *
+ * What is compared, and what is deliberately not:
+ *
+ *   value      always. Chromium stores it byte for byte or refuses the whole
+ *              call with an error, measured, so a difference here is never
+ *              the browser tidying up after the caller.
+ *   httpOnly   only when asked for. Same for sameSite: both are stored
+ *   sameSite   exactly as requested when the cookie is accepted, but both
+ *              also have a browser-chosen default (sameSite becomes "Lax"),
+ *              so comparing one that was never requested would report a
+ *              perfectly good cookie as refused.
+ *   secure     only when asked for, and never when the request said
+ *              `secure: false` alongside an https `url`. That pair is a
+ *              contradiction the url wins: measured, a cookie asked for as
+ *              { url: "https://x/", secure: false } is ACCEPTED and stored
+ *              with secure true. Flagging it would announce a refusal for a
+ *              write that landed, which is the false failure this whole
+ *              function is trying not to become.
+ *   expires    NEVER. Chromium rounds it and clamps it to a 400 day cap:
+ *              measured, a request for now plus 10 years came back stored as
+ *              now plus about 400 days, with a fractional part. Comparing it
+ *              would turn every long-lived cookie into a false rejection,
+ *              which is exactly as bad as the false pass this guards.
+ *   domain     never here. Both are part of the identity already, and the
+ *   path       browser's normalisation of them is `matchInJar`'s job.
+ */
+function unhonouredAttributes(
+  request: { value: string; url?: string; httpOnly?: boolean; secure?: boolean; sameSite?: string },
+  stored: Cookie
+): string[] {
+  const differs: string[] = [];
+  if (stored.value !== request.value) differs.push('value');
+  if (request.httpOnly !== undefined && stored.httpOnly !== request.httpOnly) differs.push('httpOnly');
+  const secureCameFromTheUrl = request.secure === false && request.url?.startsWith('https:') === true;
+  if (request.secure !== undefined && stored.secure !== request.secure && !secureCameFromTheUrl) {
+    differs.push('secure');
+  }
+  if (request.sameSite !== undefined && stored.sameSite !== request.sameSite) differs.push('sameSite');
+  return differs;
 }
 
 /**
@@ -360,7 +559,8 @@ export const storageTools = defineTools({
       contextScopedNote +
       ' The usual use is starting a session already logged in without driving the login form. Each cookie needs ' +
       'either a url, or both a domain and a path: with neither, the browser has no idea what the cookie belongs to ' +
-      'and the call is rejected. A cookie with the same name, domain and path as an existing one replaces it. ' +
+      'and the call is rejected. A cookie with the same name, domain and path as an existing one replaces it, unless ' +
+      'the browser refuses the new one, in which case the old one is left standing (see "stale" below). ' +
       'Two things a url does silently that catch people out: the path comes from the url\'s DIRECTORY (a url ending ' +
       '/some/page gives path "/some/"), and an https url marks the cookie secure, so it will not be sent over http. ' +
       'Pass domain and path explicitly when either matters. This tool does NOT reload the page: a page already open ' +
@@ -371,6 +571,19 @@ export const storageTools = defineTools({
       'as installed just because a same-named cookie for a different domain already sat in the jar. The partition ' +
       '(partitionKey) is part of that identity too, since a partitioned cookie is a different cookie from an ' +
       'unpartitioned one with the same name, domain and path. ' +
+      'That identity is compared the way the BROWSER stores it, not the way you spelled it. Chromium lowercases a ' +
+      'domain, converts an international one to punycode, and drops a leading dot from a host that cannot be a ' +
+      'domain cookie, so ".127.0.0.1" and ".localhost" are stored as "127.0.0.1" and "localhost", and it shortens a ' +
+      'partitionKey to its top-level site ("https://top.example.com" becomes "https://example.com"). Those are ' +
+      'successful installs and are reported as such. ' +
+      'Being in the jar is not enough on its own, though: the entry found there is also checked against the value ' +
+      'and against whichever of httpOnly, secure and sameSite you actually asked for. Anything that disagrees comes ' +
+      'back in "stale", naming the attributes that do not match, because the browser drops a cookie it refuses ' +
+      'rather than replacing what is there, so a refused overwrite leaves the PREVIOUS cookie sitting under the ' +
+      'identity you asked for. Those cookies are still listed in "cookies", since that is genuinely what the jar ' +
+      'holds now. "missing" means the other thing, and only that: nothing with that identity is in the jar at all. ' +
+      'expires is deliberately not compared, because Chromium rounds it and caps it at 400 days, so an accepted ' +
+      'cookie routinely stores an expiry different from the one requested. ' +
       'Whatever get_cookies gives you can be handed straight back here: partitionKey and Chromium\'s companion ' +
       '_crHasCrossSiteAncestor are both accepted and passed through to the browser unchanged. They used to be ' +
       'silently stripped, which installed a partitioned cookie as an unpartitioned one and reported success.',
@@ -449,38 +662,92 @@ export const storageTools = defineTools({
         }
       }
 
+      // The jar BEFORE the write, so that "the browser refused this and left
+      // what was already there" can be told apart from "the browser wrote
+      // something other than what was asked for". Without it, a rejected
+      // overwrite and a successful one are the same picture: a cookie with
+      // the right identity sitting in the jar.
+      const before = await target.session.context.cookies();
+      const beforeByKey = new Map(before.map(c => [cookieKey(c), c] as const));
+
       await target.session.context.addCookies(args.cookies);
 
       // Read the jar back and report the entries matching what was asked
-      // for, keyed on the full name+domain+path identity rather than name
-      // alone. Matching by name alone let a cookie the browser genuinely
-      // rejected (sameSite "None" without secure, say) read as installed
-      // whenever an unrelated, same-named cookie for a different domain
-      // already sat in the jar: the jar filter found THAT cookie and this
-      // tool reported it as if it were the one just requested.
+      // for, keyed on the full name+domain+path+partition identity rather
+      // than name alone. Matching by name alone let a cookie the browser
+      // genuinely rejected (sameSite "None" without secure, say) read as
+      // installed whenever an unrelated, same-named cookie for a different
+      // domain already sat in the jar: the jar filter found THAT cookie and
+      // this tool reported it as if it were the one just requested.
       const jar = await target.session.context.cookies();
       const jarByKey = new Map(jar.map(c => [cookieKey(c), c] as const));
-      const cookies = [...new Set(args.cookies.map(requestedCookieKey))]
-        .map(key => jarByKey.get(key))
-        .filter((c): c is Cookie => c !== undefined);
-      const missing = args.cookies.filter(c => !jarByKey.has(requestedCookieKey(c))).map(c => c.name);
+
+      // addCookies applies its array in order, so when one call names the
+      // same identity twice the LAST entry is the one the jar ends up
+      // holding. Judging the earlier ones against the final jar would invent
+      // a rejection that never happened, so only the last request for each
+      // identity is graded.
+      const requests = args.cookies.map(request => ({ request, identity: requestedCookieIdentity(request) }));
+      const lastForKey = new Map<string, number>();
+      requests.forEach((entry, index) => lastForKey.set(cookieKeyOf(entry.identity), index));
+      const graded = requests.filter((entry, index) => lastForKey.get(cookieKeyOf(entry.identity)) === index);
+
+      const cookies: Cookie[] = [];
+      const missing: string[] = [];
+      const stale: { name: string; domain: string; path: string; differs: string[] }[] = [];
+      const unchanged: string[] = [];
+      for (const { request, identity } of graded) {
+        const stored = matchInJar(jar, jarByKey, identity);
+        if (stored === undefined) {
+          missing.push(request.name);
+          continue;
+        }
+        // Reported either way. This is what the jar genuinely holds now, and
+        // hiding a stale cookie would leave a caller unable to see what the
+        // session is actually carrying.
+        cookies.push(stored);
+        const differs = unhonouredAttributes(request, stored);
+        if (differs.length === 0) continue;
+        stale.push({ name: stored.name, domain: stored.domain, path: stored.path, differs });
+        const previous = beforeByKey.get(cookieKey(stored));
+        if (previous !== undefined && previous.value === stored.value) unchanged.push(stored.name);
+      }
+
+      const notes: string[] = [];
+      if (missing.length > 0) {
+        notes.push(
+          `The browser did not keep ${missing.join(', ')}: nothing with that name, domain and path is in the jar at ` +
+            'all. A cookie is dropped silently when its attributes contradict each other, most often sameSite "None" ' +
+            'without secure: true, or a domain that does not match the url, and an expiry in the past deletes rather ' +
+            'than sets. "missing" is computed on the full identity, so a rejected cookie is not hidden by a ' +
+            'same-named cookie for a different domain or path.'
+        );
+      }
+      if (stale.length > 0) {
+        notes.push(
+          `The browser did not accept the write for ${stale.map(s => s.name).join(', ')}. A cookie with that exact ` +
+            'identity IS in the jar and is listed in "cookies", but it does not carry what was asked for, so it is ' +
+            'the OLD cookie rather than the new one: "stale" names the attributes that disagree. Chromium drops a ' +
+            'cookie it refuses instead of replacing what is there, so a refused overwrite leaves the previous value ' +
+            'live.' +
+            (unchanged.length > 0
+              ? ` ${unchanged.join(', ')} ${unchanged.length === 1 ? 'still holds' : 'still hold'} exactly what the ` +
+                'jar held before this call, so treat this session as carrying the old cookie.'
+              : '') +
+            ' Note that expires is not part of this comparison: Chromium rounds it and caps it at 400 days, so an ' +
+            'accepted cookie routinely stores an expiry different from the one requested.'
+        );
+      }
+      if (notes.length > 0) notes.push('Trust "cookies", which is the jar read back, not the request echoed.');
 
       return text({
         sessionId: args.sessionId,
         requested: args.cookies.length,
         cookies,
         totalInJar: jar.length,
-        ...(missing.length > 0
-          ? {
-              missing,
-              note:
-                `The browser did not keep ${missing.join(', ')}. A cookie is dropped silently when its attributes ` +
-                'contradict each other, most often sameSite "None" without secure: true, or a domain that does not ' +
-                'match the url. This is also what a genuinely rejected cookie looks like when a same-named cookie ' +
-                'for a different domain or path already exists: "missing" is computed on the full name, domain and ' +
-                'path triple, so that case is not hidden by the coincidence. Trust "cookies", not the request.'
-            }
-          : {})
+        ...(missing.length > 0 ? { missing } : {}),
+        ...(stale.length > 0 ? { stale } : {}),
+        ...(notes.length > 0 ? { note: notes.join(' ') } : {})
       });
     }
   }),
