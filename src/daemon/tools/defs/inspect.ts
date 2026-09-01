@@ -523,6 +523,23 @@ function frameTree(page: Page): FrameNode[] {
 }
 
 /** Resolves a frame id from list_frames, or explains which ids do exist. */
+/**
+ * How far element_box's flattened-tree walk and shadow drill are allowed to run.
+ *
+ * Guards against a malformed tree, NOT limits any real document meets, and
+ * deliberately identical to HIT_TEST_WALK_CAP and HIT_TEST_DRILL_CAP in
+ * interaction.ts: drag, wheel and element_box must answer the same question the
+ * same way. The previous walk cap of 200 was reachable (measured: 199
+ * intervening levels passed, 200 failed) and produced a confident MISS naming
+ * the leaf, with the "an ancestor is on top" remedy that cannot apply to a page
+ * whose only sin is being deep. Reaching a cap is reported as unknown now, so
+ * the raised numbers are a second line of defence rather than the fix. Passed
+ * into the in-page snippets as arguments rather than inlined as literals,
+ * precisely so a future change to one cannot silently miss the others.
+ */
+const hitTestWalkCap = 10000;
+const hitTestDrillCap = 100;
+
 /** How element_box names something in an ancestor frame that swallowed a click. */
 interface AncestorFrameOccluder {
   tagName: string;
@@ -609,13 +626,13 @@ async function ancestorFrameOccluders(
     const blocked: (AncestorFrameOccluder | null)[] = points.map(() => null);
     for (let level = 0; level < chain.length; level += 1) {
       const answers = await chain[level]!.evaluate(
-        (element: unknown, arg: { points: ({ x: number; y: number } | null)[] }) => {
+        (element: unknown, arg: { points: ({ x: number; y: number } | null)[]; drillCap: number }) => {
           const host = element as FrameHostElement;
           return arg.points.map(point => {
             if (!point) return null;
             let hit = document.elementFromPoint(point.x, point.y);
             let depth = 0;
-            while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function' && depth < 100) {
+            while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function' && depth < arg.drillCap) {
               const deeper = hit.shadowRoot.elementFromPoint(point.x, point.y);
               if (!deeper || deeper === hit) break;
               hit = deeper;
@@ -630,7 +647,7 @@ async function ancestorFrameOccluders(
               : { tagName: 'html', id: '', classes: null, containsTarget: false, inAncestorFrame: true as const };
           });
         },
-        { points: perLevel[level]! }
+        { points: perLevel[level]!, drillCap: hitTestDrillCap }
       );
       answers.forEach((answer, index) => {
         // First failing level wins: the outermost thing in the way is the one to deal with.
@@ -1645,7 +1662,7 @@ export const inspectTools = defineTools({
         const elements =
           matched === 0
             ? []
-            : await matches.evaluateAll((nodes, arg: { limit: number }) => {
+            : await matches.evaluateAll((nodes, arg: { limit: number; walkCap: number; drillCap: number }) => {
                 // No inner named functions in an in-page snippet: esbuild's
                 // keep-names transform (which the test runner applies) rewrites
                 // them into calls to a __name helper that does not exist in the
@@ -1731,7 +1748,7 @@ export const inspectTools = defineTools({
                     let shadowDrillDepth = 0;
                     let truncated = false;
                     while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function') {
-                      if (shadowDrillDepth >= 100) {
+                      if (shadowDrillDepth >= arg.drillCap) {
                         truncated = true;
                         break;
                       }
@@ -1804,7 +1821,7 @@ export const inspectTools = defineTools({
                         // on top" remedy that cannot apply to a page whose only sin is being
                         // deep. Both caps are guards against a malformed tree now, not limits
                         // any real document meets, and reaching one is reported as unknown.
-                        if (steps >= 10000) {
+                        if (steps >= arg.walkCap) {
                           truncated = true;
                           break;
                         }
@@ -1829,7 +1846,7 @@ export const inspectTools = defineTools({
                             hitContainsElement = true;
                             break;
                           }
-                          if (upSteps >= 10000) {
+                          if (upSteps >= arg.walkCap) {
                             truncated = true;
                             break;
                           }
@@ -1911,7 +1928,7 @@ export const inspectTools = defineTools({
                     zIndex: style.getPropertyValue('z-index')
                   };
                 });
-              }, { limit });
+              }, { limit, walkCap: hitTestWalkCap, drillCap: hitTestDrillCap });
 
         // Only when the probe itself said it ran in a subframe, so the main-frame path pays
         // nothing at all for this: no handle, no owner-frame lookup, no extra round trip.
