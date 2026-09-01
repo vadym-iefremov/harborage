@@ -7,6 +7,7 @@ import * as z from 'zod/v4';
 import {
   documentChangedNote,
   documentChangedPayload,
+  documentIdentity,
   isAbortedError,
   isTimeoutError,
   NAVIGATION_SETTLE_MS,
@@ -16,6 +17,7 @@ import {
   pendingNavigationPayload,
   performNavigation,
   settleAfterNavigation,
+  SNAPSHOT_READ_TIMEOUT_MS,
   watchNavigationActivity
 } from '../navigation.js';
 import { defineTool, defineTools, text, type ToolContext, type ToolResult } from '../types.js';
@@ -1379,15 +1381,12 @@ function isInsertionOf(before: string, typed: string, actual: string): boolean {
   return false;
 }
 
-/**
- * A document's identity: a number fixed for the life of one document. Needed
- * because `page.goto()` returning null does not by itself mean the document
- * survived. It is also null for `about:blank` and for non-HTTP schemes, where
- * a new document really was created.
- */
-function documentIdentity(page: Page): Promise<number | null> {
-  return page.evaluate(() => performance.timeOrigin).catch(() => null);
-}
+// documentIdentity used to live here as a bare, unbounded page.evaluate. It
+// moved into ../navigation.js so it shares the read ceiling with
+// readPageSnapshot: both are the same evaluate against the same wedged-page
+// hazard, and a page with a navigation pending will not run either of them.
+// Keeping two copies is how a fix reaches one call site and not its sibling,
+// which this project has now done three rounds running.
 
 /** A real pause, for drag's hold and settle knobs. */
 function sleep(ms: number): Promise<void> {
@@ -2311,7 +2310,16 @@ async function historyStep(
     });
   }
 
-  const before = await documentIdentity(target.page);
+  const timeoutMs = args.timeoutMs ?? NAVIGATION_TIMEOUT_MS;
+  const settleMs = args.settleMs ?? NAVIGATION_SETTLE_MS;
+  // The whole call's ceiling, not just the traversal's. Same reason
+  // performNavigation grew one: every leg here (the identity read, the step,
+  // the settle, the final read) used to run unbounded, so a page that could
+  // not be talked to made the call outlive its own timeoutMs many times over.
+  const deadline = Date.now() + timeoutMs;
+  const remaining = (): number => Math.max(1, deadline - Date.now());
+
+  const before = await documentIdentity(target.page, Math.min(SNAPSHOT_READ_TIMEOUT_MS, remaining()));
   // What this step is AIMING at, captured before it happens. The index alone
   // is not enough: a guard that calls location.replace from its popstate
   // handler swaps the entry's contents in place, so the index still moves
@@ -2327,11 +2335,10 @@ async function historyStep(
   let timedOut = false;
   let settled: PageSnapshot;
   let stillMoving: boolean;
-  const timeoutMs = args.timeoutMs ?? NAVIGATION_TIMEOUT_MS;
-  const settleMs = args.settleMs ?? NAVIGATION_SETTLE_MS;
+  let inFlight: { url: string; startedAt: number } | undefined;
   try {
     try {
-      const options = { timeout: timeoutMs, ...(args.waitUntil ? { waitUntil: args.waitUntil } : {}) };
+      const options = { timeout: remaining(), ...(args.waitUntil ? { waitUntil: args.waitUntil } : {}) };
       response = direction === 'back' ? await target.page.goBack(options) : await target.page.goForward(options);
     } catch (error) {
       // A beforeunload handler makes the step hang until the timeout and then
@@ -2350,7 +2357,12 @@ async function historyStep(
     // yet at that moment, so reading url and identity here described a
     // document that was about to be thrown away. This is the sibling call
     // site navigate's fix did not reach.
-    ({ snapshot: settled, stillMoving } = await settleAfterNavigation(target.page, watch.activity, timedOut ? 0 : settleMs));
+    ({ snapshot: settled, stillMoving, inFlight } = await settleAfterNavigation(
+      target.page,
+      watch.activity,
+      timedOut ? 0 : settleMs,
+      deadline
+    ));
   } finally {
     watch.stop();
   }
@@ -2392,6 +2404,48 @@ async function historyStep(
 
   const indexDelta = history === null || afterHistory === null ? null : afterHistory.index - history.index;
   const notes: string[] = [];
+
+  /**
+   * The step landed on an address other than the one it aimed at, and did it
+   * WITHOUT loading a document. Two completely different things look exactly
+   * like this from the outside, and the honest position is that this code
+   * cannot tell them apart, so it says so rather than guessing.
+   *
+   * The healthy one: an SPA tidying its own URL on arrival, which nearly
+   * every client-side router does on first paint. The round before this one
+   * tried to catch the other shape by treating any URL difference as a failed
+   * step, and broke this case, turning ordinary successes into blocked steps.
+   * That is why `landedOnExpectedUrl` still counts a same-document URL change
+   * as landed, and why that stays.
+   *
+   * The unhealthy one: a route guard catching the popstate this step fired
+   * and calling history.replaceState to rewrite the entry, which is what a
+   * guard that rewrites rather than redirects does. Confirmed over raw CDP
+   * that the history entry really is rewritten. "navigated": true is
+   * defensible (the browser did move, and the caller's own URL is right
+   * there in "url"), but nothing in the payload told anyone to look, so a
+   * guard silently redirecting an agent read as a clean back step.
+   *
+   * A loud, symmetric disclosure is the answer rather than a heuristic. There
+   * is no signal separating the two: both are same-document URL changes made
+   * by the page's own script, and any rule sharp enough to catch a guard is
+   * sharp enough to break a router.
+   */
+  const rewroteItsOwnUrl = expectedUrl !== null && url !== expectedUrl && !loadedNewDocument && moved;
+  if (rewroteItsOwnUrl) {
+    notes.push(
+      `THE URL IS NOT THE ONE THIS STEP AIMED AT. It aimed at ${expectedUrl} and the tab is on ${url}, and no new ` +
+        'document was loaded to get there, so the page rewrote its own address with history.replaceState or ' +
+        'pushState. Two very different things look identical here and this tool cannot tell them apart. It is ' +
+        'usually harmless: almost every client-side router rewrites its URL on arrival, and the entry you asked ' +
+        'for really did load. It is occasionally the whole story: a route guard that catches popstate and rewrites ' +
+        'the entry in place, an auth bounce that does not reload, sends you somewhere you did not ask for while ' +
+        'the history index still moves exactly one step the right way. Compare "url" against "expectedUrl" and ' +
+        'assert on the page itself before trusting this step. "navigated" stays true because the browser genuinely ' +
+        'moved; it is not a claim that you arrived where you meant to.'
+    );
+  }
+
   if (navigated && sameDocument) {
     notes.push(
       'Same-document step: the URL changed but the document was NOT reloaded. The JS context, in-page state and the console buffer all survive, and the page saw a popstate event rather than a load. This is what a hash or pushState entry looks like going back.'
@@ -2408,7 +2462,16 @@ async function historyStep(
       `The tab moved, but this ${direction} step did not land where it aimed.`
     ];
     if (expectedUrl !== null && url !== expectedUrl) {
-      parts.push(`It aimed at ${expectedUrl} and ended on ${url}, having loaded a whole new document to get there.`);
+      // "having loaded a whole new document" used to be asserted here
+      // unconditionally, including on a step where nothing was fetched at
+      // all. A note that states a mechanism the payload's own fields
+      // contradict is worse than one that says less: a caller reading it goes
+      // looking for a page load that never happened.
+      parts.push(
+        loadedNewDocument
+          ? `It aimed at ${expectedUrl} and ended on ${url}, having loaded a whole new document to get there.`
+          : `It aimed at ${expectedUrl} and ended on ${url} WITHOUT loading a new document, so the page rewrote its own URL rather than navigating.`
+      );
     }
     if (indexDelta !== null) {
       const magnitude = Math.abs(indexDelta);
@@ -2431,17 +2494,39 @@ async function historyStep(
         'and the page genuinely stopped it. Treat this as a blocked step, not a no-op.'
     );
   }
-  const pending: PendingNavigation | undefined = stillMoving
-    ? {
-        reason: `the tab was still navigating when the ${settleMs}ms settle window closed, so this describes a document that may already have been replaced`,
-        afterMs: settleMs
-      }
-    : settled.pendingRefresh !== null
+  // Same order and the same reasoning performNavigation uses, kept in step
+  // with it deliberately: a history step is a navigation, and a caller should
+  // not have to learn a second vocabulary for the same situation.
+  const pending: PendingNavigation | undefined =
+    inFlight !== undefined
       ? {
-          reason: `this document carries a meta refresh that fires in ${settled.pendingRefresh.seconds}s, so the tab will move on its own after this call returns`,
-          afterMs: Math.round(settled.pendingRefresh.seconds * 1000)
+          reason:
+            `the tab is fetching a new document and the response had not arrived when this call stopped waiting, ` +
+            `so "url", "title" and "sameDocument" describe the document being REPLACED. The fetch of ${inFlight.url} ` +
+            `had been outstanding ${Date.now() - inFlight.startedAt}ms. That is what a route guard bouncing this ` +
+            `step to a login page looks like while it is still in progress`,
+          url: inFlight.url,
+          afterMs: settleMs
         }
-      : undefined;
+      : stillMoving
+        ? {
+            reason: `the tab was still navigating when the ${settleMs}ms settle window closed, so this describes a document that may already have been replaced`,
+            afterMs: settleMs
+          }
+        : !settled.readable
+          ? {
+              reason:
+                'the page could not be read before this call ran out of time, so "title" is empty and ' +
+                '"sameDocument" may be wrong: that is what a tab with a navigation still pending looks like, or ' +
+                'one whose own JavaScript is blocking the main thread. "url" is still accurate, since it comes ' +
+                'from the browser rather than the page'
+            }
+          : settled.pendingRefresh !== null
+            ? {
+                reason: `this document carries a meta refresh that fires in ${settled.pendingRefresh.seconds}s, so the tab will move on its own after this call returns`,
+                afterMs: Math.round(settled.pendingRefresh.seconds * 1000)
+              }
+            : undefined;
   if (pending) notes.push(`This answer may already be out of date: ${pending.reason}.`);
 
   return text({
@@ -2600,23 +2685,35 @@ export const interactionTools = defineTools({
     }),
     async handler(ctx, args) {
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
-      const before = await documentIdentity(target.page);
       const outcome = await performNavigation(
         target.page,
         timeout => target.page.goto(args.url, { timeout, ...(args.waitUntil ? { waitUntil: args.waitUntil } : {}) }),
         { settleMs: args.settleMs, timeoutMs: args.timeoutMs }
       );
       const { response, settled } = outcome;
+      const before = outcome.before.identity;
 
       // A response means a document really was fetched and swapped in. A null
       // response is ambiguous on its own, so the identity check settles it.
       // When the identity is unreadable we say "same document", erring toward
       // warning the caller: a spurious warning costs one redundant reload, a
       // missed one costs a false pass.
-      const sameDocument = response === null && (before === null || settled.identity === null || before === settled.identity);
+      //
+      // A BLOCKED navigation is excluded outright, because it is not a
+      // same-document navigation and it is not any other kind either: nothing
+      // was navigated. It used to land here and produce "Same-document
+      // navigation: the URL changed but the document was NOT reloaded" for a
+      // URL that had not changed at all, which was measured against a server
+      // answering 204: the verdict (blocked, tab unmoved) was right and the
+      // note beside it described something that never happened.
+      const sameDocument =
+        !outcome.blocked && response === null && (before === null || settled.identity === null || before === settled.identity);
 
       const notes: string[] = [];
-      if (sameDocument) {
+      if (outcome.blocked) {
+        // Nothing to say here: the blocked pending reason already explains
+        // what happened, and neither of the branches below is true.
+      } else if (sameDocument) {
         notes.push(
           'Same-document navigation: the URL changed but the document was NOT reloaded. The JS context, in-page state and the console buffer all survive untouched, and nothing was re-fetched, so there is no HTTP response to report a status for either: "status" and "ok" are null for that reason, not because anything failed. Call reload if you need a real page load.'
         );
