@@ -2784,13 +2784,18 @@ async function historyStep(
   const expectedIndex = history === null ? null : direction === 'back' ? history.index - 1 : history.index + 1;
   const expectedUrl = history === null || expectedIndex === null ? null : (history.urls[expectedIndex] ?? null);
 
-  const watch = watchNavigationActivity(target.page);
   let response: Response | null = null;
   let timedOut = false;
   let settled: PageSnapshot;
   let stillMoving: boolean;
   const timeoutMs = args.timeoutMs ?? NAVIGATION_TIMEOUT_MS;
   const settleMs = args.settleMs ?? NAVIGATION_SETTLE_MS;
+  // Last statement before the try, deliberately, and kept that way: these are two page
+  // listeners whose only removal is the `watch.stop()` in the finally below, so anything
+  // that could throw between installing them and entering the try would strand them on
+  // the page for the rest of the session. Nothing here awaits today; the ordering is what
+  // makes that stay true rather than needing to be re-checked.
+  const watch = watchNavigationActivity(target.page);
   try {
     try {
       const options = { timeout: timeoutMs, ...(args.waitUntil ? { waitUntil: args.waitUntil } : {}) };
@@ -4017,11 +4022,20 @@ export const interactionTools = defineTools({
 
       const dragProbeArmedOn = await armDragProbe(target.page);
       const mouse = target.page.mouse;
-      for (const modifier of modifiers) {
-        await target.page.keyboard.down(modifier);
-      }
       let pressed = false;
+      // What was ACTUALLY pressed, appended one at a time, rather than the list we
+      // intended to press. See the finally below for why the difference matters.
+      const held: typeof modifiers = [];
       try {
+        // Inside the try, deliberately. These used to be pressed just above it, which
+        // meant a list that threw partway through (an unknown key name is rejected
+        // before it ever reaches the browser) left every modifier already down stuck
+        // down: control never entered the try, so the finally that releases them never
+        // ran at all.
+        for (const modifier of modifiers) {
+          await target.page.keyboard.down(modifier);
+          held.push(modifier);
+        }
         await mouse.move(from.x, from.y);
         await mouse.down({ button });
         pressed = true;
@@ -4036,10 +4050,16 @@ export const interactionTools = defineTools({
         // never be stranded down between calls, and anything throwing between
         // the press and the release would have stranded one anyway: every
         // later click in the session would then be a drag, undetectable from
-        // outside. A modifier left down would do the same to every later key
-        // press, so it gets the same treatment.
+        // outside. A modifier left down does the same to every later key press
+        // and click, so it gets the same treatment, and the acquisition sits
+        // inside the try above so that this is true on the failure path too and
+        // not only on the happy one.
+        //
+        // `held` rather than `modifiers`: releasing a key that was never pressed
+        // is harmless, but a failed press and a successful one are different
+        // facts and the code should not have to pretend they are the same.
         if (pressed) await mouse.up({ button }).catch(() => {});
-        for (const modifier of [...modifiers].reverse()) {
+        for (const modifier of [...held].reverse()) {
           await target.page.keyboard.up(modifier).catch(() => {});
         }
       }
@@ -4414,18 +4434,26 @@ export const interactionTools = defineTools({
       await target.page.mouse.move(point.x, point.y);
       const before = await readScrollState(target.page, point.x, point.y);
 
-      for (const modifier of modifiers) {
-        await target.page.keyboard.down(modifier);
-      }
+      // Tracked as they go down, and pressed inside the try below, for the same reason
+      // drag does it: a list that throws partway through must still release whatever it
+      // managed to press.
+      const held: typeof modifiers = [];
       try {
+        for (const modifier of modifiers) {
+          await target.page.keyboard.down(modifier);
+          held.push(modifier);
+        }
         for (let i = 0; i < repeat; i += 1) {
           if (i > 0 && delay > 0) await sleep(delay);
           await target.page.mouse.wheel(deltaX, deltaY);
         }
       } finally {
         // Same reason drag releases in a finally: a modifier left stuck down
-        // would quietly change every later key press and click in this session.
-        for (const modifier of [...modifiers].reverse()) {
+        // would quietly change every later key press and click in this session,
+        // and nothing in a later result would ever show it. That guarantee only
+        // holds because the presses above are inside the try, so a partial
+        // failure lands here rather than skipping past it.
+        for (const modifier of [...held].reverse()) {
           await target.page.keyboard.up(modifier).catch(() => {});
         }
       }

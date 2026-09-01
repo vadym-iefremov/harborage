@@ -1418,6 +1418,13 @@ function collectProbeNodes(node: CdpNode, into: number[]): void {
  * makes a resting-versus-hover comparison possible at all without synthesising
  * a real pointer. The restore is in a finally because a leaked forced :hover
  * would silently poison every later measurement of the same page.
+ *
+ * BOTH things this borrows from the page are taken inside that try, not above
+ * it: the forced pseudo-classes and the probe attribute the CDP walk needs to
+ * find its nodes by. The attribute used to be written first, which meant that
+ * if opening the CDP session failed the attributes stayed on the elements for
+ * the rest of the page's life, with the comment above still promising the page
+ * had been put back exactly as it was.
  */
 async function withForcedStates<T>(
   page: Page,
@@ -1426,14 +1433,14 @@ async function withForcedStates<T>(
   states: readonly string[],
   read: () => Promise<T>
 ): Promise<T> {
-  await matches.evaluateAll((nodes, attribute: string) => {
-    const elements = Array.prototype.slice.call(nodes) as ProbeElement[];
-    elements.forEach((element, index) => element.setAttribute(attribute, String(index)));
-  }, probeAttribute);
-
   const cdpSession = await page.context().newCDPSession(page);
   const forced: number[] = [];
   try {
+    await matches.evaluateAll((nodes, attribute: string) => {
+      const elements = Array.prototype.slice.call(nodes) as ProbeElement[];
+      elements.forEach((element, index) => element.setAttribute(attribute, String(index)));
+    }, probeAttribute);
+
     await cdpSession.send('DOM.enable');
     await cdpSession.send('CSS.enable');
     const tree = (await cdpSession.send('DOM.getDocument', { depth: -1, pierce: true })) as unknown as {

@@ -290,18 +290,25 @@ export async function performNavigation(
 ): Promise<NavigationOutcome> {
   const settleMs = options.settleMs ?? NAVIGATION_SETTLE_MS;
   const timeoutMs = options.timeoutMs ?? NAVIGATION_TIMEOUT_MS;
-  const watch = watchNavigationActivity(page);
-
-  // Where the tab was before any of this, so an abandoned navigation can be
-  // told apart from one that actually moved the tab and then failed.
-  const before = await readPageSnapshot(page);
-
   let response: Response | null = null;
   let timedOut = false;
   let aborted = false;
+  let before: PageSnapshot;
   let settled: PageSnapshot;
   let stillMoving: boolean;
+
+  // The listeners go on immediately before the try, and everything that can throw
+  // afterwards is inside it. The snapshot read below used to sit between the two, which
+  // left both listeners on the page for the rest of its life if it ever threw: they hold
+  // a closure over an activity array that keeps growing with every document response,
+  // and nothing about a failed navigation would ever have shown it. It happens not to
+  // throw today, because readPageSnapshot swallows its own evaluate failure, but that is
+  // a property of another function and not a guarantee this one should be leaning on.
+  const watch = watchNavigationActivity(page);
   try {
+    // Where the tab was before any of this, so an abandoned navigation can be
+    // told apart from one that actually moved the tab and then failed.
+    before = await readPageSnapshot(page);
     try {
       response = await run(timeoutMs);
     } catch (error) {
