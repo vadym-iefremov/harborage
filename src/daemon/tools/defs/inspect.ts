@@ -264,7 +264,10 @@ interface ProbeElement {
   // ShadowRoot structurally satisfy "optionally has a host".
   getRootNode(): { host?: ProbeElement };
   // The <slot> this node is assigned to, when it is light-DOM content being
-  // projected into a shadow tree. Null when it is not slotted, and also null
+  // projected into a shadow tree. Climbed by BOTH flattened-tree walks in
+  // this file, computed_style's background compositing walk and
+  // element_box's topmostAtCentre hit test, and by the twin walk in
+  // interaction.ts; see the matching members on ShadowDrillElement there. Null when it is not slotted, and also null
   // for a CLOSED shadow root, which is a limitation the walk that uses this
   // has to own rather than paper over.
   assignedSlot: ProbeElement | null;
@@ -285,14 +288,6 @@ interface ProbeElement {
   // Present (possibly null, for a closed root) on any element that is
   // itself a shadow host. Absent entirely on one that is not.
   shadowRoot?: { elementFromPoint?(x: number, y: number): ProbeElement | null } | null;
-  // The three members topmostAtCentre's flattened-tree walk climbs by.
-  // assignedSlot is what makes slotted content work: a light-DOM node
-  // distributed into a <slot> is painted inside the shadow tree, so its
-  // flattened parent is that slot, while its DOM parentNode stays the host.
-  // See the matching members on ShadowDrillElement in interaction.ts.
-  assignedSlot?: FlatNode | null;
-  parentNode?: FlatNode | null;
-  nodeType?: number;
 }
 
 /**
