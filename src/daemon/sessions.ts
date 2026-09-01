@@ -1214,10 +1214,20 @@ export class SessionStore {
    * anything below the next one to be issued is a tab this session really
    * had. An id that is not a plain integer can only be matched against the
    * live tabs, which is correct for every id `adoptPage` currently mints.
+   *
+   * The spelling has to be the CANONICAL one, not merely something Number()
+   * is willing to parse. `/^\d+$/` plus `Number(pageId)` let "00" and
+   * "000000000" through as tab 0, which is a tab id this session has never
+   * issued: ids are minted as `String(record.nextPageSeq++)`, so a real one
+   * never carries a leading zero. Every other malformed spelling (" 0",
+   * "+0", "0.0", "0x0") already threw, so a zero-padded one reading as an
+   * existing tab was the odd one out, and it is the shape a caller most
+   * plausibly arrives at by formatting an id themselves. Accepting it means
+   * answering a question about a tab nobody asked about.
    */
   private assertKnownPage(record: SessionRecord, pageId: string | undefined): void {
     if (pageId === undefined || record.pages.has(pageId)) return;
-    if (/^\d+$/.test(pageId) && Number(pageId) < record.nextPageSeq) return;
+    if (/^(0|[1-9]\d*)$/.test(pageId) && Number(pageId) < record.nextPageSeq) return;
     throw new PageNotFoundError(record.id, pageId);
   }
 

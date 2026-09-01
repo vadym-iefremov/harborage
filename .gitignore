@@ -1,3 +1,7 @@
+# Both spellings, because a worktree gets its dependencies as a SYMLINK named
+# node_modules rather than a directory, and a trailing-slash pattern does not
+# match a symlink. Two agents committed one today without noticing.
+node_modules
 node_modules/
 dist/
 *.log

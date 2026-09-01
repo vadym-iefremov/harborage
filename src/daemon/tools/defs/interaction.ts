@@ -7,6 +7,7 @@ import * as z from 'zod/v4';
 import {
   documentChangedNote,
   documentChangedPayload,
+  documentIdentity,
   isAbortedError,
   isTimeoutError,
   NAVIGATION_SETTLE_MS,
@@ -16,6 +17,7 @@ import {
   pendingNavigationPayload,
   performNavigation,
   settleAfterNavigation,
+  SNAPSHOT_READ_TIMEOUT_MS,
   watchNavigationActivity
 } from '../navigation.js';
 import { defineTool, defineTools, text, type ToolContext, type ToolResult } from '../types.js';
@@ -1852,15 +1854,12 @@ function isInsertionOf(before: string, typed: string, actual: string): boolean {
   return false;
 }
 
-/**
- * A document's identity: a number fixed for the life of one document. Needed
- * because `page.goto()` returning null does not by itself mean the document
- * survived. It is also null for `about:blank` and for non-HTTP schemes, where
- * a new document really was created.
- */
-function documentIdentity(page: Page): Promise<number | null> {
-  return page.evaluate(() => performance.timeOrigin).catch(() => null);
-}
+// documentIdentity used to live here as a bare, unbounded page.evaluate. It
+// moved into ../navigation.js so it shares the read ceiling with
+// readPageSnapshot: both are the same evaluate against the same wedged-page
+// hazard, and a page with a navigation pending will not run either of them.
+// Keeping two copies is how a fix reaches one call site and not its sibling,
+// which this project has now done three rounds running.
 
 /** A real pause, for drag's hold and settle knobs. */
 function sleep(ms: number): Promise<void> {
@@ -2784,7 +2783,16 @@ async function historyStep(
     });
   }
 
-  const before = await documentIdentity(target.page);
+  const timeoutMs = args.timeoutMs ?? NAVIGATION_TIMEOUT_MS;
+  const settleMs = args.settleMs ?? NAVIGATION_SETTLE_MS;
+  // The whole call's ceiling, not just the traversal's. Same reason
+  // performNavigation grew one: every leg here (the identity read, the step,
+  // the settle, the final read) used to run unbounded, so a page that could
+  // not be talked to made the call outlive its own timeoutMs many times over.
+  const deadline = Date.now() + timeoutMs;
+  const remaining = (): number => Math.max(1, deadline - Date.now());
+
+  const before = await documentIdentity(target.page, Math.min(SNAPSHOT_READ_TIMEOUT_MS, remaining()));
   // What this step is AIMING at, captured before it happens. The index alone
   // is not enough: a guard that calls location.replace from its popstate
   // handler swaps the entry's contents in place, so the index still moves
@@ -2799,8 +2807,8 @@ async function historyStep(
   let timedOut = false;
   let settled: PageSnapshot;
   let stillMoving: boolean;
-  const timeoutMs = args.timeoutMs ?? NAVIGATION_TIMEOUT_MS;
-  const settleMs = args.settleMs ?? NAVIGATION_SETTLE_MS;
+  let inFlight: { url: string; startedAt: number } | undefined;
+
   // Last statement before the try, deliberately, and kept that way: these are two page
   // listeners whose only removal is the `watch.stop()` in the finally below, so anything
   // that could throw between installing them and entering the try would strand them on
@@ -2809,7 +2817,7 @@ async function historyStep(
   const watch = watchNavigationActivity(target.page);
   try {
     try {
-      const options = { timeout: timeoutMs, ...(args.waitUntil ? { waitUntil: args.waitUntil } : {}) };
+      const options = { timeout: remaining(), ...(args.waitUntil ? { waitUntil: args.waitUntil } : {}) };
       response = direction === 'back' ? await target.page.goBack(options) : await target.page.goForward(options);
     } catch (error) {
       // A beforeunload handler makes the step hang until the timeout and then
@@ -2828,7 +2836,12 @@ async function historyStep(
     // yet at that moment, so reading url and identity here described a
     // document that was about to be thrown away. This is the sibling call
     // site navigate's fix did not reach.
-    ({ snapshot: settled, stillMoving } = await settleAfterNavigation(target.page, watch.activity, timedOut ? 0 : settleMs));
+    ({ snapshot: settled, stillMoving, inFlight } = await settleAfterNavigation(
+      target.page,
+      watch.activity,
+      timedOut ? 0 : settleMs,
+      deadline
+    ));
   } finally {
     watch.stop();
   }
@@ -2870,6 +2883,52 @@ async function historyStep(
 
   const indexDelta = history === null || afterHistory === null ? null : afterHistory.index - history.index;
   const notes: string[] = [];
+
+  /**
+   * The step landed on an address other than the one it aimed at, and did it
+   * WITHOUT loading a document. Two completely different things look exactly
+   * like this from the outside, and the honest position is that this code
+   * cannot tell them apart, so it says so rather than guessing.
+   *
+   * The healthy one: an SPA tidying its own URL on arrival, which nearly
+   * every client-side router does on first paint. The round before this one
+   * tried to catch the other shape by treating any URL difference as a failed
+   * step, and broke this case, turning ordinary successes into blocked steps.
+   * That is why `landedOnExpectedUrl` still counts a same-document URL change
+   * as landed, and why that stays.
+   *
+   * The unhealthy one: a route guard catching the popstate this step fired
+   * and calling history.replaceState to rewrite the entry, which is what a
+   * guard that rewrites rather than redirects does. Confirmed over raw CDP
+   * that the history entry really is rewritten. "navigated": true is
+   * defensible (the browser did move, and the caller's own URL is right
+   * there in "url"), but nothing in the payload told anyone to look, so a
+   * guard silently redirecting an agent read as a clean back step.
+   *
+   * A loud, symmetric disclosure is the answer rather than a heuristic. There
+   * is no signal separating the two: both are same-document URL changes made
+   * by the page's own script, and any rule sharp enough to catch a guard is
+   * sharp enough to break a router.
+   */
+  //
+  // Only when the step otherwise counts as landed. When it does not, the
+  // "did not land" note below says the same thing with more detail, and two
+  // notes making the same point is how a payload teaches its reader to skim.
+  const rewroteItsOwnUrl = navigated && expectedUrl !== null && url !== expectedUrl && !loadedNewDocument && moved;
+  if (rewroteItsOwnUrl) {
+    notes.push(
+      `THE URL IS NOT THE ONE THIS STEP AIMED AT. It aimed at ${expectedUrl} and the tab is on ${url}, and no new ` +
+        'document was loaded to get there, so the page rewrote its own address with history.replaceState or ' +
+        'pushState. Two very different things look identical here and this tool cannot tell them apart. It is ' +
+        'usually harmless: almost every client-side router rewrites its URL on arrival, and the entry you asked ' +
+        'for really did load. It is occasionally the whole story: a route guard that catches popstate and rewrites ' +
+        'the entry in place, an auth bounce that does not reload, sends you somewhere you did not ask for while ' +
+        'the history index still moves exactly one step the right way. Compare "url" against "expectedUrl" and ' +
+        'assert on the page itself before trusting this step. "navigated" stays true because the browser genuinely ' +
+        'moved; it is not a claim that you arrived where you meant to.'
+    );
+  }
+
   if (navigated && sameDocument) {
     notes.push(
       'Same-document step: the URL changed but the document was NOT reloaded. The JS context, in-page state and the console buffer all survive, and the page saw a popstate event rather than a load. This is what a hash or pushState entry looks like going back.'
@@ -2886,7 +2945,16 @@ async function historyStep(
       `The tab moved, but this ${direction} step did not land where it aimed.`
     ];
     if (expectedUrl !== null && url !== expectedUrl) {
-      parts.push(`It aimed at ${expectedUrl} and ended on ${url}, having loaded a whole new document to get there.`);
+      // "having loaded a whole new document" used to be asserted here
+      // unconditionally, including on a step where nothing was fetched at
+      // all. A note that states a mechanism the payload's own fields
+      // contradict is worse than one that says less: a caller reading it goes
+      // looking for a page load that never happened.
+      parts.push(
+        loadedNewDocument
+          ? `It aimed at ${expectedUrl} and ended on ${url}, having loaded a whole new document to get there.`
+          : `It aimed at ${expectedUrl} and ended on ${url} WITHOUT loading a new document, so the page rewrote its own URL rather than navigating.`
+      );
     }
     if (indexDelta !== null) {
       const magnitude = Math.abs(indexDelta);
@@ -2909,17 +2977,39 @@ async function historyStep(
         'and the page genuinely stopped it. Treat this as a blocked step, not a no-op.'
     );
   }
-  const pending: PendingNavigation | undefined = stillMoving
-    ? {
-        reason: `the tab was still navigating when the ${settleMs}ms settle window closed, so this describes a document that may already have been replaced`,
-        afterMs: settleMs
-      }
-    : settled.pendingRefresh !== null
+  // Same order and the same reasoning performNavigation uses, kept in step
+  // with it deliberately: a history step is a navigation, and a caller should
+  // not have to learn a second vocabulary for the same situation.
+  const pending: PendingNavigation | undefined =
+    inFlight !== undefined
       ? {
-          reason: `this document carries a meta refresh that fires in ${settled.pendingRefresh.seconds}s, so the tab will move on its own after this call returns`,
-          afterMs: Math.round(settled.pendingRefresh.seconds * 1000)
+          reason:
+            `the tab is fetching a new document and the response had not arrived when this call stopped waiting, ` +
+            `so "url", "title" and "sameDocument" describe the document being REPLACED. The fetch of ${inFlight.url} ` +
+            `had been outstanding ${Date.now() - inFlight.startedAt}ms. That is what a route guard bouncing this ` +
+            `step to a login page looks like while it is still in progress`,
+          url: inFlight.url,
+          afterMs: settleMs
         }
-      : undefined;
+      : stillMoving
+        ? {
+            reason: `the tab was still navigating when the ${settleMs}ms settle window closed, so this describes a document that may already have been replaced`,
+            afterMs: settleMs
+          }
+        : !settled.readable
+          ? {
+              reason:
+                'the page could not be read before this call ran out of time, so "title" is empty and ' +
+                '"sameDocument" may be wrong: that is what a tab with a navigation still pending looks like, or ' +
+                'one whose own JavaScript is blocking the main thread. "url" is still accurate, since it comes ' +
+                'from the browser rather than the page'
+            }
+          : settled.pendingRefresh !== null
+            ? {
+                reason: `this document carries a meta refresh that fires in ${settled.pendingRefresh.seconds}s, so the tab will move on its own after this call returns`,
+                afterMs: Math.round(settled.pendingRefresh.seconds * 1000)
+              }
+            : undefined;
   if (pending) notes.push(`This answer may already be out of date: ${pending.reason}.`);
 
   return text({
@@ -3052,7 +3142,7 @@ export const interactionTools = defineTools({
     description:
       'Navigate a session\'s tab to a URL. A URL differing from the current one only in its hash is a SAME-DOCUMENT navigation: the browser changes the address but does not reload, so the JS context, in-page state (React state, timers, subscriptions) and the console buffer all survive. This tool does not quietly force a reload in that case, because navigating to a hash is a legitimate thing to test. It reports it instead: every result carries a "sameDocument" boolean, present in both the true and the false case, plus a note when it is true. Use reload when you need a real page load. ' +
       'This is the most-called tool in the whole surface, and it reports the real HTTP outcome rather than treating a rendered page as success: every result carries "status" (the HTTP status code) and "ok" (whether it was in the 200 to 299 range), exactly as reload does, so navigating to a URL that answers 404 or 500 does not read as an ordinary success just because something rendered, which matters most for an SPA shell that paints its own error state under a failing response. "status" and "ok" are both null when there genuinely is no HTTP response to report a status FOR, which is not a failure: a same-document navigation, about:blank, or a non-HTTP scheme such as data: or javascript:. A note explains which of those it was, so a null status is never mistaken for a navigation that silently failed. ' +
-      'ONE PAYLOAD ALWAYS DESCRIBES ONE DOCUMENT. "status" and "ok" belong to the document "url" and "title" describe, not to whatever the first request happened to answer, and the call watches for a real, stated window ("settleMs", 500ms by default, watched in FULL rather than exited early) before reading any of them, so a client-side redirect fired inside that window is caught rather than missed. That matters because a client-side redirect is an ordinary shape: a 200 shell that runs location.replace on a failing route, a meta refresh chain, or a router bouncing an unauthenticated visitor to a login page. When one happens the result also carries "documentChanged", holding the response the navigation itself measured ("from"), the document finally described ("to"), and every main-frame document this call saw, in order, plus a note saying so. So ok: true beside a login page title, or beside a 500 error page, is a shape you will not see here. If the final document has no HTTP response of its own, because it ended on about:blank or a data: URL, "status" and "ok" are null rather than carrying the earlier document\'s status. A redirect fired LATER than the window is not caught, and rather than being silent about that the result says so: "pendingNavigation" appears whenever the tab was still moving when the window closed, or the document being described carries a meta refresh that has not fired yet, so a caller can raise settleMs or simply look again. Calls are serialized per session, so two navigations issued without awaiting each other queue instead of aborting each other. A page that never stops navigating, one that replaces itself with itself, does not hang the call and does not throw a raw timeout either: it comes back with "timedOut": true, a "pendingNavigation" naming the redirect loop, and a description of whatever the tab was showing when "timeoutMs" ran out.',
+      'ONE PAYLOAD ALWAYS DESCRIBES ONE DOCUMENT. "status" and "ok" belong to the document "url" and "title" describe, not to whatever the first request happened to answer, and the call watches for a real, stated window ("settleMs", 500ms by default, watched in FULL rather than exited early) before reading any of them, so a client-side redirect fired inside that window is caught rather than missed. That matters because a client-side redirect is an ordinary shape: a 200 shell that runs location.replace on a failing route, a meta refresh chain, or a router bouncing an unauthenticated visitor to a login page. When one happens the result also carries "documentChanged", holding the response the navigation itself measured ("from"), the document finally described ("to"), and every main-frame document this call saw, in order, plus a note saying so. So ok: true beside a login page title, or beside a 500 error page, is a shape you will not see here, and neither is ok: true for a page that replaced itself AT THE SAME ADDRESS: two documents at one URL are told apart by which one arrived last, not by comparing addresses, so a path answering 200 and then 503 reports the 503. If the final document has no HTTP response of its own, because it ended on about:blank or a data: URL, "status" and "ok" are null rather than carrying the earlier document\'s status. WHAT THE WINDOW CAN AND CANNOT SEE, stated exactly, because the boundary matters more than the number. A redirect whose request has already LEFT when the window closes is waited for, up to two further seconds, and then either reported as the document it landed on or disclosed as a "pendingNavigation" naming the URL still being fetched, so a slow redirect target no longer decides whether you are told. A redirect that has not fired yet when the window closes cannot be seen AT ALL, and this result will not warn you about it: at that moment nothing has happened, the tab genuinely is at rest, and there is nothing to disclose. That is a real limit rather than a bug being hidden, and raising "settleMs" is the only thing that moves it. "pendingNavigation" appears when the tab is still moving or still fetching when the window closes, when the document carries a meta refresh that has not fired, when the page could not be read at all, and when the call ran out of time. It does NOT appear for an ordinary single redirect timed past "settleMs". Calls are serialized per session, so two navigations issued without awaiting each other queue instead of aborting each other. A page that never stops navigating, one that replaces itself with itself, does not hang the call and does not throw a raw timeout either: it comes back with "timedOut": true, a "pendingNavigation" naming the redirect loop, and a description of whatever the tab was showing when "timeoutMs" ran out. "timeoutMs" is a ceiling on the WHOLE call, not on its first request: a backend that accepts the connection and never answers, and a page blocking its own main thread, both come back inside the budget rather than pinning the shared daemon.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -3078,23 +3168,48 @@ export const interactionTools = defineTools({
     }),
     async handler(ctx, args) {
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
-      const before = await documentIdentity(target.page);
       const outcome = await performNavigation(
         target.page,
         timeout => target.page.goto(args.url, { timeout, ...(args.waitUntil ? { waitUntil: args.waitUntil } : {}) }),
         { settleMs: args.settleMs, timeoutMs: args.timeoutMs }
       );
       const { response, settled } = outcome;
+      const before = outcome.before.identity;
 
       // A response means a document really was fetched and swapped in. A null
       // response is ambiguous on its own, so the identity check settles it.
       // When the identity is unreadable we say "same document", erring toward
       // warning the caller: a spurious warning costs one redundant reload, a
       // missed one costs a false pass.
-      const sameDocument = response === null && (before === null || settled.identity === null || before === settled.identity);
+      //
+      // A BLOCKED navigation is excluded outright, because it is not a
+      // same-document navigation and it is not any other kind either: nothing
+      // was navigated. It used to land here and produce "Same-document
+      // navigation: the URL changed but the document was NOT reloaded" for a
+      // URL that had not changed at all, which was measured against a server
+      // answering 204: the verdict (blocked, tab unmoved) was right and the
+      // note beside it described something that never happened.
+      //
+      // A navigation that TIMED OUT is excluded for the same reason: nothing
+      // arrived, so nothing can be said about which document is on screen.
+      // Against a backend that accepted the connection and never answered,
+      // this used to come back "sameDocument": true beside a note promising
+      // the JS context had survived a navigation that never happened.
+      const sameDocument =
+        !outcome.blocked &&
+        !outcome.timedOut &&
+        response === null &&
+        (before === null || settled.identity === null || before === settled.identity);
 
       const notes: string[] = [];
-      if (sameDocument) {
+      if (outcome.blocked || outcome.timedOut || !settled.readable) {
+        // No confident claim about the document belongs here. Every one of
+        // these three means the measurement did not complete, and the
+        // pendingNavigation reason below says which one it was. The notes
+        // underneath are positive statements about what happened to the
+        // document, and stating one on this evidence is how a call that
+        // measured nothing came to describe a same-document navigation.
+      } else if (sameDocument) {
         notes.push(
           'Same-document navigation: the URL changed but the document was NOT reloaded. The JS context, in-page state and the console buffer all survive untouched, and nothing was re-fetched, so there is no HTTP response to report a status for either: "status" and "ok" are null for that reason, not because anything failed. Call reload if you need a real page load.'
         );
@@ -3140,7 +3255,7 @@ export const interactionTools = defineTools({
     // from landing in the middle of a navigation.
     serializesInput: true,
     description:
-      'Reload a session\'s tab: a real page load that discards the JS context, in-page state and everything the page had built up, and re-fetches the document. This is what navigate deliberately does not do when only the URL hash changes. The current URL, hash included, is kept. The result carries "status" (the HTTP status code) and "ok" (whether it was in the 200 to 299 range), exactly as navigate does, both null on the rare reload with no HTTP response to report, such as one landing on about:blank. ONE PAYLOAD ALWAYS DESCRIBES ONE DOCUMENT, on the same terms navigate reports it and through the same machinery: "status" and "ok" belong to the document "url" and "title" describe, not to whatever the reload request itself answered, and the call watches for the same real, stated window ("settleMs", 500ms by default) before reading any of them, with the same "pendingNavigation" and "timedOut" reporting when a page moves later than that or never stops moving, and serialized per session the same way. Reloading a 200 shell that redirects walks the same chain a first visit does, so a reload is no safer than a navigate here: it is usually MORE exposed, because the pages an agent reloads repeatedly are the ones it is waiting on. When the page moves itself the result carries "documentChanged", holding the response the reload measured ("from"), the document finally described ("to"), and every main-frame document this call saw, in order, plus a note. A final document with no HTTP response of its own reports null rather than inheriting the earlier status.',
+      'Reload a session\'s tab: a real page load that discards the JS context, in-page state and everything the page had built up, and re-fetches the document. This is what navigate deliberately does not do when only the URL hash changes. The current URL, hash included, is kept. The result carries "status" (the HTTP status code) and "ok" (whether it was in the 200 to 299 range), exactly as navigate does, both null on the rare reload with no HTTP response to report, such as one landing on about:blank. ONE PAYLOAD ALWAYS DESCRIBES ONE DOCUMENT, on the same terms navigate reports it and through the same machinery: "status" and "ok" belong to the document "url" and "title" describe, not to whatever the reload request itself answered, and the call watches for the same real, stated window ("settleMs", 500ms by default) before reading any of them, with the same "pendingNavigation" and "timedOut" reporting, the same waiting on a redirect already in flight, the same inability to see one that has not fired yet, the same whole-call meaning for "timeoutMs", and serialized per session the same way. Reloading a 200 shell that redirects walks the same chain a first visit does, so a reload is no safer than a navigate here: it is usually MORE exposed, because the pages an agent reloads repeatedly are the ones it is waiting on. When the page moves itself the result carries "documentChanged", holding the response the reload measured ("from"), the document finally described ("to"), and every main-frame document this call saw, in order, plus a note. That includes a page that replaces itself at its OWN address, which a reload provokes more often than a first visit does. A final document with no HTTP response of its own reports null rather than inheriting the earlier status.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -3180,7 +3295,12 @@ export const interactionTools = defineTools({
       );
 
       const notes: string[] = [];
-      if (outcome.response === null) {
+      // Guarded exactly the way navigate's notes are, and for the same
+      // reason: a reload that was blocked, that timed out, or whose page
+      // could not be read has not measured anything, and "that is what
+      // reloading about:blank looks like" is a positive claim about a
+      // measurement that did not happen.
+      if (outcome.response === null && !outcome.blocked && !outcome.timedOut && outcome.settled.readable) {
         notes.push(
           'This reload produced no HTTP response, so "status" and "ok" are null: that is what reloading about:blank or a non-HTTP scheme (for instance data:) looks like, not a failure.'
         );
@@ -4297,7 +4417,7 @@ export const interactionTools = defineTools({
     // caller issuing two back steps means.
     serializesInput: true,
     description:
-      'Go back one entry in a session\'s tab history, the way a user presses the browser Back button. Real history matters wherever an app writes its state into the URL and restores it from a popstate event, and nothing else here exercises that path. When there is no entry to go back to this does NOT quietly succeed: the result says "navigated": false with a note, so a no-op can never read as a step. Nor does it quietly succeed when there WAS an entry to go to but the step never actually landed. A page can catch the popstate event this fires and push its own entries on top, which is what a route guard, an unsaved-changes interceptor or a client-side auth bounce does, and it takes two shapes: the page re-pushes the URL the tab was already on, so nothing appears to move, or it pushes somewhere else entirely, so the URL changes and the tab ends up level with or FURTHER FORWARD than where it started. Both report "navigated": false with a note naming what happened, because neither is a step back. The verdict is settled against Chromium\'s own navigation history rather than against the URL, and against THREE things, because each of the first two alone was found to pass a guarded step: the tab has to have moved, it has to end on the history index the step aimed at (one back, not three), and it has to end on the ENTRY it aimed at. That last one is what catches a guard calling location.replace, which swaps an entry\'s contents in place so the index still moves exactly one the right way while the tab lands on a login page. "previousHistoryIndex", "historyIndex" and "expectedUrl" are all reported so the movement can be checked rather than taken on trust. A guard does not act until it receives the popstate event this step fires, so its own navigation begins AFTER the step resolves: this waits a real, stated window ("settleMs", 500ms by default) for that before measuring anything, which is why "url", "title" and "sameDocument" describe the document that finally loaded rather than the one the guard was about to throw away. A step the page refuses outright, which is what a beforeunload handler does, is reported as a blocked step with "timedOut": true rather than thrown as a raw timeout. Calls are serialized per session, so two history steps issued without awaiting each other queue instead of tearing each other down. "url" always says where the tab really ended up, blocked or not, so read it rather than assuming a blocked step left the tab where it was. Otherwise it reports the resulting URL and "sameDocument", exactly as navigate does: true means the URL changed without a reload, so the JS context, in-page state and the console buffer all survived, which is what a hash or pushState step back looks like. "historyIndex" and "historyLength" are always read fresh from the browser\'s own history after the step, not computed from where the tab was before it, so they describe where the tab really ended up.',
+      'Go back one entry in a session\'s tab history, the way a user presses the browser Back button. Real history matters wherever an app writes its state into the URL and restores it from a popstate event, and nothing else here exercises that path. When there is no entry to go back to this does NOT quietly succeed: the result says "navigated": false with a note, so a no-op can never read as a step. Nor does it quietly succeed when there WAS an entry to go to but the step never actually landed. A page can catch the popstate event this fires and push its own entries on top, which is what a route guard, an unsaved-changes interceptor or a client-side auth bounce does, and it takes two shapes: the page re-pushes the URL the tab was already on, so nothing appears to move, or it pushes somewhere else entirely, so the URL changes and the tab ends up level with or FURTHER FORWARD than where it started. Both report "navigated": false with a note naming what happened, because neither is a step back. The verdict is settled against Chromium\'s own navigation history rather than against the URL, and against THREE things, because each of the first two alone was found to pass a guarded step: the tab has to have moved, it has to end on the history index the step aimed at (one back, not three), and it has to end on the ENTRY it aimed at. That last one is what catches a guard calling location.replace, which swaps an entry\'s contents in place so the index still moves exactly one the right way while the tab lands on a login page. "previousHistoryIndex", "historyIndex" and "expectedUrl" are all reported so the movement can be checked rather than taken on trust. ONE GUARD SHAPE IS DISCLOSED RATHER THAN CAUGHT, deliberately. A guard that calls history.replaceState from its popstate handler rewrites the entry WITHOUT loading a document, and that is indistinguishable from a healthy client-side router tidying its own URL on arrival, which is one of the most common things an SPA does. Treating either as a failed step breaks the other, so a step whose URL differs from "expectedUrl" without a document load still counts as landed AND carries a loud note telling you to compare the two and assert on the page yourself. Read "expectedUrl" whenever the answer matters. A SECOND SHAPE IS NOT SEEN AT ALL: a guard that waits before acting, on a token check or a first fetch, and only then navigates. If its request has already left when the settle window closes this waits for it and reports where it landed, but if it has not fired yet there is nothing to see and no warning is given, because at that moment the tab genuinely is at rest. Raise "settleMs" past the delay you expect. A guard does not act until it receives the popstate event this step fires, so its own navigation begins AFTER the step resolves: this waits a real, stated window ("settleMs", 500ms by default) for that before measuring anything, which is why "url", "title" and "sameDocument" describe the document that finally loaded rather than the one the guard was about to throw away. A step the page refuses outright, which is what a beforeunload handler does, is reported as a blocked step with "timedOut": true rather than thrown as a raw timeout. Calls are serialized per session, so two history steps issued without awaiting each other queue instead of tearing each other down. "url" always says where the tab really ended up, blocked or not, so read it rather than assuming a blocked step left the tab where it was. Otherwise it reports the resulting URL and "sameDocument", exactly as navigate does: true means the URL changed without a reload, so the JS context, in-page state and the console buffer all survived, which is what a hash or pushState step back looks like. "historyIndex" and "historyLength" are always read fresh from the browser\'s own history after the step, not computed from where the tab was before it, so they describe where the tab really ended up.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -4333,7 +4453,7 @@ export const interactionTools = defineTools({
     // caller issuing two back steps means.
     serializesInput: true,
     description:
-      'Go forward one entry in a session\'s tab history, the way a user presses the browser Forward button. The counterpart to navigate_back, and it behaves identically: sitting at the newest entry there is nothing ahead, and the result says "navigated": false with a note rather than looking like a step. The same is true when there was an entry to go to but a page trapped the step, whether it pushed the tab\'s own URL straight back or pushed it somewhere else: a forward step counts only when the tab really moved, ended on the index one FORWARD of where it started, and ended on the entry it aimed at, so an overshoot and an entry swapped out underneath it are both caught. "previousHistoryIndex", "historyIndex" and "expectedUrl" report the readings, it waits the same "settleMs" window for a guard\'s own navigation to land before measuring, and it reports a refused step rather than throwing a raw timeout. Note that navigating anywhere new discards the forward entries, so a forward step is only available directly after a back step.',
+      'Go forward one entry in a session\'s tab history, the way a user presses the browser Forward button. The counterpart to navigate_back, and it behaves identically: sitting at the newest entry there is nothing ahead, and the result says "navigated": false with a note rather than looking like a step. The same is true when there was an entry to go to but a page trapped the step, whether it pushed the tab\'s own URL straight back or pushed it somewhere else: a forward step counts only when the tab really moved, ended on the index one FORWARD of where it started, and ended on the entry it aimed at, so an overshoot and an entry swapped out underneath it are both caught. "previousHistoryIndex", "historyIndex" and "expectedUrl" report the readings, it waits the same "settleMs" window for a guard\'s own navigation to land before measuring, and it reports a refused step rather than throwing a raw timeout. It also inherits the same two limits: a guard that rewrites the entry with history.replaceState is disclosed in a note rather than failed, because a healthy router tidying its own URL looks identical, and a guard that waits before navigating is not seen at all once its delay is past "settleMs". Note that navigating anywhere new discards the forward entries, so a forward step is only available directly after a back step.',
     inputSchema: z.object({
       sessionId,
       pageId,

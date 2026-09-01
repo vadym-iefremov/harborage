@@ -25,7 +25,18 @@ const networkCaptureFilterShape = {
   urlMatches: z
     .string()
     .optional()
-    .describe('Only capture entries whose URL matches this JavaScript regular expression source.'),
+    .describe(
+      'Only capture entries whose URL matches this JavaScript regular expression source. ' +
+        'A pattern that repeats something already repeatable, such as "(a+)+" or "(a|a)*", is REFUSED with an ' +
+        'error naming this field, rather than accepted and run. Such a pattern can take time exponential in the ' +
+        'length of the URL it is matched against (measured: "^(a+)+$" takes 1ms against 18 characters, 72ms ' +
+        'against 24 and over two minutes against 34), a running regular expression cannot be interrupted, and ' +
+        'this filter is evaluated on every request for the life of the session on the event loop of a daemon ' +
+        'every agent on this machine shares. The check is deliberately incomplete: it refuses the shapes that ' +
+        'blow up on repeated characters, and a pattern it accepts can still be slow against a URL shaped unlike ' +
+        'anything it was probed with. urlIncludes takes a plain substring and is never refused, so prefer it ' +
+        'when a substring will do.'
+    ),
   method: z
     .string()
     .optional()
@@ -38,7 +49,12 @@ const networkCaptureFilterShape = {
     .optional()
     .describe(
       'Only capture entries of this Playwright resource type, e.g. "xhr", "fetch", "document". Same vocabulary as ' +
-        'list_network_requests\' resourceType. Only request entries carry one.'
+        'list_network_requests\' resourceType. Only request entries carry one. Matched case-insensitively, so ' +
+        '"XHR" and "xhr" both work. A value outside Chromium\'s vocabulary (document, stylesheet, image, media, ' +
+        'font, script, texttrack, xhr, fetch, eventsource, websocket, manifest, ping, cspreport, other) is ' +
+        'REJECTED rather than accepted and left to match nothing: it could only ever exclude every entry, and a ' +
+        'capture filter that excludes everything is not recoverable by reading again afterwards. Note that a ' +
+        'fetch() for an image URL is "fetch", not "image".'
     ),
   direction: z.enum(['request', 'response']).optional().describe('Only capture one side of each exchange.'),
   minStatus: z

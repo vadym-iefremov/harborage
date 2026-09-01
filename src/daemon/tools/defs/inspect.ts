@@ -1873,7 +1873,13 @@ export const inspectTools = defineTools({
       'dropped and filteredAtCapture are scoped the same way the read is: with a pageId they count only that ' +
       'tab\'s losses, and droppedInSession / filteredAtCaptureInSession come back alongside them with the ' +
       'session-wide totals. The ring is shared by every tab in the session, so a per-tab read reporting the ' +
-      'session-wide number was reporting mostly other tabs\' traffic. ' +
+      'session-wide number was reporting mostly other tabs\' traffic. TREAT A PER-TAB "dropped" AS A FLOOR, not ' +
+      'as the whole loss. Some entries are lost before Playwright can say which tab they belong to at all: a ' +
+      'request whose frame is never attached, or one still waiting for attribution when the holding area fills. ' +
+      'Those count in "droppedInSession" and against no tab, because filing them under a guessed tab would be ' +
+      'worse than leaving them visibly unattributed. So the per-tab numbers across a session can add up to LESS ' +
+      'than "droppedInSession", and that difference is exactly this. If "droppedInSession" is larger than you can ' +
+      'account for, some of it may belong to the tab you are reading. ' +
       'A request entry carrying "responseFilteredOut": true was ANSWERED, and its own response was excluded by the ' +
       'capture filter (either the filter was replaced mid-flight, or it excludes responses wholesale, e.g. ' +
       'direction "request" or a method filter). Without that flag, a request entry with no matching response entry ' +
@@ -1912,7 +1918,13 @@ export const inspectTools = defineTools({
         .string()
         .optional()
         .describe(
-          'Keep only entries whose URL matches this JavaScript regular expression source, e.g. "/api/.*/save$".'
+          'Keep only entries whose URL matches this JavaScript regular expression source, e.g. "/api/.*/save$". ' +
+            'A pattern whose backtracking can run away is REFUSED at compile time rather than run, because this ' +
+            'daemon is shared by every agent on the machine and a single thread runs the match: "^(a+)+$" against ' +
+            '34 characters took over two minutes, during which nobody else\'s session, and not even the health ' +
+            'endpoint, could be answered. The refusal names the field and says what to rewrite. It errs toward ' +
+            'refusing: some unambiguous patterns are turned away, which costs one rewrite, where letting one ' +
+            'through costs the machine.'
         ),
       method: z
         .string()
@@ -1939,7 +1951,11 @@ export const inspectTools = defineTools({
         .optional()
         .describe(
           'Keep only entries of this Playwright resource type, e.g. "document", "xhr", "fetch", "image", "script". ' +
-            'Only request entries carry one.'
+            'Only request entries carry one. Matched case-insensitively, like method: "XHR" and "xhr" mean the ' +
+            'same thing. It used to be the ONE case-sensitive field here, so "XHR" quietly matched nothing and ' +
+            'came back as "returned": 0 with "dropped": 0, which this tool\'s own description reads as the filter ' +
+            'genuinely having found nothing still in the buffer. A resource type Playwright does not have is now ' +
+            'REJECTED rather than silently matching nothing, since it could only ever have been a typo.'
         ),
       direction: z.enum(['request', 'response']).optional().describe('Keep only one side of each exchange.')
     }),
