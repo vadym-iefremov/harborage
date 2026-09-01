@@ -4,6 +4,20 @@ import { basename, isAbsolute } from 'node:path';
 import type { Frame, Locator, Page, Response } from 'playwright';
 import * as z from 'zod/v4';
 
+import {
+  documentChangedNote,
+  documentChangedPayload,
+  isAbortedError,
+  isTimeoutError,
+  NAVIGATION_SETTLE_MS,
+  NAVIGATION_TIMEOUT_MS,
+  type PageSnapshot,
+  type PendingNavigation,
+  pendingNavigationPayload,
+  performNavigation,
+  settleAfterNavigation,
+  watchNavigationActivity
+} from '../navigation.js';
 import { defineTool, defineTools, text, type ToolContext, type ToolResult } from '../types.js';
 import { pageId, sessionId } from './common.js';
 
@@ -849,7 +863,11 @@ async function historyStep(
       // die on a raw Playwright error, which is a poor way to report the very
       // thing this tool documents: a page refusing to let the step happen.
       // Reported as the blocked step it is.
-      if (!isTimeoutError(error)) throw error;
+      // A refused step reaches here two ways depending on how Chromium
+      // abandons it, a timeout or an outright abort, and both mean the same
+      // thing to a caller: the page would not let the step happen. Treated
+      // identically rather than one of them escaping as a raw error.
+      if (!isTimeoutError(error) && !isAbortedError(error)) throw error;
       timedOut = true;
     }
     // THE SETTLE, which this call site never had. goBack resolves as soon as
@@ -1065,345 +1083,6 @@ async function readSettledScrollState(page: Page, x: number, y: number): Promise
   return previous;
 }
 
-/** One main-frame document response, kept so a navigation's final document can be given its own status. */
-interface DocumentResponse {
-  /** The Playwright Response object, kept only to compare by identity against the one the navigation returned. */
-  response: Response;
-  url: string;
-  status: number;
-  ok: boolean;
-}
-
-/** What the tab is showing right now, read in one crossing so no two fields can come from different documents. */
-interface PageSnapshot {
-  identity: number | null;
-  url: string;
-  title: string;
-  /**
-   * The URL the CURRENT document's own navigation fetched, from its
-   * PerformanceNavigationTiming entry. This is not page.url(): a page that
-   * calls history.replaceState rewrites page.url() while this stays the
-   * address that was actually requested, which is the only way to tell a
-   * client-side route rewrite (nothing was fetched) apart from a client-side
-   * redirect (a different document was fetched).
-   */
-  documentUrl: string | null;
-  /** The HTTP status of the current document, from the document's own timing entry. Null when it had no HTTP response. */
-  documentStatus: number | null;
-  /** A meta refresh sitting in the document, which will move the tab after this call returns. */
-  pendingRefresh: { seconds: number; url: string } | null;
-}
-
-/** Why a payload may already be out of date by the time it is read. */
-interface PendingNavigation {
-  reason: string;
-  url?: string;
-  afterMs?: number;
-}
-
-/** How long navigate and reload watch for a page that moves itself, unless the caller says otherwise. */
-const NAVIGATION_SETTLE_MS = 500;
-
-/** A navigation is treated as still in flight if the tab moved this recently when the window closed. */
-const NAVIGATION_QUIET_MS = 60;
-
-/** How long the tail wait for a mid-flight navigation may add on top of the settle window. */
-const NAVIGATION_TAIL_MS = 400;
-
-/** Default ceiling for one navigation call, matching Playwright's own default. */
-const NAVIGATION_TIMEOUT_MS = 30_000;
-
-/** A URL with any fragment removed, since a fragment never reaches the server and so never has a status of its own. */
-function withoutHash(url: string): string {
-  const hash = url.indexOf('#');
-  return hash === -1 ? url : url.slice(0, hash);
-}
-
-/** Anything that would move the tab again, watched for the life of one navigation call. */
-interface NavigationActivity {
-  documents: DocumentResponse[];
-  lastAt: number;
-}
-
-/**
- * url, title, document identity, the current document's own fetched address
- * and status, and any meta refresh still pending, all read in ONE crossing
- * into the page.
- *
- * Reading them separately is how navigate came to describe two documents at
- * once: page.url() answered from one document and page.title() from the next.
- * It is also two round trips instead of one, which doubled the settle cost on
- * a page whose main thread was busy.
- */
-async function readPageSnapshot(page: Page): Promise<PageSnapshot> {
-  const read = await page
-    .evaluate(() => {
-      const entry = performance.getEntriesByType('navigation')[0];
-      const meta = document.querySelector('meta[http-equiv="refresh" i]');
-      const content = meta ? meta.getAttribute('content') : null;
-      let pendingRefresh: { seconds: number; url: string } | null = null;
-      if (content) {
-        const match = /^\s*([\d.]+)\s*(?:;\s*url\s*=\s*(.*?)\s*)?$/i.exec(content);
-        if (match) {
-          pendingRefresh = { seconds: Number(match[1]), url: (match[2] ?? '').replace(/^['"]|['"]$/g, '') };
-        }
-      }
-      return {
-        identity: performance.timeOrigin,
-        title: document.title,
-        documentUrl: typeof entry?.name === 'string' ? entry.name : null,
-        // responseStatus is 0 for a document that never came over HTTP
-        // (about:blank, a data: or blob: URL), which is a real answer and not
-        // a missing one, so it is normalised to null rather than reported.
-        documentStatus: typeof entry?.responseStatus === 'number' && entry.responseStatus > 0 ? entry.responseStatus : null,
-        pendingRefresh
-      };
-    })
-    .catch(() => null);
-  return {
-    identity: read?.identity ?? null,
-    url: page.url(),
-    title: read?.title ?? '',
-    documentUrl: read?.documentUrl ?? null,
-    documentStatus: read?.documentStatus ?? null,
-    pendingRefresh: read?.pendingRefresh ?? null
-  };
-}
-
-/**
- * Watches for the whole settle window, then reports what the tab finally
- * settled on.
- *
- * The previous version returned on the FIRST quiet 10ms poll, which made the
- * advertised 500ms a fiction: a redirect fired 20ms after load was already
- * past it, and an adversary sweeping delays found 20, 30, 50, 80, 150, 300
- * and 499ms all escaping. There is no signal a page can give that it will not
- * navigate again, so exiting early on the absence of one was never sound. The
- * window is watched in full instead, and it is a real number a caller can
- * reason about and raise.
- *
- * A short tail follows it, because measuring in the middle of a navigation is
- * its own kind of wrong answer: if the tab moved in the last moments of the
- * window, this waits for it to stop, up to a bounded extra. Whatever is still
- * moving when that runs out is reported as still moving rather than presented
- * as settled.
- */
-async function settleAfterNavigation(
-  page: Page,
-  activity: NavigationActivity,
-  settleMs: number
-): Promise<{ snapshot: PageSnapshot; stillMoving: boolean }> {
-  if (settleMs > 0) await sleep(settleMs);
-  const tailDeadline = Date.now() + NAVIGATION_TAIL_MS;
-  while (Date.now() - activity.lastAt < NAVIGATION_QUIET_MS && Date.now() < tailDeadline) {
-    await sleep(20);
-  }
-  const stillMoving = Date.now() - activity.lastAt < NAVIGATION_QUIET_MS;
-  return { snapshot: await readPageSnapshot(page), stillMoving };
-}
-
-/**
- * Watches a tab's main frame for anything that would move it again, for the
- * life of one call.
- *
- * Both halves are needed. The response listener catches a document being
- * fetched, which is what a client-side redirect and a meta refresh do, and it
- * is what lets the final document be given its own status. framenavigated
- * also catches the same-document kind, so a page that is rewriting its own
- * URL in a loop is not mistaken for a page at rest.
- */
-function watchNavigationActivity(page: Page): { activity: NavigationActivity; stop: () => void } {
-  const activity: NavigationActivity = { documents: [], lastAt: Date.now() };
-  const onResponse = (response: Response): void => {
-    try {
-      const request = response.request();
-      if (request.frame() !== page.mainFrame()) return;
-      if (request.resourceType() !== 'document') return;
-      activity.documents.push({ response, url: response.url(), status: response.status(), ok: response.ok() });
-      activity.lastAt = Date.now();
-    } catch {
-      // A request whose frame has already gone throws when asked for it.
-      // Nothing to record, and nothing worth failing the navigation over.
-    }
-  };
-  const onNavigated = (frame: Frame): void => {
-    if (frame === page.mainFrame()) activity.lastAt = Date.now();
-  };
-  page.on('response', onResponse);
-  page.on('framenavigated', onNavigated);
-  return {
-    activity,
-    stop: () => {
-      page.off('response', onResponse);
-      page.off('framenavigated', onNavigated);
-    }
-  };
-}
-
-/** A navigation measured end to end: what was fetched, what the tab finally settled on, and whether those are the same document. */
-interface NavigationOutcome {
-  /** The response for the request the navigation itself made. Null when nothing was fetched over HTTP. */
-  response: Response | null;
-  /** The tab once it stopped replacing its own document. */
-  settled: PageSnapshot;
-  /** Every main-frame document response seen during the call, in order. */
-  documents: DocumentResponse[];
-  /** The response that produced the document `settled` describes, if one was recorded. */
-  finalDocument: DocumentResponse | undefined;
-  /** Status of the document `settled` describes, NOT of whatever the first request answered. */
-  status: number | null;
-  ok: boolean | null;
-  /** True when the page fetched a DIFFERENT document after the response was measured. */
-  documentChanged: boolean;
-  /** Set when the answer may already be out of date: still navigating, a meta refresh pending, or the call timed out. */
-  pending: PendingNavigation | undefined;
-  /** True when the navigation itself did not finish inside the caller's timeout. */
-  timedOut: boolean;
-}
-
-/**
- * Runs one navigation and measures the document the caller will actually be
- * looking at when the answer comes back.
- *
- * Shared by navigate and reload because the defect was shared: both used to
- * report the status of the response THEY caused beside a url and title read
- * fresh afterwards, and those are different documents the moment the page
- * redirects itself.
- *
- * The hard question this answers is "is the document on screen the one this
- * navigation fetched?", and the honest source for it is the document's own
- * PerformanceNavigationTiming entry, not a URL comparison. A page calling
- * history.replaceState changes its URL without fetching anything, and matching
- * on URL used to read that as a client-side redirect and blank out a perfectly
- * good 200: an over-correction that hit the single most common shape there
- * is, since almost every client-side router rewrites its URL on first paint.
- */
-async function performNavigation(
-  page: Page,
-  run: (timeout: number) => Promise<Response | null>,
-  options: { settleMs?: number; timeoutMs?: number } = {}
-): Promise<NavigationOutcome> {
-  const settleMs = options.settleMs ?? NAVIGATION_SETTLE_MS;
-  const timeoutMs = options.timeoutMs ?? NAVIGATION_TIMEOUT_MS;
-  const watch = watchNavigationActivity(page);
-
-  let response: Response | null = null;
-  let timedOut = false;
-  let settled: PageSnapshot;
-  let stillMoving: boolean;
-  try {
-    try {
-      response = await run(timeoutMs);
-    } catch (error) {
-      // A page that replaces itself with itself never lets goto resolve, so
-      // the call used to die on a raw Playwright timeout with nothing said
-      // about why. A timeout here is reported rather than thrown, because
-      // what the tab IS showing and the chain of documents behind it are the
-      // whole diagnosis. Anything that is not a timeout is a real failure and
-      // still propagates.
-      if (!isTimeoutError(error)) throw error;
-      timedOut = true;
-    }
-    ({ snapshot: settled, stillMoving } = await settleAfterNavigation(page, watch.activity, timedOut ? 0 : settleMs));
-  } finally {
-    watch.stop();
-  }
-
-  const documents = watch.activity.documents;
-  // Is the document on screen the one this navigation fetched? Asked of the
-  // document itself. The URL fallback is for the rare case where the timing
-  // entry is unreadable.
-  const ownUrl = response === null ? null : withoutHash(response.url());
-  const documentIsOwn =
-    response !== null &&
-    (settled.documentUrl !== null ? withoutHash(settled.documentUrl) === ownUrl : withoutHash(settled.url) === ownUrl);
-
-  const finalKey = withoutHash(settled.documentUrl ?? settled.url);
-  const finalDocument = documentIsOwn
-    ? documents.find(entry => entry.response === response)
-    : documents.filter(entry => withoutHash(entry.url) === finalKey).at(-1);
-
-  // Playwright's own Response is preferred wherever it describes the document
-  // being reported, since it is authoritative about the status and about ok().
-  // The document's timing entry only fills in for a document goto never
-  // returned, which is exactly the redirected-to case.
-  const status =
-    response === null ? null : documentIsOwn ? response.status() : (finalDocument?.status ?? settled.documentStatus ?? null);
-  const ok =
-    response === null
-      ? null
-      : documentIsOwn
-        ? response.ok()
-        : status === null
-          ? null
-          : status >= 200 && status < 300;
-
-  const documentChanged = response !== null && !documentIsOwn;
-
-  let pending: PendingNavigation | undefined;
-  if (timedOut) {
-    pending = {
-      reason:
-        `the navigation did not finish within ${timeoutMs}ms and the tab was still moving when this call gave up. ` +
-        `${documents.length} main-frame document(s) were fetched, which is what a redirect loop looks like`,
-      afterMs: timeoutMs
-    };
-  } else if (stillMoving) {
-    pending = {
-      reason: `the tab was still navigating when the ${settleMs}ms settle window closed, so this describes a document that may already have been replaced`,
-      afterMs: settleMs
-    };
-  } else if (settled.pendingRefresh !== null) {
-    pending = {
-      reason: `this document carries a meta refresh that fires in ${settled.pendingRefresh.seconds}s, which is after this call returns, so the tab will move on its own`,
-      ...(settled.pendingRefresh.url ? { url: new URL(settled.pendingRefresh.url, settled.url).href } : {}),
-      afterMs: Math.round(settled.pendingRefresh.seconds * 1000)
-    };
-  }
-
-  return { response, settled, documents, finalDocument, status, ok, documentChanged, pending, timedOut };
-}
-
-/** True for a Playwright timeout, which is reported rather than thrown, unlike a real navigation failure. */
-function isTimeoutError(error: unknown): boolean {
-  const name = (error as { name?: string } | null)?.name;
-  const message = String((error as { message?: string } | null)?.message ?? '');
-  return name === 'TimeoutError' || /Timeout .*exceeded/i.test(message);
-}
-
-/**
- * The note a caller needs when the page moved itself, worded for whichever
- * tool is reporting it. Kept in one place so navigate and reload cannot drift
- * into explaining the same situation differently.
- */
-function documentChangedNote(outcome: NavigationOutcome, what: string): string {
-  const response = outcome.response;
-  if (response === null) return '';
-  return (
-    `The page moved itself after the response was measured: the ${what} of ${response.url()} answered ${response.status()}, and the document now on screen was fetched from ${outcome.settled.documentUrl ?? outcome.settled.url}. That is a client-side redirect (location.assign or replace, a meta refresh, or a router bouncing an unauthenticated visitor), and "documentChanged" lists every main-frame document this call saw, in order. ` +
-    (outcome.status !== null
-      ? `"status" and "ok" describe the document "url" and "title" describe, this last one, NOT the ${response.status()} that started the chain.`
-      : 'The final document has no HTTP response of its own to report (about:blank, a data: URL or a blob:), so "status" and "ok" are null rather than carrying the earlier document\'s status.')
-  );
-}
-
-/** The documentChanged block both navigate and reload attach, or nothing when the document held still. */
-function documentChangedPayload(outcome: NavigationOutcome): Record<string, unknown> {
-  if (!outcome.documentChanged || outcome.response === null) return {};
-  return {
-    documentChanged: {
-      from: { url: outcome.response.url(), status: outcome.response.status(), ok: outcome.response.ok() },
-      to: { url: outcome.settled.documentUrl ?? outcome.settled.url, status: outcome.status, ok: outcome.ok },
-      documents: outcome.documents.map(entry => ({ url: entry.url, status: entry.status, ok: entry.ok }))
-    }
-  };
-}
-
-/** The pendingNavigation block and its note, shared by navigate, reload and the history steps. */
-function pendingNavigationPayload(pending: PendingNavigation | undefined): Record<string, unknown> {
-  return pending === undefined ? {} : { pendingNavigation: pending };
-}
-
 /** Tools that drive a tab: moving it somewhere and acting on the page. */
 export const interactionTools = defineTools({
   navigate: defineTool({
@@ -1433,7 +1112,7 @@ export const interactionTools = defineTools({
         .max(30_000)
         .optional()
         .describe(
-          'How long to keep watching for the page to move itself before measuring it, in milliseconds. Defaults to 500. This is a real window, watched in full: a client-side redirect fired inside it is caught and reported, and one fired after it is not. Raise it for an app whose auth bounce waits on a token check or a first fetch, which is easily past 500ms. Set it to 0 to skip the wait entirely when you know the page is static and want the call as fast as possible, accepting that a redirect will then be missed.'
+          'How long to keep watching for the page to move itself before measuring it, in milliseconds. Defaults to 500, and that window is real: it is watched in FULL rather than exited as soon as things look quiet, because there is no signal a page can give that it will NOT navigate again, so the only way to know is to watch. A client-side redirect fired inside the window is caught and reported; one fired after it is not. BEFORE YOU LOWER THIS TO SAVE LATENCY, know what you are buying and what you are giving up. Setting it to 0 makes the call as fast as it used to be and makes "status", "ok", "url" and "title" describe the document as of the moment the response arrived, which is the right answer for a static page and the WRONG one for any page that moves itself: a 200 shell that bounces to a login page then reports ok: true beside the shell it was about to discard. Lowering it rather than zeroing it does not remove that risk, it moves it: a redirect timed just past whatever window you choose produces no "pendingNavigation" either, because at the moment the window closes nothing has happened yet and there is nothing to warn about. Raise it instead for an app whose auth bounce waits on a token check or a first fetch, which is easily past 500ms.'
         ),
       timeoutMs: z
         .number()
@@ -1488,6 +1167,7 @@ export const interactionTools = defineTools({
         status: outcome.status,
         ok: outcome.ok,
         ...(outcome.timedOut ? { timedOut: true } : {}),
+        ...(outcome.blocked ? { blocked: true } : {}),
         ...documentChangedPayload(outcome),
         ...pendingNavigationPayload(outcome.pending),
         ...(notes.length ? { note: notes.join(' ') } : {})
@@ -1519,7 +1199,7 @@ export const interactionTools = defineTools({
         .max(30_000)
         .optional()
         .describe(
-          'How long to keep watching for the page to move itself before measuring it, in milliseconds. Defaults to 500. This is a real window, watched in full: a client-side redirect fired inside it is caught and reported, and one fired after it is not. Raise it for an app whose auth bounce waits on a token check or a first fetch, which is easily past 500ms. Set it to 0 to skip the wait entirely when you know the page is static and want the call as fast as possible, accepting that a redirect will then be missed.'
+          'How long to keep watching for the page to move itself before measuring it, in milliseconds. Defaults to 500, and that window is real: it is watched in FULL rather than exited as soon as things look quiet, because there is no signal a page can give that it will NOT navigate again, so the only way to know is to watch. A client-side redirect fired inside the window is caught and reported; one fired after it is not. BEFORE YOU LOWER THIS TO SAVE LATENCY, know what you are buying and what you are giving up. Setting it to 0 makes the call as fast as it used to be and makes "status", "ok", "url" and "title" describe the document as of the moment the response arrived, which is the right answer for a static page and the WRONG one for any page that moves itself: a 200 shell that bounces to a login page then reports ok: true beside the shell it was about to discard. Lowering it rather than zeroing it does not remove that risk, it moves it: a redirect timed just past whatever window you choose produces no "pendingNavigation" either, because at the moment the window closes nothing has happened yet and there is nothing to warn about. Raise it instead for an app whose auth bounce waits on a token check or a first fetch, which is easily past 500ms.'
         ),
       timeoutMs: z
         .number()
@@ -1562,6 +1242,7 @@ export const interactionTools = defineTools({
         status: outcome.status,
         ok: outcome.ok,
         ...(outcome.timedOut ? { timedOut: true } : {}),
+        ...(outcome.blocked ? { blocked: true } : {}),
         ...documentChangedPayload(outcome),
         ...pendingNavigationPayload(outcome.pending),
         ...(notes.length ? { note: notes.join(' ') } : {})
