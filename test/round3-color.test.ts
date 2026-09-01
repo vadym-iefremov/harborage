@@ -82,6 +82,13 @@ const HTML = `<!doctype html>
     <span id="plainText" class="glyph" style="color: rgb(119,119,119)">${SVG_NS_GLYPH}</span>
   </div>
 
+  <!-- 10. Group opacity, which this gate had no case for at all. A solid box
+       rather than a glyph, because Chromium's text rasteriser adds a gamma of
+       its own that would blur what this is measuring. -->
+  <div id="opacityBox" class="box" style="left: 640px; top: 560px; background: rgb(255,255,255)">
+    <div id="fadedSquare" style="position: absolute; left: 0; top: 0; width: 200px; height: 100px; background: rgb(0,0,0); opacity: 0.1"></div>
+  </div>
+
   <!-- 9. A wide-gamut backdrop carrying alpha, which is where clipping in the
        wrong place used to move the answer across a threshold. -->
   <div id="wideBox" class="box" style="left: 320px; top: 560px; background: rgb(0,0,0)">
@@ -232,7 +239,7 @@ test('the round-2 shadow-host walk still lands exactly on the painted pixels', a
   await sessions.releaseSession(sessionId);
 });
 
-test('content slotted into a CLOSED shadow root is a known gap, and the description says so rather than hiding it', async () => {
+test('content slotted into a CLOSED shadow root is detected over CDP and refused, not quoted', async () => {
   const sessionId = await freshSession();
   const image = await capture(sessionId);
   const el = await styleOf(sessionId, '#closedSlotted');
@@ -243,16 +250,22 @@ test('content slotted into a CLOSED shadow root is a known gap, and the descript
   const truth = paintedContrastRatio(paintedGlyph, paintedBackdrop);
   assert.ok(truth < 1.05, `the closed-root fixture must also be invisible, painted ratio was ${truth}`);
 
-  // assignedSlot is specified to return null inside a closed root and no DOM
-  // API outside the root can see the slot, so the walk cannot reach the
-  // wrapper. This pins the gap in the suite instead of leaving it invisible:
-  // if a later round closes it, this assertion is what says so.
+  // This test used to assert the opposite: that the tool quoted a confidently
+  // wrong 21:1 here, because assignedSlot returns null inside a closed root
+  // and no DOM API outside it can see the slot. That was true of the page, and
+  // false of harborage, which can ask CDP. DOM.getDocument with pierce: true
+  // reports closed roots, so the walk tags every ancestor that might be one
+  // and the answer is settled rather than guessed. It still refuses to
+  // COMPOSITE through the closed root, which would mean a second walk over a
+  // different API; it refuses to quote a number instead.
+  assert.equal(el.contrast.ratio, null, 'a chain crossing a closed shadow root cannot be given a ratio');
+  assert.equal(el.contrast.passes, null);
   assert.ok(
-    Math.abs(el.contrast.ratio - truth) > 1,
-    'if the closed-root case now matches the painted pixels, the fix landed and this test and the tool ' +
-      'description both need updating to stop calling it a gap'
+    (el.contrast.unaccountedFor as string[]).includes('closedShadowRoot'),
+    `expected a closedShadowRoot code, got ${JSON.stringify(el.contrast.unaccountedFor)}`
   );
-  assert.match(inspectTools.computed_style.description, /CLOSED shadow root/);
+  assert.equal(el.effective.layerChainIncomplete, true);
+  assert.match(inspectTools.computed_style.description, /closed shadow root/i);
   assert.match(inspectTools.computed_style.description, /assignedSlot/);
 
   await sessions.releaseSession(sessionId);
@@ -527,6 +540,33 @@ test('paintedSrgb leaves every fully opaque colour exactly where clipping left i
   const pinned = paintedSrgb(nearlyOpaque);
   assert.ok(Math.abs(pinned.r * pinned.a - 255) < 1e-9, 'the premultiplied channel is what the clip pins to 255');
   assert.ok(pinned.r > 255, 'while the straight channel stays past the corner, which is what composites correctly');
+});
+
+test('an opacity group composites to the pixel Chromium paints, not to the unquantised one', async () => {
+  const sessionId = await freshSession();
+  const image = await capture(sessionId, 940, 700);
+  const el = await styleOf(sessionId, '#fadedSquare');
+
+  // This gate had no opacity case at all, which is how a one-directional
+  // 8-bit error in group opacity survived a round that was otherwise
+  // pixel-checked. opacity 0.1 is chosen because it is one of the values
+  // where the two candidate models actually disagree, so the test can tell
+  // them apart rather than passing under either.
+  const naive = Math.round(255 * (1 - 0.1));
+  const quantised = 255 - Math.round(255 * 0.1);
+  assert.equal(naive, 230, 'the model this used to use');
+  assert.equal(quantised, 229, 'the model Chromium uses, quantising opacity to an 8-bit alpha');
+
+  const painted = pixelAt(image, 740, 610);
+  assert.equal(painted.r, quantised, `Chromium painted ${painted.r}, so the quantised model is the right one`);
+
+  // What this pins is the composited BACKDROP against that painted pixel. The
+  // square carries no text, so its foreground and background are one colour
+  // and a ratio of 1 is the correct answer for it; the backdrop is where the
+  // error lived.
+  assert.equal(el.effective.backgroundColor, `rgb(${quantised}, ${quantised}, ${quantised})`);
+
+  await sessions.releaseSession(sessionId);
 });
 
 test('computed_style documents the flattened-tree walk, SVG fill and the refusals', () => {

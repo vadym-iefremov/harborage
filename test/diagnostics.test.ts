@@ -228,11 +228,19 @@ test('computed_style folds opacity into the effective colours', async () => {
   const sessionId = await freshSession();
   const el = await styleOf(sessionId, { selector: '#faded' });
 
-  // Black text at opacity 0.5 over white reads as rgb(127.5,127.5,127.5).
-  assert.equal(el.effective.color, 'rgb(128, 128, 128)');
+  // Black text at opacity 0.5 over white. This used to assert
+  // rgb(128, 128, 128), which is round(255 * 0.5) and is NOT what Chromium
+  // paints: it renders an opacity group into an 8-bit surface, so the fraction
+  // it multiplies by is round(0.5 * 255) / 255, and the pixel comes out 127.
+  // Verified by screenshotting a black box at opacity 0.5 over white and
+  // reading it back: rgb(127, 127, 127). The old expectation was one 8-bit
+  // step light, in the same direction every time, which is what
+  // test/round4-color.test.ts pins against painted pixels across 100
+  // opacities. The ratio moves with it, from about 3.977 to about 4.004.
+  assert.equal(el.effective.color, 'rgb(127, 127, 127)');
   assert.ok(
-    Math.abs(el.contrast.ratio - 3.976653) < 0.005,
-    `expected about 3.977 once opacity is folded in, got ${el.contrast.ratio}`
+    Math.abs(el.contrast.ratio - 4.004107) < 0.005,
+    `expected about 4.004 once opacity is folded in, got ${el.contrast.ratio}`
   );
   assert.equal(el.contrast.passes.aaText, false);
 
