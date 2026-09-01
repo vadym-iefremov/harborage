@@ -655,7 +655,12 @@ async function readNavigationHistory(
  * failure modes look identical from the outside: `page.goBack()` resolves to
  * null both when there was nothing to go back to and when the step was a
  * same-document one. Chromium's own history is consulted first so the
- * no-op case is stated rather than inferred.
+ * no-op case is stated rather than inferred, and it is consulted again after
+ * the step for the same reason: whether an entry EXISTED to step to says
+ * nothing about whether the step actually landed there, since a page can
+ * catch the popstate event this fires and step itself right back.
+ * "navigated" is decided on evidence of real movement alone: a genuine HTTP
+ * response, a changed URL, or a changed document identity.
  */
 async function historyStep(
   ctx: ToolContext,
@@ -692,12 +697,46 @@ async function historyStep(
   const after = await documentIdentity(target.page);
   const url = target.page.url();
 
+  // Re-read rather than doing arithmetic on the PRE-step `history` above.
+  // Probed against a back-trapping SPA (a popstate handler that re-pushes its
+  // own URL, exactly what a route guard or an unsaved-changes interceptor
+  // does): the trap does not merely leave the index where it was, it moves
+  // the browser back and then pushes a fresh entry forward again, so
+  // `history.index - 1` corroborated a step that never really landed the
+  // caller anywhere. Only a fresh read of Chromium's own history tells the
+  // truth about where the tab ended up.
+  const afterHistory = await readNavigationHistory(target.session.context, target.page);
+
   // Same rule navigate uses, for the same reason: a null response alone is
   // ambiguous, so the document's own identity settles it, and an unreadable
   // identity errs toward warning the caller.
   const sameDocument = response === null && (before === null || after === null || before === after);
-  const navigated =
-    canStep === true || response !== null || url !== previousUrl || (before !== null && after !== null && before !== after);
+  // `canStep` was dropped from this check. It only says a history entry
+  // EXISTS to step to, not that the step actually happened, and it used to
+  // sit first in this expression, short-circuiting the three terms that
+  // genuinely measure movement. Probed against a back-trapping SPA: canStep
+  // was true (there really was an entry to go back to), the trap re-pushed
+  // the same URL, and the result still came back "navigated": true, "url"
+  // unchanged from "previousUrl", a clean pass for a back button that did
+  // nothing. What is left below is evidence a step really happened: a real
+  // HTTP response came back, the URL is different, or the document's own
+  // identity changed.
+  const navigated = response !== null || url !== previousUrl || (before !== null && after !== null && before !== after);
+
+  const notes: string[] = [];
+  if (navigated && sameDocument) {
+    notes.push(
+      'Same-document step: the URL changed but the document was NOT reloaded. The JS context, in-page state and the console buffer all survive, and the page saw a popstate event rather than a load. This is what a hash or pushState entry looks like going back.'
+    );
+  }
+  if (!navigated) {
+    notes.push(
+      `Nothing moved: the tab is still on ${previousUrl}, even though there was a ${direction} entry to step to. ` +
+        'This is what a route guard or an unsaved-changes interceptor looks like from the outside: the page saw the ' +
+        'popstate event this step fired and re-pushed its own URL right back, so the browser genuinely tried to move ' +
+        'and the page genuinely stopped it. Treat this as a blocked step, not a no-op.'
+    );
+  }
 
   return text({
     pageId: target.pageId,
@@ -706,21 +745,8 @@ async function historyStep(
     title: await target.page.title().catch(() => ''),
     sameDocument: navigated ? sameDocument : false,
     previousUrl,
-    ...(history
-      ? {
-          historyIndex: direction === 'back' ? history.index - 1 : history.index + 1,
-          historyLength: history.length
-        }
-      : {}),
-    ...(navigated && sameDocument
-      ? {
-          note:
-            'Same-document step: the URL changed but the document was NOT reloaded. The JS context, in-page state and the console buffer all survive, and the page saw a popstate event rather than a load. This is what a hash or pushState entry looks like going back.'
-        }
-      : {}),
-    ...(!navigated
-      ? { note: `Nothing moved: the tab is still on ${previousUrl}. Treat this as a no-op, not a step.` }
-      : {})
+    ...(afterHistory ? { historyIndex: afterHistory.index, historyLength: afterHistory.length } : {}),
+    ...(notes.length ? { note: notes.join(' ') } : {})
   });
 }
 
@@ -802,7 +828,8 @@ async function readSettledScrollState(page: Page, x: number, y: number): Promise
 export const interactionTools = defineTools({
   navigate: defineTool({
     description:
-      'Navigate a session\'s tab to a URL. A URL differing from the current one only in its hash is a SAME-DOCUMENT navigation: the browser changes the address but does not reload, so the JS context, in-page state (React state, timers, subscriptions) and the console buffer all survive. This tool does not quietly force a reload in that case, because navigating to a hash is a legitimate thing to test. It reports it instead: every result carries a "sameDocument" boolean, present in both the true and the false case, plus a note when it is true. Use reload when you need a real page load.',
+      'Navigate a session\'s tab to a URL. A URL differing from the current one only in its hash is a SAME-DOCUMENT navigation: the browser changes the address but does not reload, so the JS context, in-page state (React state, timers, subscriptions) and the console buffer all survive. This tool does not quietly force a reload in that case, because navigating to a hash is a legitimate thing to test. It reports it instead: every result carries a "sameDocument" boolean, present in both the true and the false case, plus a note when it is true. Use reload when you need a real page load. ' +
+      'This is the most-called tool in the whole surface, and it reports the real HTTP outcome rather than treating a rendered page as success: every result carries "status" (the HTTP status code) and "ok" (whether it was in the 200 to 299 range), exactly as reload does, so navigating to a URL that answers 404 or 500 does not read as an ordinary success just because something rendered, which matters most for an SPA shell that paints its own error state under a failing response. "status" and "ok" are both null when there genuinely is no HTTP response to report a status FOR, which is not a failure: a same-document navigation, about:blank, or a non-HTTP scheme such as data: or javascript:. A note explains which of those it was, so a null status is never mistaken for a navigation that silently failed.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -822,24 +849,47 @@ export const interactionTools = defineTools({
       // missed one costs a false pass.
       const sameDocument = response === null && (before === null || after === null || before === after);
 
+      // navigate is the most-called tool here, and until now it discarded
+      // `response` the moment sameDocument was settled: a URL that answered
+      // 404 or 500 came back looking like an ordinary success, and for an SPA
+      // shell that renders its own error state under a failing response even
+      // "title" gave nothing away. Reported the same way reload already
+      // reports it, so the two tools agree on what a caller should read.
+      const status = response?.status() ?? null;
+      const ok = response?.ok() ?? null;
+
+      const notes: string[] = [];
+      if (sameDocument) {
+        notes.push(
+          'Same-document navigation: the URL changed but the document was NOT reloaded. The JS context, in-page state and the console buffer all survive untouched, and nothing was re-fetched, so there is no HTTP response to report a status for either: "status" and "ok" are null for that reason, not because anything failed. Call reload if you need a real page load.'
+        );
+      } else if (response === null) {
+        // about:blank lands here: sameDocument is false for it (a fresh
+        // document really was created), but goto() still resolves to a null
+        // response, since nothing was fetched over HTTP. Same for a
+        // non-HTTP scheme such as data: or javascript:. Without this, both
+        // came back with "status": null and no explanation, indistinguishable
+        // from a request that failed before a response ever arrived.
+        notes.push(
+          'This navigation produced no HTTP response, so "status" and "ok" are null: that is what about:blank and a non-HTTP scheme (for instance data: or javascript:) look like, not a failure. The document did change, a fresh one was created, just not through anything this tool can report an HTTP status for.'
+        );
+      }
+
       return text({
         pageId: target.pageId,
         url: target.page.url(),
         title: await target.page.title().catch(() => ''),
         sameDocument,
-        ...(sameDocument
-          ? {
-              note:
-                'Same-document navigation: the URL changed but the document was NOT reloaded. The JS context, in-page state and the console buffer all survive untouched, and nothing was re-fetched. Call reload if you need a real page load.'
-            }
-          : {})
+        status,
+        ok,
+        ...(notes.length ? { note: notes.join(' ') } : {})
       });
     }
   }),
 
   reload: defineTool({
     description:
-      'Reload a session\'s tab: a real page load that discards the JS context, in-page state and everything the page had built up, and re-fetches the document. This is what navigate deliberately does not do when only the URL hash changes. The current URL, hash included, is kept.',
+      'Reload a session\'s tab: a real page load that discards the JS context, in-page state and everything the page had built up, and re-fetches the document. This is what navigate deliberately does not do when only the URL hash changes. The current URL, hash included, is kept. The result carries "status" (the HTTP status code of the reload) and "ok" (whether it was in the 200 to 299 range), exactly as navigate does, both null on the rare reload with no HTTP response to report, such as one landing on about:blank.',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -852,7 +902,8 @@ export const interactionTools = defineTools({
         pageId: target.pageId,
         url: target.page.url(),
         title: await target.page.title().catch(() => ''),
-        status: response?.status()
+        status: response?.status() ?? null,
+        ok: response?.ok() ?? null
       });
     }
   }),
@@ -1121,7 +1172,9 @@ export const interactionTools = defineTools({
   hover: defineTool({
     serializesInput: true,
     description:
-      'Hover the mouse over an element in a session\'s tab, moving the real pointer to it. Synthetic pointerover/mouseover events dispatched from a script only exercise the page\'s own listeners: they cannot satisfy a CSS-only :hover rule, and they cannot open a tooltip that depends on real pointer geometry. This can. Pass x and y together to hover a specific offset from the element\'s top-left corner. Returns whether the element matches :hover afterwards.',
+      'Hover the mouse over an element in a session\'s tab, moving the real pointer to it. Synthetic pointerover/mouseover events dispatched from a script only exercise the page\'s own listeners: they cannot satisfy a CSS-only :hover rule, and they cannot open a tooltip that depends on real pointer geometry. This can. Pass x and y together to hover a specific offset from the element\'s top-left corner. ' +
+      'This does NOT require the selector to be unique: like click, when it matches several elements the FIRST one is hovered, and no error is raised. The result carries "matchedElements" for that reason, with a note whenever it is more than one, because Playwright selectors pierce open shadow roots and a positional path can match far more of the page than it appears to. Read it before concluding the right thing was hovered. ' +
+      'Returns whether the element matches :hover afterwards as "hovering", read back against the exact element that was hovered rather than the bare selector, because reading a multi-match selector through evaluate is strict mode where hovering it is not: without that, hovering a selector matching several elements used to come back as "hovering": false, the opposite of what really happened, since the readback threw on the ambiguity and the failure was swallowed into a false negative. On the rare occasion the readback genuinely cannot run at all, for instance because the hover triggered something that removed the element from the DOM, "hovering" is null rather than false, with a note explaining why, so a readback that could not run is never mistaken for a confirmed "not hovering".',
     inputSchema: z.object({
       sessionId,
       pageId,
@@ -1136,16 +1189,53 @@ export const interactionTools = defineTools({
       }
       const target = ctx.sessions.resolve(args.sessionId, args.pageId);
       const position = args.x !== undefined && args.y !== undefined ? { x: args.x, y: args.y } : undefined;
+      // Counted before the hover, the same reason click counts before its own
+      // act: page.hover is not strict either, so with a selector matching
+      // several elements it silently hovers the FIRST one and reports the
+      // same result either way.
+      const matchedElements = await target.page.locator(args.selector).count().catch(() => undefined);
       await target.page.hover(args.selector, position ? { position } : undefined);
+      // Read back against .first(), not the bare locator. locator.evaluate IS
+      // strict mode, so on a selector matching several elements it used to
+      // throw where page.hover just silently acted on the first one, and the
+      // .catch below turned that throw into "hovering": false: a hover that
+      // genuinely landed reported as though it had done nothing at all.
+      // .first() targets the exact element page.hover already acted on, so
+      // the readback can no longer disagree with the act on that account.
+      // A .catch still guards a readback failing for a real reason, such as
+      // the hover itself removing the element from the DOM, and that is
+      // reported as "hovering": null, not false, so it is never misread as a
+      // confirmed "not hovering".
       const hovering = await target.page
         .locator(args.selector)
+        .first()
         .evaluate((el: PageElement) => el.matches(':hover'))
-        .catch(() => false);
+        .catch(() => null);
+
+      const notes: string[] = [];
+      if (matchedElements !== undefined && matchedElements > 1) {
+        notes.push(
+          `This selector matched ${matchedElements} elements and the FIRST one was hovered. Playwright's ` +
+            'selectors pierce open shadow roots, so a positional path can match more of the page than it looks ' +
+            'like it does. Narrow the selector, or confirm with find which element you meant, before trusting ' +
+            'that the right thing was hovered.'
+        );
+      }
+      if (hovering === null) {
+        notes.push(
+          'The hover itself completed, but the readback that checks :hover afterwards could not run, most likely ' +
+            'because the hover triggered something that removed the element from the DOM. "hovering" is null for ' +
+            'that reason, not false: a real "not hovering" only comes from a readback that actually ran.'
+        );
+      }
+
       return text({
         pageId: target.pageId,
         selector: args.selector,
         hovering,
-        ...(position ? { position } : {})
+        ...(position ? { position } : {}),
+        ...(matchedElements !== undefined ? { matchedElements } : {}),
+        ...(notes.length ? { note: notes.join(' ') } : {})
       });
     }
   }),
@@ -1575,14 +1665,14 @@ export const interactionTools = defineTools({
 
   navigate_back: defineTool({
     description:
-      'Go back one entry in a session\'s tab history, the way a user presses the browser Back button. Real history matters wherever an app writes its state into the URL and restores it from a popstate event, and nothing else here exercises that path. When there is no entry to go back to this does NOT quietly succeed: the result says "navigated": false with a note, so a no-op can never read as a step. Otherwise it reports the resulting URL and "sameDocument", exactly as navigate does: true means the URL changed without a reload, so the JS context, in-page state and the console buffer all survived, which is what a hash or pushState step back looks like.',
+      'Go back one entry in a session\'s tab history, the way a user presses the browser Back button. Real history matters wherever an app writes its state into the URL and restores it from a popstate event, and nothing else here exercises that path. When there is no entry to go back to this does NOT quietly succeed: the result says "navigated": false with a note, so a no-op can never read as a step. Nor does it quietly succeed when there WAS an entry to go to but the step never actually landed: a page can catch the popstate event this fires and push its own URL right back, which is exactly what a route guard or an unsaved-changes interceptor does, and "navigated" is false with a note for that too, so a back button an app is trapping the user on cannot read as a clean pass. Otherwise it reports the resulting URL and "sameDocument", exactly as navigate does: true means the URL changed without a reload, so the JS context, in-page state and the console buffer all survived, which is what a hash or pushState step back looks like. "historyIndex" and "historyLength" are always read fresh from the browser\'s own history after the step, not computed from where the tab was before it, so they describe where the tab really ended up.',
     inputSchema: z.object({ sessionId, pageId, waitUntil }),
     handler: (ctx, args) => historyStep(ctx, args, 'back')
   }),
 
   navigate_forward: defineTool({
     description:
-      'Go forward one entry in a session\'s tab history, the way a user presses the browser Forward button. The counterpart to navigate_back, and it behaves identically: sitting at the newest entry there is nothing ahead, and the result says "navigated": false with a note rather than looking like a step. Note that navigating anywhere new discards the forward entries, so a forward step is only available directly after a back step.',
+      'Go forward one entry in a session\'s tab history, the way a user presses the browser Forward button. The counterpart to navigate_back, and it behaves identically: sitting at the newest entry there is nothing ahead, and the result says "navigated": false with a note rather than looking like a step, and the same is true when there was an entry to go to but a page trapped the step and pushed its own URL right back. Note that navigating anywhere new discards the forward entries, so a forward step is only available directly after a back step.',
     inputSchema: z.object({ sessionId, pageId, waitUntil }),
     handler: (ctx, args) => historyStep(ctx, args, 'forward')
   }),
