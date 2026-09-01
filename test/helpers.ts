@@ -202,9 +202,27 @@ function collectFiles(dir: string, ignore: Set<string>, out: string[]): void {
   }
 }
 
-/** A sorted, repo-relative file listing, skipping VCS/build/dependency directories. */
+/**
+ * A sorted, repo-relative file listing, skipping VCS, build, dependency and
+ * agent-scratch directories.
+ *
+ * `.claude` is ignored for a different reason than the other three, and the
+ * distinction matters. The others are noise. `.claude` is where git worktrees
+ * and agent scratch files live, it is gitignored, and it is written to by
+ * OTHER processes while a test runs. Without it here, a caller asserting "this
+ * tool wrote nothing to disk" fails whenever anything else on the machine
+ * happens to touch a scratch file mid-run, which is a false failure about a
+ * process the test is not testing. Measured directly: the screenshot inline
+ * test failed in a full suite and passed in isolation, purely because a
+ * sibling was writing probe files under `.claude/worktrees` at the time.
+ *
+ * The assertion this protects is unchanged in strength: a screenshot written
+ * anywhere a human would call the repo, the root, `src/`, `test/`, `assets/`
+ * or `docs/`, is still caught. Only the gitignored scratch tree is exempt,
+ * and nothing in this project writes there on purpose.
+ */
 export function snapshotRepoFiles(): string[] {
-  const ignore = new Set(['node_modules', 'dist', '.git']);
+  const ignore = new Set(['node_modules', 'dist', '.git', '.claude']);
   const out: string[] = [];
   collectFiles(repoRoot, ignore, out);
   return out.map(f => relative(repoRoot, f)).sort();
