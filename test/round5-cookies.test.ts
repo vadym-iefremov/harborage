@@ -445,3 +445,48 @@ test('the same cookie asked for twice in one call reports the last write, not a 
 
   await sessions.releaseSession(sessionId);
 });
+
+test('an https url with an explicit secure:false is an accepted write, not a refused one', async () => {
+  const sessionId = await freshSession();
+
+  // The pair contradicts itself and the url wins: measured, the cookie is
+  // accepted and stored with secure true. Comparing the requested flag
+  // naively would announce a refusal for a write that landed, which is the
+  // false failure the finding 6 fix must not become.
+  const result = payload(
+    await handlers.set_cookies({
+      sessionId,
+      cookies: [{ name: 'contradiction', value: 'v', url: 'https://url.test/', secure: false }]
+    })
+  );
+
+  const stored = await oracleFind(sessionId, 'contradiction');
+  assert.ok(stored, 'the browser must have accepted it');
+  assert.equal(stored.secure, true, 'the fixture is only meaningful if the url really overrode secure:false');
+
+  assert.equal(result.stale, undefined);
+  assert.equal(result.missing, undefined);
+  assert.ok(claimsInstalled(result, 'contradiction', 'url.test', '/'));
+
+  await sessions.releaseSession(sessionId);
+});
+
+test('an expiry inside the 400 day cap is stored exactly and is not reported as a rejection', async () => {
+  const sessionId = await freshSession();
+
+  // The other side of the clamp test above: 400 days is honoured to the
+  // second, 401 is cut back. Both have to read as installed.
+  const now = Math.floor(Date.now() / 1000);
+  const result = payload(
+    await handlers.set_cookies({
+      sessionId,
+      cookies: [{ name: 'atcap', value: 'v', domain: '127.0.0.1', path: '/', expires: now + 400 * 24 * 60 * 60 }]
+    })
+  );
+
+  assert.equal((await oracleFind(sessionId, 'atcap'))?.expires, now + 400 * 24 * 60 * 60);
+  assert.equal(result.stale, undefined);
+  assert.equal(result.missing, undefined);
+
+  await sessions.releaseSession(sessionId);
+});

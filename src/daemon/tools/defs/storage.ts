@@ -423,12 +423,18 @@ function matchInJar(jar: Cookie[], jarByKey: Map<string, Cookie>, identity: Cook
  *   value      always. Chromium stores it byte for byte or refuses the whole
  *              call with an error, measured, so a difference here is never
  *              the browser tidying up after the caller.
- *   httpOnly   only when asked for. Same for secure and sameSite: each is
- *   secure     stored exactly as requested when the cookie is accepted, but
- *   sameSite   each also has a browser-chosen default (sameSite becomes
- *              "Lax", and an https `url` sets secure on its own), so
- *              comparing one that was never requested would report a
+ *   httpOnly   only when asked for. Same for sameSite: both are stored
+ *   sameSite   exactly as requested when the cookie is accepted, but both
+ *              also have a browser-chosen default (sameSite becomes "Lax"),
+ *              so comparing one that was never requested would report a
  *              perfectly good cookie as refused.
+ *   secure     only when asked for, and never when the request said
+ *              `secure: false` alongside an https `url`. That pair is a
+ *              contradiction the url wins: measured, a cookie asked for as
+ *              { url: "https://x/", secure: false } is ACCEPTED and stored
+ *              with secure true. Flagging it would announce a refusal for a
+ *              write that landed, which is the false failure this whole
+ *              function is trying not to become.
  *   expires    NEVER. Chromium rounds it and clamps it to a 400 day cap:
  *              measured, a request for now plus 10 years came back stored as
  *              now plus about 400 days, with a fractional part. Comparing it
@@ -438,13 +444,16 @@ function matchInJar(jar: Cookie[], jarByKey: Map<string, Cookie>, identity: Cook
  *   path       browser's normalisation of them is `matchInJar`'s job.
  */
 function unhonouredAttributes(
-  request: { value: string; httpOnly?: boolean; secure?: boolean; sameSite?: string },
+  request: { value: string; url?: string; httpOnly?: boolean; secure?: boolean; sameSite?: string },
   stored: Cookie
 ): string[] {
   const differs: string[] = [];
   if (stored.value !== request.value) differs.push('value');
   if (request.httpOnly !== undefined && stored.httpOnly !== request.httpOnly) differs.push('httpOnly');
-  if (request.secure !== undefined && stored.secure !== request.secure) differs.push('secure');
+  const secureCameFromTheUrl = request.secure === false && request.url?.startsWith('https:') === true;
+  if (request.secure !== undefined && stored.secure !== request.secure && !secureCameFromTheUrl) {
+    differs.push('secure');
+  }
   if (request.sameSite !== undefined && stored.sameSite !== request.sameSite) differs.push('sameSite');
   return differs;
 }
