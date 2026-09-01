@@ -1635,8 +1635,20 @@ async function replaceKeylesslyOrFallBack(
   const landed = await readFieldValue(page, locator).catch(() => value);
   if (landed === value) return;
 
-  // The element holds something other than what was asked for, and the
-  // readback is one that can be believed, so the page rejected the insert.
+  // Not "the readback disagrees", but "the readback disagrees in the specific
+  // shape of a refused insert": what was asked for is there, with the old
+  // content still hanging off one end of it. A refused insert prepends or
+  // appends, so it is one of those two, and an empty value is covered because
+  // anything starts with the empty string.
+  //
+  // The looser test cost a keystroke on writes that had in fact succeeded. A
+  // multi-line value is the ordinary case: insertText puts a line break into a
+  // contenteditable as a <br>, which textContent does not render as a newline,
+  // so "a\nb" reads back as "ab" and compares unequal to a correct write. Under
+  // the looser test that pressed a Delete, on a plain contenteditable, which is
+  // exactly the element inside a canvas node this round exists to protect.
+  if (!landed.startsWith(value) && !landed.endsWith(value)) return;
+
   // Re-select first: the failed insert has already changed the contents, so
   // the Range placed before it no longer covers them.
   const reselected = await selectElementContents(locator);

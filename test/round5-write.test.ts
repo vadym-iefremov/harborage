@@ -429,3 +429,21 @@ test('a refusing editor whose readback cannot be believed gets NO fallback key',
   assertNoKeyDispatched(await keys(s), 'fill on a refusing editor with an untrustworthy readback');
   await sessions.releaseSession(s);
 });
+
+test('a multi-line value into a plain contenteditable presses no key', async () => {
+  // The case that made the fallback's trigger too loose. insertText puts a
+  // line break into a contenteditable as a <br>, which textContent does not
+  // render as a newline, so a correct write reads back "ab" against a
+  // requested "a\nb" and compares unequal. Falling back on any disagreement
+  // pressed a Delete there, on a plain contenteditable inside a canvas, which
+  // is the exact element this round exists to protect.
+  const s = await open('/canvas-ce');
+  await resetKeys(s);
+  await handlers.fill({ sessionId: s, selector: '#l2', value: 'first\nsecond' });
+  assertNoKeyDispatched(await keys(s), 'fill with a multi-line value');
+  assert.deepEqual((await canvasState(s)).nodes, ['n1', 'n2', 'n3']);
+  const landed = await ev<string>(s, 'document.getElementById("l2").innerHTML');
+  assert.match(landed, /first/);
+  assert.match(landed, /second/);
+  await sessions.releaseSession(s);
+});
