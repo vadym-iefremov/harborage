@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 800px;
+    height: 600px;
+    overflow: hidden;
+    background: #ffffff;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  #stage {
+    position: relative;
+    width: 800px;
+    height: 600px;
+    background: #ffffff;
+    overflow: hidden;
+  }
+  .fixture {
+    display: none;
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 800px;
+    height: 600px;
+  }
+  .fixture.active { display: block; }
+
+  .center-wrap {
+    width: 800px;
+    height: 600px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* ---------- logo ---------- */
+  .logo-wrap {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    transform: scale(1);
+    transform-origin: center center;
+  }
+  .logo-mark { display: block; }
+  .mark-path {
+    stroke-dasharray: 1;
+    stroke-dashoffset: 1;
+  }
+  .mark-path.run { animation: markDraw 700ms linear forwards; }
+  @keyframes markDraw {
+    from { stroke-dashoffset: 1; }
+    to { stroke-dashoffset: 0; }
+  }
+  .logo-word {
+    font-size: 22px;
+    font-weight: 600;
+    letter-spacing: 0.2px;
+    color: #0f172a;
+    opacity: 0;
+  }
+  .logo-word.run { animation: wordFade 300ms ease 700ms forwards; }
+  @keyframes wordFade {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  .logo-wrap.run { animation: logoSettle 150ms ease 1000ms forwards; }
+  @keyframes logoSettle {
+    0% { transform: scale(1); }
+    50% { transform: scale(1.04); }
+    100% { transform: scale(1); }
+  }
+
+  /* ---------- transition-ok ---------- */
+  .ok-screen {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 800px;
+    height: 600px;
+    box-sizing: border-box;
+    padding: 48px 56px;
+    background: #ffffff;
+  }
+  .ok-screen-a { transform: translateX(0); opacity: 1; }
+  .ok-screen-a.run { animation: okOutA 500ms ease-in-out forwards; }
+  @keyframes okOutA {
+    from { transform: translateX(0); opacity: 1; }
+    to { transform: translateX(-800px); opacity: 0; }
+  }
+  .ok-screen-b { transform: translateX(800px); opacity: 0; }
+  .ok-screen-b.run { animation: okInB 500ms ease-in-out forwards; }
+  @keyframes okInB {
+    from { transform: translateX(800px); opacity: 0; }
+    to { transform: translateX(0); opacity: 1; }
+  }
+
+  /* ---------- transition-blank (bug fixture) ---------- */
+  .blank-screen {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 800px;
+    height: 600px;
+    box-sizing: border-box;
+    padding: 48px 56px;
+    background: #ffffff;
+  }
+  .blank-screen-a { transform: translateX(0); opacity: 1; }
+  .blank-screen-a.run { animation: blankOutA 250ms ease-in-out forwards; }
+  @keyframes blankOutA {
+    from { transform: translateX(0); opacity: 1; }
+    to { transform: translateX(-800px); opacity: 0; }
+  }
+  .blank-screen-b { transform: translateX(800px); opacity: 0; }
+  .blank-screen-b.run { animation: blankInB 380ms ease-in-out 420ms forwards; }
+  @keyframes blankInB {
+    from { transform: translateX(800px); opacity: 0; }
+    to { transform: translateX(0); opacity: 1; }
+  }
+
+  /* shared card/detail styling for both transition fixtures */
+  .scr-heading { font-size: 20px; font-weight: 600; color: #0f172a; margin: 0 0 18px; }
+  .scr-card {
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    padding: 16px 18px;
+    margin-bottom: 12px;
+    background: #f8fafc;
+  }
+  .scr-card-title { font-size: 15px; font-weight: 600; color: #1e293b; margin: 0 0 4px; }
+  .scr-card-body { font-size: 13px; color: #64748b; margin: 0; }
+  .scr-detail-title { font-size: 24px; font-weight: 700; color: #0f172a; margin: 0 0 14px; }
+  .scr-detail-body { font-size: 14px; line-height: 1.6; color: #475569; max-width: 560px; margin: 0; }
+  .scr-back { font-size: 13px; color: #2563eb; margin: 0 0 20px; }
+
+  /* ---------- micro ---------- */
+  .micro-btn {
+    width: 150px;
+    height: 44px;
+    border-radius: 8px;
+    background: #2563eb;
+    color: #ffffff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 15px;
+    font-weight: 600;
+    box-shadow: 0 4px 10px rgba(0,0,0,.18);
+    transform: translateY(0);
+  }
+  .micro-btn.run { animation: microPress 120ms ease-out forwards; }
+  @keyframes microPress {
+    from { transform: translateY(0); box-shadow: 0 4px 10px rgba(0,0,0,.18); }
+    to { transform: translateY(2px); box-shadow: 0 1px 3px rgba(0,0,0,.18); }
+  }
+
+  /* ---------- spinner-stall ---------- */
+  .spinner-row {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 14px;
+  }
+  .spinner-ring {
+    width: 40px;
+    height: 40px;
+    box-sizing: border-box;
+    border: 4px solid #e2e8f0;
+    border-top-color: #2563eb;
+    border-radius: 50%;
+  }
+  .spinner-ring.run { animation: spinStall 2000ms linear forwards; }
+  @keyframes spinStall {
+    0%   { transform: rotate(0deg); }
+    45%  { transform: rotate(405deg); }
+    65%  { transform: rotate(405deg); }
+    100% { transform: rotate(720deg); }
+  }
+  .spinner-label { font-size: 13px; color: #64748b; }
+</style>
+</head>
+<body>
+<div id="stage">
+
+  <div id="fx-logo" class="fixture">
+    <div class="center-wrap">
+      <div class="logo-wrap">
+        <svg class="logo-mark" width="56" height="56" viewBox="0 0 56 56">
+          <path class="mark-path" pathLength="1" d="M28 4 L50 16 L50 40 L28 52 L6 40 L6 16 Z"
+                fill="none" stroke="#1d4ed8" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+          <path class="mark-path" pathLength="1" d="M17 28 L25 36 L40 19"
+                fill="none" stroke="#1d4ed8" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <div class="logo-word">Meridian</div>
+      </div>
+    </div>
+  </div>
+
+  <div id="fx-transition-ok" class="fixture">
+    <div class="ok-screen ok-screen-a">
+      <p class="scr-heading">Projects</p>
+      <div class="scr-card">
+        <p class="scr-card-title">Atlas redesign</p>
+        <p class="scr-card-body">Updated 2 hours ago by Priya Shah</p>
+      </div>
+      <div class="scr-card">
+        <p class="scr-card-title">Onboarding flow</p>
+        <p class="scr-card-body">3 open comments</p>
+      </div>
+      <div class="scr-card">
+        <p class="scr-card-title">Q3 roadmap</p>
+        <p class="scr-card-body">Shared with 6 people</p>
+      </div>
+    </div>
+    <div class="ok-screen ok-screen-b">
+      <p class="scr-back">&larr; Back to projects</p>
+      <p class="scr-detail-title">Atlas redesign</p>
+      <p class="scr-detail-body">This workspace tracks the visual refresh for the customer-facing
+        dashboard, including component audits and revised spacing tokens. Priya and two other
+        editors currently have access.</p>
+    </div>
+  </div>
+
+  <div id="fx-transition-blank" class="fixture">
+    <div class="blank-screen blank-screen-a">
+      <p class="scr-heading">Projects</p>
+      <div class="scr-card">
+        <p class="scr-card-title">Atlas redesign</p>
+        <p class="scr-card-body">Updated 2 hours ago by Priya Shah</p>
+      </div>
+      <div class="scr-card">
+        <p class="scr-card-title">Onboarding flow</p>
+        <p class="scr-card-body">3 open comments</p>
+      </div>
+      <div class="scr-card">
+        <p class="scr-card-title">Q3 roadmap</p>
+        <p class="scr-card-body">Shared with 6 people</p>
+      </div>
+    </div>
+    <div class="blank-screen blank-screen-b">
+      <p class="scr-back">&larr; Back to projects</p>
+      <p class="scr-detail-title">Atlas redesign</p>
+      <p class="scr-detail-body">This workspace tracks the visual refresh for the customer-facing
+        dashboard, including component audits and revised spacing tokens. Priya and two other
+        editors currently have access.</p>
+    </div>
+  </div>
+
+  <div id="fx-micro" class="fixture">
+    <div class="center-wrap">
+      <div class="micro-btn">Continue</div>
+    </div>
+  </div>
+
+  <div id="fx-spinner-stall" class="fixture">
+    <div class="center-wrap">
+      <div class="spinner-row">
+        <div class="spinner-ring"></div>
+        <div class="spinner-label">Fetching latest data</div>
+      </div>
+    </div>
+  </div>
+
+</div>
+<script>
+(function () {
+  window.__done = false;
+  var doneTimer = null;
+
+  function allFixtures() {
+    return document.querySelectorAll('.fixture');
+  }
+  function allAnimated() {
+    return document.querySelectorAll(
+      '.mark-path, .logo-word, .logo-wrap, .ok-screen-a, .ok-screen-b, ' +
+      '.blank-screen-a, .blank-screen-b, .micro-btn, .spinner-ring'
+    );
+  }
+
+  function reset() {
+    if (doneTimer) {
+      clearTimeout(doneTimer);
+      doneTimer = null;
+    }
+    allFixtures().forEach(function (f) { f.classList.remove('active'); });
+    allAnimated().forEach(function (el) { el.classList.remove('run'); });
+    window.__done = false;
+  }
+  window.reset = reset;
+
+  function armDone(ms) {
+    doneTimer = setTimeout(function () {
+      window.__done = true;
+      doneTimer = null;
+    }, ms);
+  }
+
+  function play(name) {
+    reset();
+    window.__done = false;
+    var fixture = document.getElementById('fx-' + name);
+    if (!fixture) return;
+    fixture.classList.add('active');
+    void fixture.offsetWidth; // force reflow so display:none -> block takes effect, and replay works
+
+    switch (name) {
+      case 'logo': {
+        var paths = fixture.querySelectorAll('.mark-path');
+        var word = fixture.querySelector('.logo-word');
+        var wrap = fixture.querySelector('.logo-wrap');
+        void wrap.offsetWidth;
+        paths.forEach(function (p) { p.classList.add('run'); });
+        word.classList.add('run');
+        wrap.classList.add('run');
+        armDone(1150);
+        break;
+      }
+      case 'transition-ok': {
+        var a = fixture.querySelector('.ok-screen-a');
+        var b = fixture.querySelector('.ok-screen-b');
+        void a.offsetWidth;
+        a.classList.add('run');
+        b.classList.add('run');
+        armDone(500);
+        break;
+      }
+      case 'transition-blank': {
+        var a2 = fixture.querySelector('.blank-screen-a');
+        var b2 = fixture.querySelector('.blank-screen-b');
+        void a2.offsetWidth;
+        a2.classList.add('run');
+        b2.classList.add('run');
+        armDone(800);
+        break;
+      }
+      case 'micro': {
+        var btn = fixture.querySelector('.micro-btn');
+        void btn.offsetWidth;
+        btn.classList.add('run');
+        armDone(120);
+        break;
+      }
+      case 'spinner-stall': {
+        var ring = fixture.querySelector('.spinner-ring');
+        void ring.offsetWidth;
+        ring.classList.add('run');
+        armDone(2000);
+        break;
+      }
+    }
+  }
+  window.play = play;
+})();
+</script>
+</body>
+</html>

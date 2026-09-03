@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 800px;
+    height: 600px;
+    overflow: hidden;
+    background: #ffffff;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  #stage {
+    position: relative;
+    width: 800px;
+    height: 600px;
+    background: #ffffff;
+    overflow: hidden;
+  }
+  .fixture {
+    display: none;
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 800px;
+    height: 600px;
+  }
+  .fixture.active { display: block; }
+
+  .slide-sq, .ease-sq {
+    position: absolute;
+    left: 60px;
+    top: 260px;
+    width: 80px;
+    height: 80px;
+    background: #2563eb;
+  }
+  .slide-sq.run { animation: moveX 600ms linear forwards; }
+  .ease-sq.run { animation: moveX 600ms cubic-bezier(0.16, 1, 0.3, 1) forwards; }
+  @keyframes moveX {
+    from { transform: translateX(0); }
+    to { transform: translateX(600px); }
+  }
+
+  .fade-sq {
+    position: absolute;
+    left: 300px;
+    top: 200px;
+    width: 200px;
+    height: 200px;
+    background: #e8964a;
+    opacity: 0;
+    transform: scale(0.8);
+  }
+  .fade-sq.run { animation: fadeScale 400ms ease-in-out forwards; }
+  @keyframes fadeScale {
+    from { opacity: 0; transform: scale(0.8); }
+    to { opacity: 1; transform: scale(1); }
+  }
+
+  .janky-sq {
+    position: absolute;
+    left: 60px;
+    top: 260px;
+    width: 80px;
+    height: 80px;
+    background: #16a34a;
+  }
+  .janky-sq.run { animation: jankyMove 900ms linear forwards; }
+  @keyframes jankyMove {
+    0% { transform: translateX(0); }
+    33.33% { transform: translateX(300px); }
+    66.66% { transform: translateX(300px); }
+    100% { transform: translateX(600px); }
+  }
+
+  .subtle-rect {
+    position: absolute;
+    left: 250px;
+    top: 240px;
+    width: 300px;
+    height: 120px;
+    background: #e5e7eb;
+  }
+  .subtle-rect.run { animation: subtleShift 500ms ease-in-out forwards; }
+  @keyframes subtleShift {
+    from { transform: translateY(0); }
+    to { transform: translateY(3px); }
+  }
+
+  .spinner {
+    position: absolute;
+    left: 340px;
+    top: 240px;
+    width: 120px;
+    height: 120px;
+    box-sizing: border-box;
+    border: 12px solid #e5e7eb;
+    border-top-color: #0e3b45;
+    border-radius: 50%;
+  }
+  .spinner.run { animation: spin 1000ms linear infinite; }
+  @keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+  }
+
+  .stagger-sq {
+    position: absolute;
+    top: 265px;
+    width: 70px;
+    height: 70px;
+    opacity: 0;
+  }
+  .stagger-left { left: 165px; background: #ef4444; }
+  .stagger-mid { left: 365px; background: #eab308; }
+  .stagger-right { left: 565px; background: #3b82f6; }
+  .stagger-left.run { animation: staggerFade 250ms ease-in-out 0ms forwards; }
+  .stagger-mid.run { animation: staggerFade 250ms ease-in-out 300ms forwards; }
+  .stagger-right.run { animation: staggerFade 250ms ease-in-out 600ms forwards; }
+  @keyframes staggerFade {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="fx-slide" class="fixture"><div class="slide-sq"></div></div>
+  <div id="fx-ease" class="fixture"><div class="ease-sq"></div></div>
+  <div id="fx-fade" class="fixture"><div class="fade-sq"></div></div>
+  <div id="fx-janky" class="fixture"><div class="janky-sq"></div></div>
+  <div id="fx-subtle" class="fixture"><div class="subtle-rect"></div></div>
+  <div id="fx-spinner" class="fixture"><div class="spinner"></div></div>
+  <div id="fx-stagger" class="fixture">
+    <div class="stagger-sq stagger-left"></div>
+    <div class="stagger-sq stagger-mid"></div>
+    <div class="stagger-sq stagger-right"></div>
+  </div>
+</div>
+<script>
+(function () {
+  window.__done = false;
+
+  function allFixtures() {
+    return document.querySelectorAll('.fixture');
+  }
+  function allShapes() {
+    return document.querySelectorAll(
+      '.slide-sq, .ease-sq, .fade-sq, .janky-sq, .subtle-rect, .spinner, .stagger-sq'
+    );
+  }
+
+  function reset() {
+    allFixtures().forEach(function (f) { f.classList.remove('active'); });
+    allShapes().forEach(function (el) { el.classList.remove('run'); });
+    window.__done = false;
+  }
+  window.reset = reset;
+
+  function play(name) {
+    reset();
+    window.__done = false;
+    var fixture = document.getElementById('fx-' + name);
+    if (!fixture) return;
+    fixture.classList.add('active');
+    void fixture.offsetWidth; // force reflow so display:none -> block takes effect
+
+    switch (name) {
+      case 'slide':
+      case 'ease': {
+        var el = fixture.querySelector('.' + name + '-sq');
+        void el.offsetWidth;
+        el.addEventListener('animationend', function h() {
+          window.__done = true;
+          el.removeEventListener('animationend', h);
+        }, { once: true });
+        el.classList.add('run');
+        break;
+      }
+      case 'fade': {
+        var el = fixture.querySelector('.fade-sq');
+        void el.offsetWidth;
+        el.addEventListener('animationend', function h() {
+          window.__done = true;
+          el.removeEventListener('animationend', h);
+        }, { once: true });
+        el.classList.add('run');
+        break;
+      }
+      case 'janky': {
+        var el = fixture.querySelector('.janky-sq');
+        void el.offsetWidth;
+        el.addEventListener('animationend', function h() {
+          window.__done = true;
+          el.removeEventListener('animationend', h);
+        }, { once: true });
+        el.classList.add('run');
+        break;
+      }
+      case 'subtle': {
+        var el = fixture.querySelector('.subtle-rect');
+        void el.offsetWidth;
+        el.addEventListener('animationend', function h() {
+          window.__done = true;
+          el.removeEventListener('animationend', h);
+        }, { once: true });
+        el.classList.add('run');
+        break;
+      }
+      case 'spinner': {
+        var el = fixture.querySelector('.spinner');
+        void el.offsetWidth;
+        el.classList.add('run');
+        break;
+      }
+      case 'stagger': {
+        var left = fixture.querySelector('.stagger-left');
+        var mid = fixture.querySelector('.stagger-mid');
+        var right = fixture.querySelector('.stagger-right');
+        void left.offsetWidth;
+        right.addEventListener('animationend', function h() {
+          window.__done = true;
+          right.removeEventListener('animationend', h);
+        }, { once: true });
+        left.classList.add('run');
+        mid.classList.add('run');
+        right.classList.add('run');
+        break;
+      }
+    }
+  }
+  window.play = play;
+})();
+</script>
+</body>
+</html>
