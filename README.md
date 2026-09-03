@@ -126,7 +126,7 @@ So, across the surface:
 
 ## What a subagent gets
 
-**59 MCP tools.** Every tool takes a `sessionId`. Most take an optional
+**60 MCP tools.** Every tool takes a `sessionId`. Most take an optional
 `pageId` and default to the session's active tab.
 
 <details>
@@ -170,6 +170,24 @@ real pixel dimensions), `read_console`, `list_network_requests`,
 `:hover` or `:focus-visible`), `element_box` (geometry, visibility, and what
 is occluding it), `list_frames`, `find` (returns a selector the other tools
 accept), and `send_cdp_command` for raw CDP.
+
+</details>
+
+<details>
+<summary><strong>Animation (1)</strong></summary>
+
+`record_animation` captures a running animation and reports BOTH what the page
+declares it is animating and what actually rendered, because those are
+different questions that disagree in the cases that matter. `getAnimations()`
+returns playState "running" identically for an element that is visible, one at
+`visibility:hidden`, one at `opacity:0`, one positioned off-screen and one
+covered by an opaque overlay, so the declared channel alone cannot tell you a
+user would see anything. Frames come from a CDP screencast rather than a loop
+of screenshots, so the capture does not pace the animation it is measuring, and
+because a page that stops repainting emits no frames at all, a stall is
+detected from gaps between frame timestamps rather than from frames that show
+no change. It reports measurements, never a verdict: a mismatch means the two
+channels disagree, not that there is a bug.
 
 </details>
 

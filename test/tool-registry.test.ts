@@ -53,6 +53,7 @@ const expectedToolNames = [
   'press_key',
   'read_console',
   'read_page_errors',
+  'record_animation',
   'release_session',
   'reload',
   'remove_route_rule',
@@ -108,9 +109,9 @@ test('every tool definition is complete', () => {
   }
 });
 
-test('the tool surface is exactly the 59 tools listed here', () => {
+test('the tool surface is exactly the 60 tools listed here', () => {
   assert.deepEqual([...toolNames].sort(), expectedToolNames);
-  assert.equal(toolNames.length, 59);
+  assert.equal(toolNames.length, 60);
   assert.equal(new Set(toolNames).size, toolNames.length, 'duplicate tool name in toolDefs');
 });
 

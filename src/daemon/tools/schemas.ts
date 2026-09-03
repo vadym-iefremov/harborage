@@ -1,3 +1,4 @@
+import { animationTools } from './defs/animation.js';
 import { emulationTools } from './defs/emulation.js';
 import { inspectTools } from './defs/inspect.js';
 import { interactionTools } from './defs/interaction.js';
@@ -22,7 +23,8 @@ export const toolDefs = {
   ...inspectTools,
   ...emulationTools,
   ...networkTools,
-  ...storageTools
+  ...storageTools,
+  ...animationTools
 };
 
 export type ToolName = keyof typeof toolDefs;

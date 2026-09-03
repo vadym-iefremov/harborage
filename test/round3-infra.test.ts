@@ -742,7 +742,9 @@ test('every tool schema still accepts a correctly named call, so strictness caug
         // Numeric fields carry real ranges (status is 100 to 599, latitude
         // is -90 to 90), and this test is about strictness rather than about
         // bounds, so the first candidate the field itself accepts wins.
-        const candidates = [200, 1, 0, 90, 0.5, -1];
+        // 12 and 4 were added when record_animation arrived with a frames
+        // field bounded to 4..24, which every earlier candidate falls outside.
+        const candidates = [200, 1, 0, 90, 0.5, -1, 12, 4];
         const leaf = schema as unknown as { safeParse: (v: unknown) => { success: boolean } };
         return candidates.find(candidate => leaf.safeParse(candidate).success) ?? 1;
       }
@@ -750,10 +752,21 @@ test('every tool schema still accepts a correctly named call, so strictness caug
         return true;
       case 'enum':
         return Object.values((def as { entries: Record<string, unknown> }).entries)[0];
+      // A discriminated union's tag is a literal, and sampling it as a plain
+      // string picks no branch at all.
+      case 'literal':
+        return (def as { values?: unknown[] }).values?.[0] ?? 'x';
       case 'array':
         return [sample(def.element as never)];
       case 'record':
         return { anything: 'x' };
+      // A union (record_animation's trigger is the first on the surface) is
+      // satisfied by any one branch, so sample the first and let the rest of
+      // the check do its job.
+      case 'union': {
+        const options = (def as unknown as { options: unknown[] }).options;
+        return sample(options[0] as never);
+      }
       case 'object': {
         const shape = (schema as unknown as { shape: Record<string, never> }).shape;
         return Object.fromEntries(Object.entries(shape).map(([key, value]) => [key, sample(value)]));
