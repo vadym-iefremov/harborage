@@ -289,3 +289,57 @@ export function sampleFrames(frames, timeline, n) {
   }
   return picks.slice(0, n).sort((a, b) => a - b);
 }
+
+/**
+ * Resolve the capture region.
+ *
+ * If the caller names a target, that is authoritative and is reported as
+ * `source: "caller"`. If not, the region is derived from where pixels actually
+ * changed and reported as `source: "derived"`, because a region the tool chose
+ * for itself is an interpretation and hiding it makes the payload only look
+ * raw. A caller can always see which happened and why.
+ */
+export async function resolveRegion(page, timeline, viewport, target) {
+  const pad = 12;
+  if (target) {
+    const r = await page.evaluate(sel => {
+      const el = document.querySelector(sel);
+      if (!el) return null;
+      const b = el.getBoundingClientRect();
+      return { x: b.x, y: b.y, w: b.width, h: b.height };
+    }, target);
+    if (!r) return { region: null, source: 'caller', targetFound: false, reason: `selector ${target} matched nothing` };
+    return {
+      region: {
+        x: Math.max(0, Math.round(r.x - pad)), y: Math.max(0, Math.round(r.y - pad)),
+        w: Math.min(viewport.width, Math.round(r.w + pad * 2)),
+        h: Math.min(viewport.height, Math.round(r.h + pad * 2))
+      },
+      source: 'caller', targetFound: true, reason: `bounds of ${target}`
+    };
+  }
+  let mnx = viewport.width, mny = viewport.height, mxx = 0, mxy = 0, any = false;
+  for (const r of timeline) if (r.bbox) {
+    any = true;
+    mnx = Math.min(mnx, r.bbox.x); mny = Math.min(mny, r.bbox.y);
+    mxx = Math.max(mxx, r.bbox.x + r.bbox.w); mxy = Math.max(mxy, r.bbox.y + r.bbox.h);
+  }
+  if (!any) return { region: null, source: 'derived', reason: 'no pixels changed anywhere' };
+  const region = {
+    x: Math.max(0, mnx - pad), y: Math.max(0, mny - pad),
+    w: Math.min(viewport.width, mxx + pad) - Math.max(0, mnx - pad),
+    h: Math.min(viewport.height, mxy + pad) - Math.max(0, mny - pad)
+  };
+  const frac = (region.w * region.h) / (viewport.width * viewport.height);
+  return {
+    region, source: 'derived',
+    reason: `union of changed pixels, ${(frac * 100).toFixed(0)}% of viewport`,
+    coversWholeViewport: frac > 0.6
+  };
+}
+
+/** Estimated image tokens: (w*h)/750 after a 1568px long-edge downscale. */
+export function imageTokens(w, h) {
+  const s = Math.min(1, 1568 / Math.max(w, h));
+  return Math.round((w * s) * (h * s) / 750);
+}
