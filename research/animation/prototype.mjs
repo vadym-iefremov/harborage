@@ -43,6 +43,10 @@ export async function capture(page, client, { trigger, durationMs, viewport }) {
     format: 'png', everyNthFrame: 1, maxWidth: viewport.width, maxHeight: viewport.height
   });
 
+  // A load-triggered animation (the common case for a logo) cannot be captured
+  // by settling the page first and then triggering: it has already finished.
+  // The screencast is live before this runs, so a trigger that navigates or
+  // reloads gets its load animation recorded from the first painted frame.
   await trigger();
 
   // The declared channel must be read MID-FLIGHT. Sampled after the animation
@@ -167,6 +171,12 @@ export async function observe(work, frames, backgroundColor, viewport) {
       regions.sort((p, q) => q.cells - p.cells);
 
       out.push({
+        // Scope matters and was previously left implicit: an agent reading a
+        // 50%-of-viewport crop region reasonably assumed the emptiness count
+        // was scoped to it too, and hedged its answer for no reason. Every
+        // measurement here is VIEWPORT-WIDE; `region` describes only the
+        // cropping of the returned image.
+        scope: 'viewport',
         frame: i, tMs: Math.round(frames[i].t),
         adjacentPct: +(100 * adj.n / (VW*VH)).toFixed(3),
         sinceAnchorPct: +(100 * cum.n / (VW*VH)).toFixed(3),
@@ -194,9 +204,14 @@ export function crossCheck(declared, timeline, viewport, frameTimings) {
     declared.animations.some(a => a.playState === 'running' || a.playState === 'finished');
 
   const emptyFrames = post.filter(r => r.nonBackgroundPx === 0);
-  const allEmpty = emptyFrames.length === post.length;
+  // `every` on an empty array is vacuously true. An invisible element causes
+  // no repaints and therefore no frames, so `post` is routinely empty exactly
+  // when this claim would be most wrong. Require real evidence.
+  const allEmpty = post.length > 0 && emptyFrames.length === post.length;
 
   if (!declared.supported) codes.push('declared_channel_unavailable');
+  // Too few frames to say anything about how the page changed over time.
+  if (post.length < 2) codes.push('insufficient_frames_for_timeline');
 
   if (declaredAnimating && !anyPixelChange) {
     codes.push('declared_animating_but_no_pixel_change');
