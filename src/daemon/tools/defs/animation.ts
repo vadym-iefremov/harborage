@@ -430,6 +430,9 @@ export const animationTools = defineTools({
       'Frames come from a CDP screencast, not a loop of screenshots, so the capture does not pace the animation it ' +
       'is measuring. A page that stops repainting emits no frames at all, which is why a stall is detected from ' +
       'gaps between frame timestamps rather than from frames that show no change. ' +
+      'A navigate capture reports paint gaps as paint_gaps_during_navigation, not as a stall: a loading page ' +
+      'legitimately stops painting while it waits on the network, and real sites produce gaps of a second or ' +
+      'more on a clean load. To judge smoothness, record an already-loaded page with a click or evaluate trigger. ' +
       'This tool reports measurements and does NOT decide whether an animation is correct. agreement.status ' +
       '"mismatch" means the two channels disagree, not that there is a bug: a deliberately hidden element gives ' +
       'the same signature as a broken one, and only you know which was intended.',
@@ -572,7 +575,21 @@ export const animationTools = defineTools({
         const stride = Math.max(1, Math.ceil(captured.length / maxAnalysedFrames));
         const analysed = captured.filter((_, i) => i % stride === 0);
 
-        const work = await target.session.context.newPage();
+        // The scratch page for canvas work goes in its OWN context, never in
+        // the session's. Created inside session.context it registers as a tab
+        // of that session, and closing it leaves the session's active-tab
+        // pointer dangling, so the NEXT call fails with PageNotFoundError.
+        // Found by running this against a real site twice in a row.
+        const workContext = await target.session.context.browser()?.newContext();
+        if (!workContext) {
+          return text({
+            error: 'no_browser_for_analysis',
+            message:
+              'The browser behind this session is gone, so the captured frames cannot be measured. ' +
+              'Frames were recorded but not analysed; create a fresh session and record again.'
+          });
+        }
+        const work = await workContext.newPage();
         let timeline: TimelineRow[];
         let sheet: { base64: string; width: number; height: number } | null = null;
         let crop: { x: number; y: number; w: number; h: number } | null = null;
@@ -658,7 +675,7 @@ export const animationTools = defineTools({
             Math.min(4, Math.max(1, picked.length))
           );
         } finally {
-          await work.close().catch(() => {});
+          await workContext.close().catch(() => {});
         }
 
         // --- cross-check -------------------------------------------------
@@ -685,6 +702,14 @@ export const animationTools = defineTools({
         // A stall is the page not repainting, so it shows as a gap between
         // frame TIMESTAMPS. It never shows as a zero-change frame, because
         // no frame is emitted at all.
+        // During a navigation the page legitimately stops painting while it
+        // waits on the network, so gaps here are ordinary load behaviour and
+        // not jank. Measured on three real sites: MDN produced 503ms and
+        // 1131ms gaps on a clean load. The gaps are still reported, because
+        // they are real, but they are not labelled as stalls under a navigate
+        // trigger, since that label would send someone hunting a bug that is
+        // not there.
+        const gapsAreLoadWaits = args.trigger.type === 'navigate';
         const stalls: { fromMs: number; toMs: number; durationMs: number }[] = [];
         if (captured.length > 4) {
           const deltas = captured.slice(1).map((f, i) => f.t - captured[i].t).sort((p, q) => p - q);
@@ -701,7 +726,7 @@ export const animationTools = defineTools({
             }
           }
         }
-        if (stalls.length) codes.push('repaint_stall_detected');
+        if (stalls.length) codes.push(gapsAreLoadWaits ? 'paint_gaps_during_navigation' : 'repaint_stall_detected');
 
         // A quiet interval is frames arriving normally with nothing changing.
         // Common and legitimate (the pause between staggered items), so it is
@@ -779,6 +804,11 @@ export const animationTools = defineTools({
             status,
             codes,
             stalls,
+            stallsNote: gapsAreLoadWaits
+              ? 'Captured across a navigation, so these gaps include ordinary waits on the network and are NOT ' +
+                'evidence of jank. Re-record with a click or evaluate trigger on an already-loaded page to judge ' +
+                'smoothness.'
+              : null,
             quietIntervals,
             discriminators: {
               maxChangeSinceAnchorPct: maxSinceAnchor,

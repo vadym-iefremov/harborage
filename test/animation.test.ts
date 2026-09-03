@@ -119,6 +119,7 @@ interface AnimationResult {
     status: string;
     codes: string[];
     stalls: { durationMs: number }[];
+    stallsNote: string | null;
     quietIntervals: { durationMs: number; viewportEmptyThroughout: boolean }[];
     discriminators: { maxChangeSinceAnchorPct: number };
   };
@@ -239,6 +240,24 @@ test('a load-time animation is captured by triggering the navigation, not by nav
   assert.equal(withNavigate.capture.trigger, 'navigate');
 });
 
+test('paint gaps during a navigation are not labelled as a stall', async () => {
+  // A loading page stops painting while it waits on the network. Three real
+  // sites produced gaps up to 1131ms on a clean load, and calling those
+  // stalls would send someone hunting jank that is not there.
+  const r = await record('/onload', {
+    trigger: { type: 'navigate', url: `${base}/onload` },
+    durationMs: 900
+  });
+  assert.ok(
+    !r.agreement.codes.includes('repaint_stall_detected'),
+    'a navigate capture must not claim jank for ordinary load waits'
+  );
+  if (r.agreement.stalls.length > 0) {
+    assert.ok(r.agreement.codes.includes('paint_gaps_during_navigation'));
+    assert.match(String(r.agreement.stallsNote), /waits on the network/);
+  }
+});
+
 test('a page where nothing animates says so rather than inventing motion', async () => {
   const r = await record('/static', { trigger: { type: 'none' }, durationMs: 500 });
   assert.notEqual(r.agreement.status, 'agree');
@@ -304,6 +323,45 @@ test('cached mode writes a file and returns its path instead of inline image dat
     );
   } finally {
     await cachingHandlers.release_session({ sessionId });
+  }
+});
+
+test('recording twice on one session leaves its tabs untouched', async () => {
+  // The analysis needs a scratch page for canvas work. Created inside the
+  // session's own context it registers as a tab there, and closing it leaves
+  // the active-tab pointer dangling so the NEXT call cannot resolve the
+  // session at all. Caught by running against a real site twice in a row.
+  const created = await handlers.create_session({ viewport: { width: 800, height: 600 } });
+  const sessionId = (created.structuredContent as { sessionId: string }).sessionId;
+  try {
+    await handlers.navigate({ sessionId, url: `${base}/slide` });
+    const before = await handlers.list_tabs({ sessionId });
+    const tabsBefore = (before.structuredContent as { tabs: unknown[] }).tabs.length;
+
+    await handlers.record_animation({
+      sessionId,
+      trigger: { type: 'evaluate', expression: 'window.go()' },
+      durationMs: 600
+    });
+    const after = await handlers.list_tabs({ sessionId });
+    assert.equal(
+      (after.structuredContent as { tabs: unknown[] }).tabs.length,
+      tabsBefore,
+      'recording must not add or remove tabs on the session under test'
+    );
+
+    // The real symptom: a second call on the same session.
+    const second = await handlers.record_animation({
+      sessionId,
+      trigger: { type: 'evaluate', expression: 'window.go()' },
+      durationMs: 600
+    });
+    assert.ok(
+      (second.structuredContent as AnimationResult).capture.rawFrames > 0,
+      'a second recording on the same session must still work'
+    );
+  } finally {
+    await handlers.release_session({ sessionId });
   }
 });
 
