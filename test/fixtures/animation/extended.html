@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 800px;
+    height: 600px;
+    overflow: hidden;
+    background: #ffffff;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  #stage {
+    position: relative;
+    width: 800px;
+    height: 600px;
+    background: #ffffff;
+    overflow: hidden;
+  }
+  .fixture {
+    display: none;
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 800px;
+    height: 600px;
+  }
+  .fixture.active { display: block; }
+
+  .center-wrap {
+    width: 800px;
+    height: 600px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+  }
+
+  /* ---------- dark ---------- */
+  #fx-dark { background: #0d1117; }
+  .dark-card {
+    width: 320px;
+    height: 180px;
+    box-sizing: border-box;
+    border-radius: 12px;
+    background: #161b22;
+    border: 1px solid #30363d;
+    color: #c9d1d9;
+    padding: 24px;
+    transform: translateY(40px);
+    opacity: 0;
+  }
+  .dark-card.run { animation: darkCardIn 500ms ease-out forwards; }
+  @keyframes darkCardIn {
+    from { transform: translateY(40px); opacity: 0; }
+    to   { transform: translateY(0);    opacity: 1; }
+  }
+  .dark-card h2 { margin: 0 0 8px; font-size: 20px; font-weight: 600; color: #e6edf3; }
+  .dark-card p  { margin: 0; font-size: 14px; line-height: 1.5; color: #8b949e; }
+
+  /* ---------- photo ---------- */
+  #fx-photo { position: relative; overflow: hidden; background: #000; }
+  #photo-canvas { position: absolute; top: 0; left: 0; width: 800px; height: 600px; display: block; }
+  .photo-panel {
+    position: absolute;
+    top: 200px;
+    left: 560px;
+    width: 200px;
+    height: 200px;
+    box-sizing: border-box;
+    background: rgba(255,255,255,.92);
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0,0,0,.45);
+    padding: 18px;
+    color: #1e293b;
+    font-size: 14px;
+    transform: translateX(240px);
+  }
+  .photo-panel.run { animation: photoSlideIn 600ms cubic-bezier(.22,.61,.36,1) forwards; }
+  @keyframes photoSlideIn {
+    from { transform: translateX(240px); }
+    to   { transform: translateX(0); }
+  }
+
+  /* ---------- canvas ---------- */
+  #canvas-wrap { width: 800px; height: 600px; display: flex; align-items: center; justify-content: center; background: #f1f5f9; }
+  #anim-canvas { display: block; background: #1e1e2e; border-radius: 6px; }
+
+  /* ---------- scroll ---------- */
+  #fx-scroll { background: #f8fafc; }
+  .scroll-container {
+    width: 800px;
+    height: 600px;
+    overflow-y: scroll;
+    position: relative;
+    box-sizing: border-box;
+  }
+  .scroll-header {
+    position: sticky;
+    top: 0;
+    left: 0;
+    height: 120px;
+    background: #2563eb;
+    color: #ffffff;
+    display: flex;
+    align-items: center;
+    padding: 0 28px;
+    box-sizing: border-box;
+    font-size: 24px;
+    font-weight: 700;
+    z-index: 2;
+  }
+  .scroll-body { padding: 28px; }
+  .scroll-body p { font-size: 14px; line-height: 1.7; color: #334155; max-width: 620px; }
+  .scroll-spacer { height: 1400px; }
+
+  /* ---------- reveal-slow ---------- */
+  .reveal-box {
+    width: 300px;
+    height: 200px;
+    box-sizing: border-box;
+    border-radius: 10px;
+    background: #334155;
+    color: #f1f5f9;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 15px;
+    font-weight: 600;
+    opacity: 0;
+  }
+  .reveal-box.run { animation: revealFade 4000ms linear forwards; }
+  @keyframes revealFade {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+  }
+</style>
+</head>
+<body>
+<div id="stage">
+
+  <div id="fx-dark" class="fixture">
+    <div class="center-wrap">
+      <div class="dark-card">
+        <h2>Sync complete</h2>
+        <p>All 214 files are up to date. Last change 12 seconds ago.</p>
+      </div>
+    </div>
+  </div>
+
+  <div id="fx-photo" class="fixture">
+    <canvas id="photo-canvas" width="800" height="600"></canvas>
+    <div class="photo-panel">
+      <strong>Filters</strong>
+      <div style="margin-top:8px;color:#64748b;">Exposure, contrast and grain controls slide in over the photo.</div>
+    </div>
+  </div>
+
+  <div id="fx-canvas" class="fixture">
+    <div id="canvas-wrap">
+      <canvas id="anim-canvas" width="400" height="300"></canvas>
+    </div>
+  </div>
+
+  <div id="fx-scroll" class="fixture">
+    <div class="scroll-container">
+      <div class="scroll-header" id="scroll-header">Account activity</div>
+      <div class="scroll-body">
+        <p>Recent activity for this account is listed below. Scroll to see older entries; the
+          header above shrinks as you go, so more of the list stays visible.</p>
+        <p>Line item one. Line item two. Line item three. Line item four. Line item five.</p>
+        <div class="scroll-spacer"></div>
+        <p>End of list.</p>
+      </div>
+    </div>
+  </div>
+
+  <div id="fx-reveal-slow" class="fixture">
+    <div class="center-wrap">
+      <div class="reveal-box">Loaded</div>
+    </div>
+  </div>
+
+</div>
+<script>
+(function () {
+  window.__done = false;
+  var doneTimer = null;
+  var canvasRaf = null;
+  var scrollRaf = null;
+
+  function allFixtures() {
+    return document.querySelectorAll('.fixture');
+  }
+  function allAnimated() {
+    return document.querySelectorAll('.dark-card, .photo-panel, .reveal-box');
+  }
+
+  // ---- photo texture: drawn once at load, never redrawn on replay ----
+  function drawPhotoTexture() {
+    var cv = document.getElementById('photo-canvas');
+    var cx = cv.getContext('2d');
+    // gradient mesh base
+    var g1 = cx.createRadialGradient(120, 100, 20, 120, 100, 520);
+    g1.addColorStop(0, '#6b4f3a');
+    g1.addColorStop(1, '#1c140d');
+    cx.fillStyle = g1;
+    cx.fillRect(0, 0, 800, 600);
+
+    var g2 = cx.createRadialGradient(700, 480, 30, 700, 480, 480);
+    g2.addColorStop(0, 'rgba(180,150,90,0.55)');
+    g2.addColorStop(1, 'rgba(180,150,90,0)');
+    cx.fillStyle = g2;
+    cx.fillRect(0, 0, 800, 600);
+
+    var g3 = cx.createLinearGradient(0, 0, 800, 600);
+    g3.addColorStop(0, 'rgba(40,60,90,0.35)');
+    g3.addColorStop(0.5, 'rgba(90,60,40,0)');
+    g3.addColorStop(1, 'rgba(20,20,30,0.4)');
+    cx.fillStyle = g3;
+    cx.fillRect(0, 0, 800, 600);
+
+    // ~2000 small semi-transparent circles for high-frequency texture, drawn once
+    var seed = 42;
+    function rand() {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return (seed % 10000) / 10000;
+    }
+    for (var i = 0; i < 2000; i++) {
+      var x = rand() * 800, y = rand() * 600;
+      var r = 2 + rand() * 9;
+      var lum = Math.floor(80 + rand() * 175);
+      var a = 0.05 + rand() * 0.22;
+      cx.beginPath();
+      cx.fillStyle = 'rgba(' + lum + ',' + Math.floor(lum * 0.85) + ',' + Math.floor(lum * 0.7) + ',' + a.toFixed(2) + ')';
+      cx.arc(x, y, r, 0, Math.PI * 2);
+      cx.fill();
+    }
+  }
+  drawPhotoTexture();
+
+  // ---- scroll: shrink header as the container scrolls ----
+  var scrollContainer = document.querySelector('#fx-scroll .scroll-container');
+  var scrollHeader = document.getElementById('scroll-header');
+  scrollContainer.addEventListener('scroll', function () {
+    var st = scrollContainer.scrollTop;
+    var t = Math.max(0, Math.min(1, st / 400));
+    scrollHeader.style.height = (120 - 60 * t) + 'px';
+    scrollHeader.style.fontSize = (24 - 6 * t) + 'px';
+  });
+
+  function reset() {
+    if (doneTimer) { clearTimeout(doneTimer); doneTimer = null; }
+    if (canvasRaf) { cancelAnimationFrame(canvasRaf); canvasRaf = null; }
+    if (scrollRaf) { cancelAnimationFrame(scrollRaf); scrollRaf = null; }
+    allFixtures().forEach(function (f) { f.classList.remove('active'); });
+    allAnimated().forEach(function (el) { el.classList.remove('run'); });
+
+    var ac = document.getElementById('anim-canvas');
+    if (ac) ac.getContext('2d').clearRect(0, 0, ac.width, ac.height);
+
+    scrollContainer.scrollTop = 0;
+    scrollHeader.style.height = '120px';
+    scrollHeader.style.fontSize = '24px';
+
+    window.__done = false;
+  }
+  window.reset = reset;
+
+  function armDone(ms) {
+    doneTimer = setTimeout(function () {
+      window.__done = true;
+      doneTimer = null;
+    }, ms);
+  }
+
+  function play(name) {
+    reset();
+    window.__done = false;
+    var fixture = document.getElementById('fx-' + name);
+    if (!fixture) return;
+    fixture.classList.add('active');
+    void fixture.offsetWidth; // force reflow so display:none -> block takes effect, and replay works
+
+    switch (name) {
+      case 'dark': {
+        var card = fixture.querySelector('.dark-card');
+        void card.offsetWidth;
+        card.classList.add('run');
+        armDone(500);
+        break;
+      }
+      case 'photo': {
+        var panel = fixture.querySelector('.photo-panel');
+        void panel.offsetWidth;
+        panel.classList.add('run');
+        armDone(600);
+        break;
+      }
+      case 'canvas': {
+        var canvas = document.getElementById('anim-canvas');
+        var ctx = canvas.getContext('2d');
+        var start = null;
+        var DURATION = 900;
+        function frame(ts) {
+          if (start === null) start = ts;
+          var elapsed = ts - start;
+          var t = Math.min(elapsed / DURATION, 1);
+          ctx.clearRect(0, 0, 400, 300);
+          ctx.fillStyle = '#1e1e2e';
+          ctx.fillRect(0, 0, 400, 300);
+          var x = 40 + t * (400 - 80);
+          var y = 150 + Math.sin(t * Math.PI * 2) * 80;
+          ctx.beginPath();
+          ctx.fillStyle = '#f97316';
+          ctx.arc(x, y, 24, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.beginPath();
+          ctx.fillStyle = '#38bdf8';
+          ctx.arc(400 - x, 300 - y * 0.4, 14, 0, Math.PI * 2);
+          ctx.fill();
+          if (elapsed < DURATION) {
+            canvasRaf = requestAnimationFrame(frame);
+          } else {
+            canvasRaf = null;
+            window.__done = true;
+          }
+        }
+        canvasRaf = requestAnimationFrame(frame);
+        break;
+      }
+      case 'scroll': {
+        scrollContainer.scrollTop = 0;
+        var sstart = null;
+        var SDUR = 700;
+        function sframe(ts) {
+          if (sstart === null) sstart = ts;
+          var elapsed = ts - sstart;
+          var t = Math.min(elapsed / SDUR, 1);
+          scrollContainer.scrollTop = Math.round(400 * t);
+          if (t < 1) {
+            scrollRaf = requestAnimationFrame(sframe);
+          } else {
+            scrollRaf = null;
+            window.__done = true;
+          }
+        }
+        scrollRaf = requestAnimationFrame(sframe);
+        break;
+      }
+      case 'reveal-slow': {
+        var box = fixture.querySelector('.reveal-box');
+        void box.offsetWidth;
+        box.classList.add('run');
+        armDone(4000);
+        break;
+      }
+    }
+  }
+  window.play = play;
+})();
+</script>
+</body>
+</html>
